@@ -1,0 +1,17 @@
+# 运行产物
+logs/
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型权重 / 数据（绝不入 git，走 HF / 共享盘 / Modal Volume）
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+data/
+checkpoints/
+
+# 本地环境
+.venv*/
+.env
