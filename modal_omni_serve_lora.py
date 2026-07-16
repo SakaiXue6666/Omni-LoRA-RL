@@ -267,13 +267,14 @@ def e2e() -> None:
 
     prompt = "Translate to Chinese: The weather is nice today."
 
-    def _gen(lora_name: str | None) -> str:
+    def _gen(lora_name: str | None) -> tuple[str, list | None]:
         # sglang-omni 的 preprocessing 期望 chat messages（不是裸 prompt string）；
         # 裸 prompt 会在 normalize_messages() 抛 "expects a list of chat messages"。
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "sampling_params": {"temperature": 0.0, "max_new_tokens": 16},
             "stream": False,
+            "return_logprob": True,
         }
         if lora_name:
             payload["stage_params"] = {"thinker": {"lora_name": lora_name}}
@@ -286,11 +287,15 @@ def e2e() -> None:
             time.sleep(3)
             _dump_stage_errors()
             r.raise_for_status()
-        return r.json().get("text", "")
+        body = r.json()
+        return body.get("text", ""), (body.get("meta_info") or {}).get(
+            "output_token_logprobs"
+        )
 
     # ---- 2) baseline（无 LoRA）----
-    base_out = _gen(None)
+    base_out, base_logprobs = _gen(None)
     print(f"[e2e] BASE 输出: {base_out!r}")
+    print(f"[e2e] BASE logprobs: {base_logprobs!r}")
 
     # ---- 3) 构造一个随机 PEFT adapter 落盘（lora_B 非零 → 输出会变）----
     adapter_dir = _build_random_peft_adapter()
@@ -309,11 +314,12 @@ def e2e() -> None:
         raise SystemExit("[e2e] 热加载 LoRA 失败")
 
     # ---- 4) 带 LoRA 再生成 ----
-    lora_out = _gen("smoke")
+    lora_out, lora_logprobs = _gen("smoke")
     print(f"[e2e] LORA 输出: {lora_out!r}")
+    print(f"[e2e] LORA logprobs: {lora_logprobs!r}")
 
     print("=" * 70)
-    if lora_out != base_out:
+    if lora_out != base_out or lora_logprobs != base_logprobs:
         print("[e2e] PASS —— 带 LoRA 输出与 base 不同，热加载生效")
     else:
         print("[e2e] WARN —— 输出相同；可能 adapter 未生效（检查命名/路由）")
