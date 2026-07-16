@@ -106,15 +106,13 @@
 - 100 steps ✅
 - 权重同步优化（现状：每步都全量推 base + LoRA 每步 unload→reload，两处浪费）：base 冻结，不再 offload/onload，两端常驻 ✅
 - 改成同传，即多轮 每轮输入chunk，看 reward 是否上升 ✅
-- LoRA 加上 mlp / moe
 - 改成 speech-to-speech (训练 thinker)
+    - sglang-omni (todo：可热加载 + 可正确生成)
+    - relax (已知接sglang做s2tt可行，todo：接sglang-omni做s2st可行)
+- LoRA 加上 mlp / moe
 - 改成异步
 
-# 其他方法
-- ms-swift
-- verl
-
-（LoRA 加上 mlp / moe）
+## LoRA 加上 mlp / moe
 我上面的判断可能错了。光看文件名就有强烈反证:sglang 里有 lora_moe_runners.py、triton_ops/fused_moe_lora_kernel.py、triton_ops/virtual_experts.py,测试里甚至有 test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff.py(正是你的模型) 和 test_lora_moe_tp_logprob_diff.py。这直接打脸我"sglang 不支持 MoE LoRA"的说法。让我把关键源码读实。
 
 Megatron 侧的 matcher 默认 target 就含 linear_fc1/linear_fc2,且是按模块名+类型匹配。关键要看它怎么处理 MoE 的 grouped experts。再读 Megatron-Bridge 的 lora.py,以及 sglang 的 lora layers.py 和那个 30B-A3B MoE 测试。
@@ -152,3 +150,8 @@ router LoRA(如果你也挂):又是另一套。
 不是"整条链路推不动",而是一个**"对齐契约"的工程活**:两端能力都在,你补的是中间转换/同步的 MoE 分支。
 工作量:比我上次说的小,因为不用去啃"Megatron 能不能挂 / sglang 能不能服务"这种不可控的东西——它们已被官方测试覆盖。你要做的是照 sglang 期望的 MoE LoRA 布局,把转换层写对(gate_up 融合拆分 + shared-outer expert 命名),然后用那个 test_lora_qwen3_30b_a3b 的思路验证 logprob 对齐。
 仍然成立的建议:先验证 attention-only 是否欠拟合再决定要不要扩;但"扩 MoE"本身没有我上次说的那种硬阻塞。
+
+
+# 其他方法
+- ms-swift
+- verl
