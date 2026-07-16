@@ -6,3 +6,7 @@
 	path = sglang
 	url = https://github.com/SakaiXue6666/sglang.git
 	branch = lora-omni-baseline
+[submodule "sglang-omni"]
+	path = sglang-omni
+	url = https://github.com/SakaiXue6666/sglang-omni.git
+	branch = lora-omni-baseline
