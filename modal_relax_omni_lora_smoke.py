@@ -15,6 +15,7 @@ subsequent rollout.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -45,6 +46,7 @@ OMNI_PORT = 30000
 TRAIN_GPU_COUNT = 4
 OMNI_TP_SIZE = 4
 TOTAL_GPU_COUNT = 4
+STREAMING_CHUNK_MS = 960
 
 OMNI_RUNTIME_DEPS = (
     "typer pyzmq msgpack pydantic pyyaml xxhash httpx fastapi uvicorn "
@@ -134,7 +136,7 @@ def _assigned_gpus() -> list[str]:
     return devices
 
 
-def _write_bleu_smoke_dataset(source_path: str, destination_path: str) -> None:
+def _write_bleu_smoke_dataset(source_path: str, destination_path: str) -> float:
     import wave
 
     if not os.path.exists(source_path):
@@ -182,17 +184,45 @@ def _write_bleu_smoke_dataset(source_path: str, destination_path: str) -> None:
         f"reference={record['label']!r}",
         flush=True,
     )
+    return duration_s
 
 
-def _write_bleu_smoke_config(path: str) -> None:
+def _write_bleu_smoke_config(path: str, *, streaming: bool) -> None:
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write("max_turns: 1\nsimul_chunk_ms: 30000\n")
+        if streaming:
+            handle.write(
+                f"max_turns: 8\nsimul_chunk_ms: {STREAMING_CHUNK_MS}\n"
+            )
+        else:
+            handle.write("max_turns: 1\nsimul_chunk_ms: 30000\n")
 
 
 _GRAD_NORM_RE = re.compile(r"'train/grad_norm': ([0-9.eE+-]+)")
+_TRAIN_LOSS_RE = re.compile(r"'train/loss': ([^,}]+)")
+_PPO_KL_RE = re.compile(r"'train/ppo_kl': ([^,}]+)")
+_PG_CLIPFRAC_RE = re.compile(r"'train/pg_clipfrac': ([^,}]+)")
+_ROLLOUT_RAW_REWARD_RE = re.compile(r"'rollout/raw_reward': ([^,}]+)")
+_STREAMING_ROLLOUT_RE = re.compile(
+    r"\[omni-simul-evidence\] "
+    r"sample_index=(?P<sample_index>\S+) "
+    r"rollout_turns=(?P<rollout_turns>\d+) "
+    r"num_chunks=(?P<num_chunks>\d+) "
+    r"stop_reason=(?P<stop_reason>\S+) "
+    r"status=(?P<status>\S+)"
+)
+_STREAMING_OUTPUT_RE = re.compile(
+    r"\[omni-simul-output\] "
+    r"sample_index=(?P<sample_index>\S+) "
+    r"response=(?P<response>\"(?:\\.|[^\"\\])*\")"
+)
 
 
-def _validate_training_evidence(lines: list[str], num_rollout: int) -> None:
+def _validate_training_evidence(
+    lines: list[str],
+    num_rollout: int,
+    *,
+    require_nonzero_gradient: bool = True,
+) -> None:
     output = "".join(lines)
     required_markers = [
         f"Actor training completed step {num_rollout - 1}/{num_rollout}",
@@ -203,16 +233,218 @@ def _validate_training_evidence(lines: list[str], num_rollout: int) -> None:
     if missing:
         raise RuntimeError(f"Missing training evidence markers: {missing}")
 
+    raw_rewards = [
+        float(match.group(1))
+        for match in _ROLLOUT_RAW_REWARD_RE.finditer(output)
+    ]
+    if len(raw_rewards) < num_rollout or not all(
+        math.isfinite(value) for value in raw_rewards
+    ):
+        raise RuntimeError(
+            "BLEU smoke did not report finite rollout rewards for every step; "
+            f"observed raw_rewards={raw_rewards}"
+        )
+    train_losses = [
+        float(match.group(1))
+        for match in _TRAIN_LOSS_RE.finditer(output)
+    ]
+    if len(train_losses) < num_rollout or not all(
+        math.isfinite(value) for value in train_losses
+    ):
+        raise RuntimeError(
+            "BLEU smoke did not report finite training losses for every step; "
+            f"observed train_losses={train_losses}"
+        )
+    ppo_kls = [float(match.group(1)) for match in _PPO_KL_RE.finditer(output)]
+    clipfracs = [
+        float(match.group(1))
+        for match in _PG_CLIPFRAC_RE.finditer(output)
+    ]
+    if (
+        len(ppo_kls) < num_rollout
+        or len(clipfracs) < num_rollout
+        or not all(math.isfinite(value) for value in ppo_kls + clipfracs)
+    ):
+        raise RuntimeError(
+            "BLEU smoke did not report finite PPO alignment metrics for every step; "
+            f"observed ppo_kls={ppo_kls}, clipfracs={clipfracs}"
+        )
     grad_norms = [
         float(match.group(1))
         for match in _GRAD_NORM_RE.finditer(output)
     ]
-    if not grad_norms or not any(value > 0.0 for value in grad_norms):
+    if (
+        require_nonzero_gradient
+        and (not grad_norms or not any(value > 0.0 for value in grad_norms))
+    ):
         raise RuntimeError(
             "BLEU smoke completed without a non-zero gradient; "
             f"observed grad_norms={grad_norms}"
         )
-    print(f"[evidence] non-zero training grad_norms={grad_norms}", flush=True)
+    print(
+        "[evidence] training "
+        f"raw_rewards={raw_rewards} losses={train_losses} grad_norms={grad_norms} "
+        f"ppo_kls={ppo_kls} clipfracs={clipfracs}",
+        flush=True,
+    )
+
+
+def _validate_streaming_evidence(
+    train_lines: list[str],
+    omni_lines: list[str],
+    *,
+    expected_samples: int,
+    expected_chunks: int,
+    expected_steps: int,
+) -> None:
+    train_output = "".join(train_lines)
+    omni_output = "".join(omni_lines)
+    summaries = [
+        {
+            "sample_index": match.group("sample_index"),
+            "rollout_turns": int(match.group("rollout_turns")),
+            "num_chunks": int(match.group("num_chunks")),
+            "stop_reason": match.group("stop_reason"),
+            "status": match.group("status"),
+        }
+        for match in _STREAMING_ROLLOUT_RE.finditer(train_output)
+    ]
+    if len(summaries) != expected_samples:
+        raise RuntimeError(
+            "Streaming smoke did not report one rollout summary per sample; "
+            f"expected={expected_samples}, observed={summaries}"
+        )
+    if any(summary["num_chunks"] != expected_chunks for summary in summaries):
+        raise RuntimeError(
+            "Streaming smoke used an unexpected audio chunk count; "
+            f"expected={expected_chunks}, observed={summaries}"
+        )
+    if any(summary["rollout_turns"] < 2 for summary in summaries):
+        raise RuntimeError(
+            "Streaming smoke did not exercise a multi-turn trajectory for every "
+            f"sample: {summaries}"
+        )
+    invalid_stops = [
+        summary
+        for summary in summaries
+        if summary["stop_reason"] not in {"chunks_exhausted", "length"}
+        or summary["status"] not in {"completed", "truncated"}
+    ]
+    if invalid_stops:
+        raise RuntimeError(
+            "Streaming smoke observed an abort or invalid terminal state: "
+            f"{invalid_stops}"
+        )
+    full_audio_coverage = sum(
+        summary["rollout_turns"] >= expected_chunks for summary in summaries
+    )
+    if full_audio_coverage < 1:
+        raise RuntimeError(
+            "Streaming smoke never submitted every audio chunk for any trajectory; "
+            f"expected_chunks={expected_chunks}, observed={summaries}"
+        )
+    if full_audio_coverage < expected_steps:
+        raise RuntimeError(
+            "Streaming smoke did not provide at least one full-audio trajectory "
+            f"per training step; expected={expected_steps}, "
+            f"observed={full_audio_coverage}"
+        )
+    output_previews = [
+        {
+            "sample_index": match.group("sample_index"),
+            "response": json.loads(match.group("response")),
+        }
+        for match in _STREAMING_OUTPUT_RE.finditer(train_output)
+    ]
+    if len(output_previews) != expected_samples:
+        raise RuntimeError(
+            "Streaming smoke did not report one output preview per sample; "
+            f"expected={expected_samples}, observed={output_previews}"
+        )
+    invalid_outputs = [
+        preview
+        for preview in output_previews
+        if not preview["response"].strip()
+        or "\ufffd" in preview["response"]
+        or any(
+            ord(character) < 32
+            and character not in {"\n", "\r", "\t"}
+            for character in preview["response"]
+        )
+    ]
+    if invalid_outputs:
+        raise RuntimeError(
+            "Streaming smoke observed an empty or malformed Unicode output: "
+            f"{invalid_outputs}"
+        )
+    successful_requests = omni_output.count(
+        'POST /generate HTTP/1.1" 200 OK'
+    )
+    expected_requests = sum(
+        summary["rollout_turns"] for summary in summaries
+    )
+    if successful_requests != expected_requests:
+        raise RuntimeError(
+            "Streaming rollout summaries do not match successful Omni requests; "
+            f"expected={expected_requests}, observed={successful_requests}"
+        )
+    if "has_active_lora=True" not in omni_output:
+        raise RuntimeError("Streaming smoke never observed an active Thinker policy LoRA")
+    control_events = [
+        match.group(1)
+        for match in re.finditer(
+            r'POST /(load_lora_adapter_from_tensors|'
+            r'generate|unload_lora_adapter) HTTP/1\.1" 200 OK',
+            omni_output,
+        )
+    ]
+    load_positions = [
+        index
+        for index, event in enumerate(control_events)
+        if event == "load_lora_adapter_from_tensors"
+    ]
+    expected_loads = expected_steps + 1
+    if len(load_positions) != expected_loads:
+        raise RuntimeError(
+            "Streaming smoke did not complete the initial and post-train tensor "
+            f"loads; expected={expected_loads}, observed={len(load_positions)}"
+        )
+    unloads = control_events.count("unload_lora_adapter")
+    if unloads != expected_steps:
+        raise RuntimeError(
+            "Streaming smoke did not unload the previous adapter after every "
+            f"training step; expected={expected_steps}, observed={unloads}"
+        )
+    missing_post_reload_rollouts = [
+        step
+        for step in range(expected_steps)
+        if "generate"
+        not in control_events[load_positions[step] + 1 : load_positions[step + 1]]
+    ]
+    if missing_post_reload_rollouts:
+        raise RuntimeError(
+            "Streaming smoke did not consume the currently loaded adapter before "
+            f"the next training update; missing_steps={missing_post_reload_rollouts}"
+        )
+    chunks_exhausted = sum(
+        summary["stop_reason"] == "chunks_exhausted" for summary in summaries
+    )
+    truncated = sum(
+        summary["status"] == "truncated" for summary in summaries
+    )
+    print(
+        "[evidence] streaming "
+        f"requests={successful_requests} "
+        f"full_audio_coverage={full_audio_coverage}/{expected_samples} "
+        f"chunks_exhausted={chunks_exhausted}/{expected_samples} "
+        f"truncated={truncated}/{expected_samples}",
+        flush=True,
+    )
+    print(
+        "[evidence] streaming output previews="
+        f"{json.dumps(output_previews, ensure_ascii=True)}",
+        flush=True,
+    )
 
 
 def _wait_for_omni(process, *, required_process=None) -> None:
@@ -346,21 +578,30 @@ def unit() -> None:
 
 @app.function(
     image=image,
+    cpu=8.0,
     gpu="A100-80GB:4",
     volumes={"/models": model_volume, S2TT_DIR: s2tt_volume},
     timeout=3 * 60 * 60,
 )
-def smoke(num_rollout: int = 1) -> None:
+def smoke(num_rollout: int = 1, streaming: bool = False) -> None:
     """Run the real external-Omni Relax training closure."""
     import subprocess
     import threading
     import time
 
-    if num_rollout not in (1, 2):
-        raise ValueError("Cost-controlled smoke only permits one or two rollouts")
+    if streaming:
+        if num_rollout not in (1, 2, 3):
+            raise ValueError(
+                "Cost-controlled streaming smoke permits at most three rollouts"
+            )
+    elif num_rollout not in (1, 2):
+        raise ValueError(
+            "Cost-controlled full-audio smoke permits one or two rollouts"
+        )
     if not os.path.exists(f"{MODEL_DIR}/config.json"):
         raise FileNotFoundError(f"Missing model volume file {MODEL_DIR}/config.json")
 
+    samples_per_prompt = 4
     devices = _assigned_gpus()
     train_devices = devices[:TRAIN_GPU_COUNT]
     omni_devices = devices[:OMNI_TP_SIZE]
@@ -386,11 +627,11 @@ def smoke(num_rollout: int = 1) -> None:
         "DATA": "/tmp/omni-real-bleu-smoke.jsonl",
         "NUM_ROLLOUT": str(num_rollout),
         "RM_TYPE": "bleu",
-        "N_SAMPLES": "4",
+        "N_SAMPLES": str(samples_per_prompt),
         "ROLLOUT_BATCH": "1",
-        "GLOBAL_BATCH": "4",
-        "ROLLOUT_TEMPERATURE": "1.3",
-        "ROLLOUT_MAX_RESPONSE_LEN": "64",
+        "GLOBAL_BATCH": str(samples_per_prompt),
+        "ROLLOUT_TEMPERATURE": "0.8" if streaming else "1.3",
+        "ROLLOUT_MAX_RESPONSE_LEN": "128" if streaming else "64",
         "ROLLOUT_MAX_PROMPT_LEN": "4096",
         "CUSTOM_CONFIG_PATH": "/tmp/omni-real-bleu-smoke.yaml",
         "MAX_GLOBAL_RESTART": "0",
@@ -425,14 +666,19 @@ def smoke(num_rollout: int = 1) -> None:
     train_process = None
     train_output_thread = None
     omni_process = None
+    omni_output_thread = None
     train_output_lines: list[str] = []
+    omni_output_lines: list[str] = []
 
     try:
-        _write_bleu_smoke_dataset(
+        duration_s = _write_bleu_smoke_dataset(
             S2TT_JSONL,
             train_env["DATA"],
         )
-        _write_bleu_smoke_config(train_env["CUSTOM_CONFIG_PATH"])
+        _write_bleu_smoke_config(
+            train_env["CUSTOM_CONFIG_PATH"],
+            streaming=streaming,
+        )
         subprocess.run(
             ["ray", "stop", "--force"],
             env=train_env,
@@ -509,8 +755,26 @@ def smoke(num_rollout: int = 1) -> None:
         omni_process = subprocess.Popen(
             [OMNI_PYTHON, "-c", _OMNI_SERVER_CODE],
             env=omni_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
             start_new_session=True,
         )
+
+        def _forward_omni_output() -> None:
+            assert omni_process is not None
+            assert omni_process.stdout is not None
+            for line in omni_process.stdout:
+                omni_output_lines.append(line)
+                print(line, end="", flush=True)
+
+        omni_output_thread = threading.Thread(
+            target=_forward_omni_output,
+            name="omni-output",
+            daemon=True,
+        )
+        omni_output_thread.start()
         _wait_for_omni(
             omni_process,
             required_process=train_process,
@@ -523,8 +787,26 @@ def smoke(num_rollout: int = 1) -> None:
                 returncode,
                 ["bash", script],
             )
-        _validate_training_evidence(train_output_lines, num_rollout)
-        print(f"REAL RELAX OMNI SMOKE PASS (num_rollout={num_rollout})", flush=True)
+        _validate_training_evidence(
+            train_output_lines,
+            num_rollout,
+            require_nonzero_gradient=not streaming,
+        )
+        if streaming:
+            _validate_streaming_evidence(
+                train_output_lines,
+                omni_output_lines,
+                expected_samples=samples_per_prompt * num_rollout,
+                expected_chunks=math.ceil(
+                    duration_s * 1000 / STREAMING_CHUNK_MS
+                ),
+                expected_steps=num_rollout,
+            )
+        print(
+            "REAL RELAX OMNI SMOKE PASS "
+            f"(num_rollout={num_rollout}, streaming={streaming})",
+            flush=True,
+        )
     finally:
         if train_process is not None:
             _stop_process_group(train_process)
@@ -537,9 +819,11 @@ def smoke(num_rollout: int = 1) -> None:
         )
         if omni_process is not None:
             _stop_process_group(omni_process)
+        if omni_output_thread is not None:
+            omni_output_thread.join(timeout=10)
         print("[cleanup] Ray and SGLang-Omni stopped", flush=True)
 
 
 @app.local_entrypoint()
-def main(num_rollout: int = 1) -> None:
-    smoke.remote(num_rollout=num_rollout)
+def main(num_rollout: int = 1, streaming: bool = False) -> None:
+    smoke.remote(num_rollout=num_rollout, streaming=streaming)
