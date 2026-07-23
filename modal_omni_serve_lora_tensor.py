@@ -62,21 +62,33 @@ app = modal.App(APP_NAME)
 model_volume = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=False)
 
 
-def _build_pipeline_config(thinker_tp_size: int = 1) -> Any:
+def _build_pipeline_config(
+    thinker_tp_size: int = 1, *, speech: bool = False
+) -> Any:
     from sglang_omni.cli.serve import (
         _apply_stage_server_args_override,
         apply_parallelism_cli_overrides,
         apply_thinker_server_args_cli_overrides,
     )
-    from sglang_omni.models.qwen3_omni.config import Qwen3OmniPipelineConfig
 
-    config = Qwen3OmniPipelineConfig(model_path=MODEL_DIR)
+    if speech:
+        if thinker_tp_size != 1:
+            raise ValueError("the single-GPU colocated speech smoke requires TP=1")
+        from sglang_omni.config.manager import ConfigManager
+
+        config = ConfigManager.from_file(
+            f"{OMNI_REMOTE}/examples/configs/qwen3_omni_colocated_h100_bf16.yaml"
+        ).merge_config({"model_path": MODEL_DIR})
+    else:
+        from sglang_omni.models.qwen3_omni.config import Qwen3OmniPipelineConfig
+
+        config = Qwen3OmniPipelineConfig(model_path=MODEL_DIR)
     apply_parallelism_cli_overrides(
         config,
         thinker_tp_size=thinker_tp_size,
         thinker_gpus=",".join(str(rank) for rank in range(thinker_tp_size)),
-        talker_gpu=None,
-        code2wav_gpu=None,
+        talker_gpu=0 if speech else None,
+        code2wav_gpu=0 if speech else None,
     )
     apply_thinker_server_args_cli_overrides(
         config,
@@ -87,25 +99,28 @@ def _build_pipeline_config(thinker_tp_size: int = 1) -> Any:
         lora_target_modules="qkv_proj,o_proj",
         max_loras_per_batch=1,
     )
-    _apply_stage_server_args_override(
-        config,
-        stage_name="thinker",
-        updates={
-            "attention_backend": "triton",
-            "disable_cuda_graph": True,
-            "disable_custom_all_reduce": True,
-            "mem_fraction_static": 0.85,
-            "disable_overlap_schedule": True,
-        },
-        reason="tensor LoRA e2e Qwen3-Omni settings",
-    )
+    updates = {
+        "attention_backend": "triton",
+        "disable_cuda_graph": True,
+        "disable_custom_all_reduce": True,
+        "disable_overlap_schedule": True,
+    }
+    if not speech:
+        updates["mem_fraction_static"] = 0.85
+    for stage_name in (("thinker", "talker_ar") if speech else ("thinker",)):
+        _apply_stage_server_args_override(
+            config,
+            stage_name=stage_name,
+            updates=updates,
+            reason="tensor LoRA e2e Qwen3-Omni settings",
+        )
     return config
 
 
-def _serve_thinker(thinker_tp_size: int) -> None:
+def _serve_thinker(thinker_tp_size: int, speech: bool = False) -> None:
     from sglang_omni.serve import launch_server
 
-    config = _build_pipeline_config(thinker_tp_size)
+    config = _build_pipeline_config(thinker_tp_size, speech=speech)
     launch_server(
         config,
         host="127.0.0.1",
@@ -222,12 +237,17 @@ def probe() -> None:
     if not os.path.exists(f"{MODEL_DIR}/config.json"):
         raise FileNotFoundError(f"model volume is missing {MODEL_DIR}/config.json")
     config = _build_pipeline_config()
+    speech_config = _build_pipeline_config(speech=True)
     payload, tensor_count, serialized_size = _build_flattened_bucket_payload(
         seed=20260717
     )
     assert payload["load_format"] == "flattened_bucket"
     assert payload["lora_name"] == "policy"
     assert tensor_count > 0 and serialized_size > 0
+    speech_stages = {stage.name: stage for stage in speech_config.stages}
+    assert speech_stages["thinker"].gpu == 0
+    assert speech_stages["talker_ar"].gpu == 0
+    assert speech_stages["code2wav"].gpu == 0
     print(f"pipeline={type(config).__name__}", flush=True)
     print(
         f"payload tensors={tensor_count}, base64_bytes={serialized_size}",
@@ -256,12 +276,27 @@ def e2e_tp2() -> None:
     _run_e2e(thinker_tp_size=2)
 
 
-def _run_e2e(thinker_tp_size: int) -> None:
+@app.function(
+    image=image,
+    gpu="A100-80GB:1",
+    volumes={MODEL_VOLUME_PATH: model_volume},
+    timeout=30 * 60,
+)
+def e2e_speech() -> None:
+    """Verify tensor hot-updates followed by a colocated Talker WAV request."""
+    _run_e2e(thinker_tp_size=1, speech=True)
+
+
+def _run_e2e(thinker_tp_size: int, *, speech: bool = False) -> None:
+    import base64
     import glob
+    import io
     import multiprocessing as mp
     import time
 
+    import numpy as np
     import requests
+    import soundfile as sf
 
     os.environ.setdefault("SGLANG_OMNI_STARTUP_TIMEOUT", "1800")
     os.environ["SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"] = "1"
@@ -281,7 +316,7 @@ def _run_e2e(thinker_tp_size: int) -> None:
     ctx = mp.get_context("spawn")
     server_process = ctx.Process(
         target=_serve_thinker,
-        args=(thinker_tp_size,),
+        args=(thinker_tp_size, speech),
         daemon=False,
     )
     server_process.start()
@@ -418,6 +453,66 @@ def _run_e2e(thinker_tp_size: int) -> None:
             raise RuntimeError("first tensor LoRA update did not change token logprobs")
         if not update_changed:
             raise RuntimeError("second tensor LoRA update did not change token logprobs")
+
+        if speech:
+            request_id = "tensor-lora-speech-smoke"
+            speech_response = requests.post(
+                f"{base_url}/v1/chat/completions",
+                json={
+                    "request_id": request_id,
+                    "model": "qwen3-omni",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Say this short sentence: Hello after tensor update.",
+                        }
+                    ],
+                    "modalities": ["text", "audio"],
+                    "audio": {"format": "wav"},
+                    "max_tokens": 16,
+                    "temperature": 0.0,
+                    "stream": False,
+                    "stage_params": {"thinker": {"lora_name": "policy"}},
+                },
+                timeout=900,
+            )
+            if speech_response.status_code != 200:
+                _dump_stage_errors()
+                raise RuntimeError(
+                    "post-update speech failed: "
+                    f"{speech_response.status_code} {speech_response.text[:4000]}"
+                )
+            message = speech_response.json()["choices"][0]["message"]
+            speech_text = str(message.get("content") or "")
+            audio = message.get("audio") or {}
+            wav_bytes = base64.b64decode(audio.get("data") or "", validate=True)
+            if not speech_text.strip() or wav_bytes[:4] not in {b"RIFF", b"RF64"}:
+                raise RuntimeError("post-update speech returned empty text or invalid WAV")
+            waveform, sample_rate = sf.read(
+                io.BytesIO(wav_bytes), dtype="float32", always_2d=False
+            )
+            waveform = np.asarray(waveform, dtype=np.float32)
+            frames = int(waveform.shape[0])
+            duration_s = frames / float(sample_rate)
+            rms = float(np.sqrt(np.mean(np.square(waveform, dtype=np.float64))))
+            if (
+                sample_rate <= 0
+                or frames <= 0
+                or duration_s < 0.05
+                or not np.isfinite(rms)
+                or rms <= 1e-6
+            ):
+                raise RuntimeError(
+                    "post-update WAV is empty or invalid: "
+                    f"rate={sample_rate} frames={frames} duration={duration_s} rms={rms}"
+                )
+            print(f"speech text={speech_text!r}", flush=True)
+            print(
+                "speech WAV: "
+                f"bytes={len(wav_bytes)} rate={sample_rate} frames={frames} "
+                f"duration={duration_s:.3f}s rms={rms:.6f}",
+                flush=True,
+            )
 
         print("PASS", flush=True)
     finally:

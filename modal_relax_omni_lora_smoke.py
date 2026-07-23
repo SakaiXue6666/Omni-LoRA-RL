@@ -9,7 +9,8 @@ The test runs Megatron TP4 and an external SGLang-Omni thinker TP4 colocated
 on the same four A100-80GB GPUs. One rollout
 step proves initial adapter loading, rollout, training, and the post-train
 unload/reload. Use two steps to additionally consume the trained adapter in a
-subsequent rollout.
+subsequent rollout. The opt-in ``speech`` mode keeps Talker/Code2Wav in the
+same service and synthesizes one WAV with the final in-memory Thinker adapter.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ TRAIN_GPU_COUNT = 4
 OMNI_TP_SIZE = 4
 TOTAL_GPU_COUNT = 4
 STREAMING_CHUNK_MS = 960
+POST_TRAIN_SPEECH_REQUEST_ID = "relax-post-train-speech"
 
 OMNI_RUNTIME_DEPS = (
     "typer pyzmq msgpack pydantic pyyaml xxhash httpx fastapi uvicorn "
@@ -75,7 +77,7 @@ image = (
 app = modal.App(APP_NAME)
 
 
-_OMNI_SERVER_CODE = f"""
+_OMNI_TEXT_SERVER_CODE = f"""
 from sglang_omni.cli.serve import (
     _apply_stage_server_args_override,
     apply_parallelism_cli_overrides,
@@ -114,6 +116,80 @@ _apply_stage_server_args_override(
     }},
     reason="real Relax tensor-LoRA smoke settings",
 )
+launch_server(
+    config,
+    host="127.0.0.1",
+    port={OMNI_PORT},
+    model_name="qwen3-omni",
+)
+"""
+
+
+_OMNI_SPEECH_CONFIG_CODE = f"""
+from sglang_omni.cli.serve import (
+    _apply_stage_server_args_override,
+    apply_parallelism_cli_overrides,
+    apply_thinker_server_args_cli_overrides,
+)
+from sglang_omni.models.qwen3_omni.config import (
+    Qwen3OmniSpeechPipelineConfig,
+)
+
+config = Qwen3OmniSpeechPipelineConfig(model_path={MODEL_DIR!r})
+
+# Use the supported hybrid speech topology: Thinker is TP4 while Talker,
+# Code2Wav, and the encoders share the Thinker leader's GPU 0. Keep GPU 0's
+# complete speech stack close to the proven 0.55 Thinker-only
+# budget: 0.45 Thinker + 0.10 Talker + 3 * 0.02 auxiliary stages = 0.61.
+# The Thinker runtime subtracts its existing 0.05 encoder reserve, leaving a
+# 0.40 SGLang/KV budget on each TP rank, which is ample for four short samples.
+stage_fractions = {{
+    "image_encoder": 0.02,
+    "audio_encoder": 0.02,
+    "thinker": 0.45,
+    "talker_ar": 0.10,
+    "code2wav": 0.02,
+}}
+stage_by_name = {{stage.name: stage for stage in config.stages}}
+for stage_name, fraction in stage_fractions.items():
+    stage_by_name[stage_name].runtime.resources.total_gpu_memory_fraction = fraction
+
+apply_parallelism_cli_overrides(
+    config,
+    thinker_tp_size={OMNI_TP_SIZE},
+    thinker_gpus="0,1,2,3",
+    talker_gpu=0,
+    code2wav_gpu=0,
+)
+apply_thinker_server_args_cli_overrides(
+    config,
+    cpu_offload_gb=None,
+    quantization=None,
+    enable_lora=True,
+    max_lora_rank=16,
+    lora_target_modules="qkv_proj,o_proj",
+    max_loras_per_batch=1,
+)
+
+for stage_name in ("thinker", "talker_ar"):
+    _apply_stage_server_args_override(
+        config,
+        stage_name=stage_name,
+        updates={{
+            "attention_backend": "triton",
+            "disable_cuda_graph": True,
+            "disable_custom_all_reduce": True,
+            "disable_overlap_schedule": True,
+            **({{"max_running_requests": 4}} if stage_name == "thinker" else {{}}),
+        }},
+        reason="real Relax post-train speech smoke settings",
+    )
+"""
+
+
+_OMNI_SPEECH_SERVER_CODE = _OMNI_SPEECH_CONFIG_CODE + f"""
+from sglang_omni.serve import launch_server
+
 launch_server(
     config,
     host="127.0.0.1",
@@ -447,6 +523,89 @@ def _validate_streaming_evidence(
     )
 
 
+def _run_post_train_speech(base_url: str) -> dict[str, object]:
+    """Use the final in-memory policy adapter for one Talker/Code2Wav request."""
+    import base64
+    import io
+
+    import numpy as np
+    import requests
+    import soundfile as sf
+
+    payload = {
+        "model": "qwen3-omni",
+        "request_id": POST_TRAIN_SPEECH_REQUEST_ID,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Say this short sentence: Hello after one Relax update.",
+            }
+        ],
+        "modalities": ["text", "audio"],
+        "audio": {"format": "wav"},
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "stream": False,
+        "stage_params": {"thinker": {"lora_name": "policy"}},
+    }
+    print(
+        "[speech] requesting post-train text+audio with Thinker LoRA policy",
+        flush=True,
+    )
+    response = requests.post(
+        f"{base_url}/v1/chat/completions",
+        json=payload,
+        timeout=15 * 60,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Post-train speech request failed: "
+            f"HTTP {response.status_code} {response.text[:1200]}"
+        )
+
+    message = response.json()["choices"][0]["message"]
+    text = message.get("content") or ""
+    audio = message.get("audio") or {}
+    if not text.strip():
+        raise RuntimeError("Post-train speech request returned empty Thinker text")
+    if not audio.get("data"):
+        raise RuntimeError("Post-train speech request returned no audio.data")
+
+    wav_bytes = base64.b64decode(audio["data"], validate=True)
+    if wav_bytes[:4] not in {b"RIFF", b"RF64"}:
+        raise RuntimeError("Post-train speech response is not a WAV container")
+    waveform, sample_rate = sf.read(
+        io.BytesIO(wav_bytes), dtype="float32", always_2d=False
+    )
+    waveform = np.asarray(waveform, dtype=np.float32)
+    frames = int(waveform.shape[0])
+    duration_s = frames / float(sample_rate)
+    rms = float(np.sqrt(np.mean(np.square(waveform, dtype=np.float64))))
+    if sample_rate <= 0 or frames <= 0 or duration_s < 0.05:
+        raise RuntimeError(
+            "Post-train speech WAV has invalid geometry: "
+            f"sample_rate={sample_rate}, frames={frames}, duration={duration_s}"
+        )
+    if not math.isfinite(rms) or rms <= 1e-6:
+        raise RuntimeError(f"Post-train speech WAV is silent or invalid: rms={rms}")
+
+    print(f"[speech] Thinker text={text!r}", flush=True)
+    print(
+        "[speech] Talker WAV "
+        f"bytes={len(wav_bytes)} sample_rate={sample_rate} frames={frames} "
+        f"duration={duration_s:.3f}s rms={rms:.6f}",
+        flush=True,
+    )
+    return {
+        "wav_bytes": wav_bytes,
+        "text": text,
+        "sample_rate": int(sample_rate),
+        "frames": frames,
+        "duration_s": duration_s,
+        "rms": rms,
+    }
+
+
 def _wait_for_omni(process, *, required_process=None) -> None:
     import time
 
@@ -537,6 +696,32 @@ def probe() -> None:
         env={**os.environ, "PYTHONPATH": RELAX_PYTHONPATH},
         check=True,
     )
+    speech_probe_code = _OMNI_SPEECH_CONFIG_CODE + """
+from sglang_omni.config import build_stage_placement_plan
+
+placement = build_stage_placement_plan(config)
+assert stage_by_name["thinker"].tp_size == 4
+assert stage_by_name["thinker"].gpu == [0, 1, 2, 3]
+assert stage_by_name["talker_ar"].gpu == 0
+assert stage_by_name["code2wav"].gpu == 0
+assert abs(sum(stage_fractions.values()) - 0.61) < 1e-9
+assert abs(placement.gpus[0].total_gpu_memory_fraction - 0.61) < 1e-9
+for gpu_id in (1, 2, 3):
+    assert abs(placement.gpus[gpu_id].total_gpu_memory_fraction - 0.45) < 1e-9
+assert placement.same_gpu_stream_targets["thinker"] == frozenset({"talker_ar"})
+print("speech topology", {
+    name: (stage_by_name[name].gpu, fraction)
+    for name, fraction in stage_fractions.items()
+})
+"""
+    subprocess.run(
+        [OMNI_PYTHON, "-c", speech_probe_code],
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{SGLANG_REMOTE}:{OMNI_REMOTE}",
+        },
+        check=True,
+    )
     subprocess.run(
         [
             "bash",
@@ -557,7 +742,7 @@ def probe() -> None:
     timeout=20 * 60,
 )
 def unit() -> None:
-    """Run the CPU regressions that cover the independent Omni backend."""
+    """Run CPU regressions for the Omni backend and its stage IPC bridge."""
     import subprocess
 
     subprocess.run(
@@ -574,6 +759,22 @@ def unit() -> None:
         env={**os.environ, "PYTHONPATH": RELAX_PYTHONPATH},
         check=True,
     )
+    subprocess.run(
+        [
+            OMNI_PYTHON,
+            "-m",
+            "pytest",
+            "-q",
+            "tests/unit_test/pipeline/test_stage_streaming.py",
+            "tests/unit_test/scheduling/test_lora_admin.py",
+        ],
+        cwd=OMNI_REMOTE,
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{SGLANG_REMOTE}:{OMNI_REMOTE}",
+        },
+        check=True,
+    )
 
 
 @app.function(
@@ -583,12 +784,21 @@ def unit() -> None:
     volumes={"/models": model_volume, S2TT_DIR: s2tt_volume},
     timeout=3 * 60 * 60,
 )
-def smoke(num_rollout: int = 1, streaming: bool = False) -> None:
+def smoke(
+    num_rollout: int = 1,
+    streaming: bool = False,
+    speech: bool = False,
+) -> dict[str, object] | None:
     """Run the real external-Omni Relax training closure."""
     import subprocess
     import threading
     import time
 
+    if speech and (streaming or num_rollout != 1):
+        raise ValueError(
+            "Cost-controlled post-train speech smoke requires "
+            "num_rollout=1 and streaming=False"
+        )
     if streaming:
         if num_rollout not in (1, 2, 3):
             raise ValueError(
@@ -669,6 +879,7 @@ def smoke(num_rollout: int = 1, streaming: bool = False) -> None:
     omni_output_thread = None
     train_output_lines: list[str] = []
     omni_output_lines: list[str] = []
+    speech_result: dict[str, object] | None = None
 
     try:
         duration_s = _write_bleu_smoke_dataset(
@@ -749,11 +960,15 @@ def smoke(num_rollout: int = 1, streaming: bool = False) -> None:
                 )
 
         print(
-            "[startup] Megatron actor ready; starting colocated SGLang-Omni TP4",
+            "[startup] Megatron actor ready; starting colocated SGLang-Omni TP4 "
+            f"(speech={speech})",
             flush=True,
         )
+        omni_server_code = (
+            _OMNI_SPEECH_SERVER_CODE if speech else _OMNI_TEXT_SERVER_CODE
+        )
         omni_process = subprocess.Popen(
-            [OMNI_PYTHON, "-c", _OMNI_SERVER_CODE],
+            [OMNI_PYTHON, "-c", omni_server_code],
             env=omni_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -802,9 +1017,29 @@ def smoke(num_rollout: int = 1, streaming: bool = False) -> None:
                 ),
                 expected_steps=num_rollout,
             )
+        if speech:
+            speech_result = _run_post_train_speech(
+                f"http://127.0.0.1:{OMNI_PORT}"
+            )
+            expected_routing = (
+                f"request_ids=['{POST_TRAIN_SPEECH_REQUEST_ID}'] "
+                "lora_ids=['policy'] has_active_lora=True"
+            )
+            routing_deadline = time.monotonic() + 10
+            while expected_routing not in "".join(omni_output_lines):
+                if time.monotonic() >= routing_deadline:
+                    raise RuntimeError(
+                        "Post-train speech did not prove active Thinker policy routing; "
+                        f"expected marker={expected_routing!r}"
+                    )
+                time.sleep(0.1)
+            print(
+                "[evidence] post-train speech used active Thinker policy LoRA",
+                flush=True,
+            )
         print(
             "REAL RELAX OMNI SMOKE PASS "
-            f"(num_rollout={num_rollout}, streaming={streaming})",
+            f"(num_rollout={num_rollout}, streaming={streaming}, speech={speech})",
             flush=True,
         )
     finally:
@@ -822,8 +1057,28 @@ def smoke(num_rollout: int = 1, streaming: bool = False) -> None:
         if omni_output_thread is not None:
             omni_output_thread.join(timeout=10)
         print("[cleanup] Ray and SGLang-Omni stopped", flush=True)
+    return speech_result
 
 
 @app.local_entrypoint()
-def main(num_rollout: int = 1, streaming: bool = False) -> None:
-    smoke.remote(num_rollout=num_rollout, streaming=streaming)
+def main(
+    num_rollout: int = 1,
+    streaming: bool = False,
+    speech: bool = False,
+) -> None:
+    result = smoke.remote(
+        num_rollout=num_rollout,
+        streaming=streaming,
+        speech=speech,
+    )
+    if speech:
+        if result is None:
+            raise RuntimeError("Post-train speech smoke returned no WAV result")
+        output_path = HERE / "relax_omni_post_train_speech.wav"
+        output_path.write_bytes(result["wav_bytes"])
+        print(f"[local] Thinker text: {result['text']!r}")
+        print(
+            "[local] Post-train Talker WAV saved: "
+            f"{output_path} ({result['duration_s']:.3f}s, "
+            f"{result['sample_rate']} Hz, RMS={result['rms']:.6f})"
+        )
