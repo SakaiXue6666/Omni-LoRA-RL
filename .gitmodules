@@ -1,8 +1,8 @@
 [submodule "Relax"]
 	path = Relax
 	url = https://github.com/SakaiXue6666/Relax.git
-	branch = lora-omni-baseline
+	branch = lora-omni-v2
 [submodule "sglang"]
 	path = sglang
 	url = https://github.com/SakaiXue6666/sglang.git
-	branch = lora-omni-baseline
+	branch = lora-omni-v2
