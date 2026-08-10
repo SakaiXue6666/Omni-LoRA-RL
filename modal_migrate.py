@@ -22,7 +22,7 @@
     modal run modal_migrate.py
 
 可调（环境变量）：
-    MIG_BASE_IMAGE       基础镜像（默认 slimerl/slime:latest）
+    MIG_BASE_IMAGE       基础镜像（默认 slime nightly-dev-20260428a，见 README_v1.md）
     MIG_BRIDGE_INSTALL   bridge 安装命令（默认见下；想只换 bridge 加回 --no-deps；
                          想装 git ref 改成 pip install 'megatron-bridge @ git+https://...'）
 """
@@ -45,7 +45,11 @@ MODEL_VOLUME_NAME = "qwen3-omni-weights"
 MODEL_MOUNT = "/models"                 # 卷挂载点（与 modal_run.py 一致）
 OMNI_CKPT = "/models/qwen3-omni"        # 权重目录（卷内）
 
-BASE_IMAGE = os.environ.get("MIG_BASE_IMAGE", "slimerl/slime:latest")
+# v1 冻结镜像 = slime nightly-dev-20260428a（:latest 会漂移，认定过程见 README_v1.md）
+BASE_IMAGE = os.environ.get(
+    "MIG_BASE_IMAGE",
+    "slimerl/slime@sha256:bd219aba21be6e404ff09e385f34f40993b60773b928e13f341e8d77590da6aa",
+)
 BRIDGE_INSTALL = os.environ.get(
     "MIG_BRIDGE_INSTALL",
     # 第 2 轮：带依赖安装，让 pip 按需升级 megatron-core（不 force-reinstall，

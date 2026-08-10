@@ -15,7 +15,11 @@ from typing import Any
 import modal
 
 APP_NAME = "sglang-omni-lora-tensor-e2e"
-BASE_IMAGE = os.environ.get("RELAX_BASE_IMAGE", "slimerl/slime:latest")
+# v1 冻结镜像 = slime nightly-dev-20260428a（:latest 会漂移，认定过程见 README_v1.md）
+BASE_IMAGE = os.environ.get(
+    "RELAX_BASE_IMAGE",
+    "slimerl/slime@sha256:bd219aba21be6e404ff09e385f34f40993b60773b928e13f341e8d77590da6aa",
+)
 MODEL_VOLUME_NAME = "qwen3-omni-weights"
 MODEL_DIR = "/models/qwen3-omni"
 MODEL_VOLUME_PATH = "/models"

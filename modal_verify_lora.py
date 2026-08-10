@@ -1,7 +1,7 @@
 """在 Modal 上跑 verify_lora_attach.py（机制验证，成本最小化）。
 
 省钱策略：
-  - 直接拉 slime 预构建镜像 `slimerl/slime:latest`（已装 Megatron + Megatron-Bridge
+  - 直接拉 slime 预构建镜像 `nightly-dev-20260428a`（已装 Megatron + Megatron-Bridge
     + TransformerEngine），不从零编译（否则编 flash-attn/TE/apex 要几小时 + 大量费用）。
   - 用最便宜的 GPU(T4)；脚本只跑几秒。
   - 短超时，跑完即停。
@@ -24,8 +24,11 @@ REMOTE_SCRIPT = "/root/verify_lora_attach.py"
 LOCAL_TP_SCRIPT = HERE / "verify_lora_tp.py"
 REMOTE_TP_SCRIPT = "/root/verify_lora_tp.py"
 
+# v1 冻结镜像 = slime nightly-dev-20260428a（:latest 会漂移，认定过程见 README_v1.md）
+BASE_IMAGE = "slimerl/slime@sha256:bd219aba21be6e404ff09e385f34f40993b60773b928e13f341e8d77590da6aa"
+
 image = (
-    modal.Image.from_registry("slimerl/slime:latest", add_python=None)
+    modal.Image.from_registry(BASE_IMAGE, add_python=None)
     .add_local_file(LOCAL_SCRIPT.as_posix(), REMOTE_SCRIPT, copy=True)
     .add_local_file(LOCAL_TP_SCRIPT.as_posix(), REMOTE_TP_SCRIPT, copy=True)
 )

@@ -1,0 +1,2908 @@
+diff --git a/sglang_omni/cli/serve.py b/sglang_omni/cli/serve.py
+index c43db370..21319dd5 100644
+--- a/sglang_omni/cli/serve.py
++++ b/sglang_omni/cli/serve.py
+@@ -571,6 +571,10 @@ def apply_thinker_server_args_cli_overrides(
+     *,
+     cpu_offload_gb: int | None,
+     quantization: str | None,
++    enable_lora: bool = False,
++    max_lora_rank: int | None = None,
++    lora_target_modules: str | None = None,
++    max_loras_per_batch: int | None = None,
+ ) -> PipelineConfig:
+     updates: dict[str, object] = {}
+     if cpu_offload_gb is not None:
+@@ -582,6 +586,29 @@ def apply_thinker_server_args_cli_overrides(
+         if not quantization:
+             raise typer.BadParameter("--quantization must not be empty")
+         updates["quantization"] = quantization
++    if enable_lora:
++        updates["enable_lora"] = True
++        if max_lora_rank is not None:
++            if max_lora_rank <= 0:
++                raise typer.BadParameter("--max-lora-rank must be > 0")
++            updates["max_lora_rank"] = int(max_lora_rank)
++        if lora_target_modules is not None:
++            modules = [m.strip() for m in lora_target_modules.split(",") if m.strip()]
++            if not modules:
++                raise typer.BadParameter("--lora-target-modules must not be empty")
++            updates["lora_target_modules"] = modules
++        if max_loras_per_batch is not None:
++            if max_loras_per_batch <= 0:
++                raise typer.BadParameter("--max-loras-per-batch must be > 0")
++            updates["max_loras_per_batch"] = int(max_loras_per_batch)
++    elif any(
++        v is not None
++        for v in (max_lora_rank, lora_target_modules, max_loras_per_batch)
++    ):
++        raise typer.BadParameter(
++            "--max-lora-rank/--lora-target-modules/--max-loras-per-batch "
++            "require --enable-lora"
++        )
+ 
+     if updates:
+         _apply_stage_server_args_override(
+@@ -1011,6 +1038,36 @@ def serve(
+             help="Set SGLang quantization mode for the thinker stage.",
+         ),
+     ] = None,
++    enable_lora: Annotated[
++        bool,
++        typer.Option(
++            "--enable-lora",
++            help="Enable LoRA on the thinker stage (allows hot-loading adapters).",
++        ),
++    ] = False,
++    max_lora_rank: Annotated[
++        int | None,
++        typer.Option(
++            "--max-lora-rank",
++            help="Max LoRA rank for the thinker (required with --enable-lora "
++            "unless --lora-paths preloads adapters).",
++        ),
++    ] = None,
++    lora_target_modules: Annotated[
++        str | None,
++        typer.Option(
++            "--lora-target-modules",
++            help="Comma-separated LoRA target module suffixes for the thinker "
++            "(e.g. 'qkv_proj,o_proj,gate_up_proj,down_proj').",
++        ),
++    ] = None,
++    max_loras_per_batch: Annotated[
++        int | None,
++        typer.Option(
++            "--max-loras-per-batch",
++            help="Max distinct LoRA adapters per batch on the thinker.",
++        ),
++    ] = None,
+     log_level: Annotated[
+         Literal["debug", "info", "warning", "error", "critical"],
+         typer.Option(help="Log level (default: info)."),
+@@ -1236,6 +1293,10 @@ def serve(
+         merged_config,
+         cpu_offload_gb=cpu_offload_gb,
+         quantization=quantization,
++        enable_lora=enable_lora,
++        max_lora_rank=max_lora_rank,
++        lora_target_modules=lora_target_modules,
++        max_loras_per_batch=max_loras_per_batch,
+     )
+     merged_config = apply_parallelism_cli_overrides(
+         merged_config,
+diff --git a/sglang_omni/client/client.py b/sglang_omni/client/client.py
+index 2b028a18..e34e89dc 100644
+--- a/sglang_omni/client/client.py
++++ b/sglang_omni/client/client.py
+@@ -330,6 +330,17 @@ class Client:
+             timeout_s=timeout_s,
+         )
+ 
++    async def flush_cache(
++        self,
++        *,
++        stages: list[str] | None = None,
++        timeout_s: float = 60.0,
++    ) -> dict[str, Any]:
++        return await self._coordinator.flush_cache(
++            stages=stages,
++            timeout_s=timeout_s,
++        )
++
+     async def update_weights_from_disk(
+         self,
+         payload: dict[str, Any],
+@@ -395,6 +406,45 @@ class Client:
+             timeout_s=timeout_s,
+         )
+ 
++    async def load_lora_adapter(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: list[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        return await self._coordinator.load_lora_adapter(
++            payload,
++            stages=stages,
++            timeout_s=timeout_s,
++        )
++
++    async def load_lora_adapter_from_tensors(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: list[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        return await self._coordinator.load_lora_adapter_from_tensors(
++            payload,
++            stages=stages,
++            timeout_s=timeout_s,
++        )
++
++    async def unload_lora_adapter(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: list[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        return await self._coordinator.unload_lora_adapter(
++            payload,
++            stages=stages,
++            timeout_s=timeout_s,
++        )
++
+     # ------------------------------------------------------------------
+     # Internals
+     # ------------------------------------------------------------------
+diff --git a/sglang_omni/model_runner/base.py b/sglang_omni/model_runner/base.py
+index 7db85402..17aacd1e 100644
+--- a/sglang_omni/model_runner/base.py
++++ b/sglang_omni/model_runner/base.py
+@@ -270,7 +270,6 @@ class ModelRunner:
+         if schedule_batch is None:
+             return None
+ 
+-        model_worker_batch = schedule_batch.get_model_worker_batch()
+         is_prefill = bool(schedule_batch.forward_mode.is_extend())
+ 
+         capture_hidden_mode = (
+@@ -282,15 +281,34 @@ class ModelRunner:
+                 schedule_batch, scheduler_output.requests
+             )
+         )
++        # sglang 0.5.12 removed ScheduleBatch.get_model_worker_batch(): the
++        # ModelWorkerBatch intermediate was dropped and ForwardBatch.init_new now
++        # takes the ScheduleBatch directly, consuming a one-shot
++        # ``capture_hidden_mode`` override off the SB (read-then-reset in
++        # init_new). So stamp the override onto the ScheduleBatch instead of a MWB.
+         if capture_hidden_mode is not None:
+-            model_worker_batch.capture_hidden_mode = capture_hidden_mode
++            schedule_batch.capture_hidden_mode = capture_hidden_mode
+         elif self.output_processor._capture_hidden:
+-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
++            schedule_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+ 
+         forward_batch = ForwardBatch.init_new(
+-            model_worker_batch, self.tp_worker.model_runner
++            schedule_batch, self.tp_worker.model_runner
+         )
+-        return forward_batch, schedule_batch, model_worker_batch, is_prefill
++        if is_prefill:
++            lora_manager = getattr(self.tp_worker.model_runner, "lora_manager", None)
++            lora_backend = getattr(lora_manager, "lora_backend", None)
++            batch_info = getattr(lora_backend, "batch_info", None)
++            logger.info(
++                "Omni ModelRunner prefill LoRA routing: request_ids=%s "
++                "lora_ids=%s has_active_lora=%s",
++                [getattr(req, "rid", None) for req in schedule_batch.reqs],
++                list(getattr(forward_batch, "lora_ids", []) or []),
++                getattr(batch_info, "has_active_lora", None),
++            )
++        # The MWB slot in the returned tuple is kept for call-site compatibility;
++        # its only downstream readers touch ``.seq_lens`` / ``.input_ids`` (the
++        # prefill-only finalize branch), both of which ScheduleBatch also carries.
++        return forward_batch, schedule_batch, schedule_batch, is_prefill
+ 
+     def _prepare_and_forward(
+         self,
+diff --git a/sglang_omni/model_runner/model_worker.py b/sglang_omni/model_runner/model_worker.py
+index aa0d926b..652de614 100644
+--- a/sglang_omni/model_runner/model_worker.py
++++ b/sglang_omni/model_runner/model_worker.py
+@@ -347,6 +347,151 @@ class ModelWorker:
+                     setattr(runner_args, "weight_version", weight_version)
+         return bool(success), str(message)
+ 
++    def load_lora_adapter(self, payload: dict[str, Any]) -> tuple[bool, str]:
++        """Load a LoRA adapter from disk into the running model runner.
++
++        Mirrors sglang's TpWorker.load_lora_adapter: build a LoRARef and delegate
++        to the (inherited) ModelRunner.load_lora_adapter. Requires the server to
++        have been started with enable_lora=True so the LoRAManager exists.
++        """
++        load = getattr(self.model_runner, "load_lora_adapter", None)
++        if load is None:
++            return False, "model runner does not support load_lora_adapter"
++        lora_name = payload.get("lora_name")
++        lora_path = payload.get("lora_path")
++        if not lora_name or not lora_path:
++            return False, "lora_name and lora_path are required"
++        from sglang.srt.lora.lora_registry import LoRARef
++
++        # Use a deterministic lora_id (== lora_name unless overridden) so a
++        # generate request can route to this adapter by name via req.lora_id.
++        lora_ref = LoRARef(
++            lora_id=str(payload.get("lora_id") or lora_name),
++            lora_name=str(lora_name),
++            lora_path=str(lora_path),
++            pinned=bool(payload.get("pinned", False)),
++        )
++        result = load(lora_ref)
++        return bool(result.success), str(result.error_message or "")
++
++    def load_lora_adapter_from_tensors(
++        self, payload: dict[str, Any]
++    ) -> tuple[bool, str]:
++        """Load a LoRA adapter from serialized in-memory tensors."""
++        load = getattr(self.model_runner, "load_lora_adapter_from_tensors", None)
++        if load is None:
++            return (
++                False,
++                "model runner does not support load_lora_adapter_from_tensors",
++            )
++
++        lora_name = payload.get("lora_name")
++        serialized_tensors = payload.get("serialized_tensors")
++        config_dict = payload.get("config_dict")
++        if not isinstance(lora_name, str) or not lora_name:
++            return False, "lora_name is required and must be a non-empty string"
++        if not isinstance(serialized_tensors, str) or not serialized_tensors:
++            return (
++                False,
++                "serialized_tensors is required and must be a non-empty string",
++            )
++        if not isinstance(config_dict, dict):
++            return False, "config_dict is required and must be a dictionary"
++
++        from sglang.srt.lora.lora_registry import LoRARef
++        from sglang.srt.utils import MultiprocessingSerializer
++        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
++        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
++
++        try:
++            monkey_patch_torch_reductions()
++            if payload.get("load_format") == "flattened_bucket":
++                flattened_data = MultiprocessingSerializer.deserialize(
++                    serialized_tensors
++                )
++                bucket = FlattenedTensorBucket(
++                    flattened_tensor=flattened_data["flattened_tensor"],
++                    metadata=flattened_data["metadata"],
++                )
++                tensors = dict(bucket.reconstruct_tensors())
++            else:
++                tensors = MultiprocessingSerializer.deserialize(serialized_tensors)
++        except Exception as exc:
++            detail = str(exc) or type(exc).__name__
++            return False, f"failed to deserialize LoRA tensors: {detail}"
++
++        lora_ref = LoRARef(
++            lora_id=str(payload.get("lora_id") or lora_name),
++            lora_name=str(lora_name),
++            lora_path="__tensor__",
++            pinned=bool(payload.get("pinned", False)),
++        )
++        result = load(
++            lora_ref,
++            tensors,
++            config_dict,
++            payload.get("added_tokens_config"),
++        )
++        return bool(result.success), str(result.error_message or "")
++
++    def unload_lora_adapter(self, payload: dict[str, Any]) -> tuple[bool, str]:
++        """Unload a previously loaded LoRA adapter by name."""
++        unload = getattr(self.model_runner, "unload_lora_adapter", None)
++        if unload is None:
++            return False, "model runner does not support unload_lora_adapter"
++        lora_name = payload.get("lora_name")
++        if not lora_name:
++            return False, "lora_name is required"
++        from sglang.srt.lora.lora_registry import LoRARef
++
++        lora_ref = LoRARef(
++            lora_id=str(payload.get("lora_id") or lora_name),
++            lora_name=str(lora_name),
++            lora_path=None,
++        )
++        result = unload(lora_ref)
++        if result.success:
++            self._invalidate_lora_memory_pool_slot(lora_ref.lora_id)
++        return bool(result.success), str(result.error_message or "")
++
++    def _invalidate_lora_memory_pool_slot(self, lora_id: str) -> None:
++        """Ensure a later same-ID load copies fresh weights into the GPU pool.
++
++        Standard SGLang removes the CPU-side adapter during unload but can leave
++        its UID mapped to the old GPU buffer. A subsequent load with the same
++        ID then reuses that slot without copying the newly supplied tensors.
++        """
++        lora_manager = getattr(self.model_runner, "lora_manager", None)
++        memory_pool = getattr(lora_manager, "memory_pool", None)
++        uid_to_buffer_id = getattr(memory_pool, "uid_to_buffer_id", None)
++        if not isinstance(uid_to_buffer_id, dict):
++            return
++
++        missing = object()
++        buffer_id = uid_to_buffer_id.pop(lora_id, missing)
++        if buffer_id is missing:
++            return
++
++        buffer_id_to_uid = getattr(memory_pool, "buffer_id_to_uid", None)
++        if (
++            isinstance(buffer_id, int)
++            and isinstance(buffer_id_to_uid, list)
++            and 0 <= buffer_id < len(buffer_id_to_uid)
++        ):
++            from sglang.srt.lora.mem_pool import EMPTY_SLOT
++
++            buffer_id_to_uid[buffer_id] = EMPTY_SLOT
++
++        eviction_policy = getattr(memory_pool, "eviction_policy", None)
++        remove = getattr(eviction_policy, "remove", None)
++        if callable(remove):
++            remove(lora_id)
++        logger.debug(
++            "Invalidated unloaded LoRA %r from GPU memory pool slot %r",
++            lora_id,
++            buffer_id,
++        )
++
+     def weights_checker(self, action: str) -> dict[str, Any]:
+         checker = getattr(self, "_strict_weight_checker", None)
+         if checker is None:
+@@ -416,18 +561,37 @@ def _apply_model_worker_backend_policy(
+     has_moe = _model_config_has_moe(model_config)
+     has_native_fp8_block_quant = _model_config_has_native_fp8_block_quant(model_config)
+ 
++    # 🚨 ===== [YULIN-MOD] START: 让 A100/H20 的 Talker 自动使用可用的 Triton MoE =====
++
++    # Qwen3-Omni 的 Talker 本身也是一个 MoE 模型。
++    #
++    # 在没有量化、并且用户没有手动指定 MoE backend 时，SGLang 默认可能选择
++    # FlashInfer CUTLASS。但它的 BF16 fused MoE 没有 A100（SM80）kernel；
++    # H20 上还可能在 CUDA graph capture 阶段卡住。
++    #
++    # 因此这里只针对 Talker 自动选择：
++    # - H20 或 A100/SM80 → Triton；
++    # - 其他受支持的新架构 → 保留 FlashInfer CUTLASS。
++    #
++    # 用户显式指定 moe_runner_backend 时不会进入这里，仍然尊重用户配置。
++
+     if (
+         model_arch_override == "Qwen3OmniTalker"
+         and effective_quantization is None
+         and moe_runner_backend == "auto"
+     ):
+         # Note:(Chenchen Hong) flashinfer_cutlass MoE deadlocks CUDA-graph
+-        # capture on H20 (no H20 kernel coverage); triton captures cleanly there.
++        # capture on H20 (no H20 kernel coverage), and FlashInfer's BF16
++        # cutlass_fused_moe has no SM80 backend for A100. Triton covers both.
+         server_args.moe_runner_backend = (
+-            "triton" if _is_h20_device() else "flashinfer_cutlass"
++            "triton"
++            if _is_h20_device() or _is_sm80_device()
++            else "flashinfer_cutlass"
+         )
+         moe_runner_backend = server_args.moe_runner_backend
+ 
++    # 🚨 ===== [YULIN-MOD] END =====
++
+     if (
+         is_qwen3_omni_arch
+         and effective_quantization == "fp8"
+@@ -540,6 +704,26 @@ def _is_h20_device() -> bool:
+         return False
+ 
+ 
++# 🚨 ===== [YULIN-MOD] START: 识别 A100 所属的 SM80 GPU 架构 =====
++
++# 不直接匹配显卡名称，而是读取当前可见逻辑 GPU 的 SM version。
++#
++# A100 对应 SM80。Modal 或 CUDA_VISIBLE_DEVICES 改写设备编号后，
++# get_visible_gpu_sm_version(0) 仍然检查当前进程实际看到的第 0 张卡，
++# 比硬编码物理 GPU 编号更可靠。
++
++def _is_sm80_device() -> bool:
++    """Return whether the active logical GPU is an SM80 device such as A100."""
++    try:
++        from sglang_omni.utils.gpu_compat import get_visible_gpu_sm_version
++
++        return get_visible_gpu_sm_version(0) == 80
++    except Exception:
++        return False
++
++# 🚨 ===== [YULIN-MOD] END =====
++
++
+ def _is_fp8_cutlass_moe_supported() -> bool:
+     """Mirror pinned SGLang 0.5.12.post1 FP8 CUTLASS MoE assertions."""
+     try:
+diff --git a/sglang_omni/model_runner/thinker_model_runner.py b/sglang_omni/model_runner/thinker_model_runner.py
+index a8d57dde..6acb1241 100644
+--- a/sglang_omni/model_runner/thinker_model_runner.py
++++ b/sglang_omni/model_runner/thinker_model_runner.py
+@@ -13,6 +13,11 @@ from typing import Any
+ 
+ import torch
+ from sglang.srt.managers.scheduler import GenerationBatchResult
++from sglang.srt.model_executor.forward_context import (
++    ForwardContext,
++    forward_context,
++    has_forward_context,
++)
+ 
+ from sglang_omni.model_runner.base import ModelRunner
+ 
+@@ -305,20 +310,34 @@ class ThinkerModelRunner(ModelRunner):
+             full_ds[visual_pos_masks] = ds_input
+             ds_input = full_ds
+ 
+-        hidden_states = outer.model(
+-            input_ids=None,
+-            positions=positions,
+-            forward_batch=forward_batch,
+-            input_embeds=input_embeds,
+-            input_deepstack_embeds=ds_input,
++        # sglang 0.5.12 introduced a global forward context: model layers read
++        # get_forward_context()/get_token_to_kv_pool() during forward (e.g.
++        # enable_fused_set_kv_buffer in qwen3_moe attention). Native
++        # ModelRunner.forward() publishes it, but this custom path calls
++        # outer.model() directly, so publish it here (honor an outer-published
++        # context if one is already active, mirroring ModelRunner.forward).
++        ctx_mgr = (
++            contextlib.nullcontext()
++            if has_forward_context()
++            else forward_context(
++                ForwardContext(attn_backend=model_runner.attn_backend)
++            )
+         )
++        with ctx_mgr:
++            hidden_states = outer.model(
++                input_ids=None,
++                positions=positions,
++                forward_batch=forward_batch,
++                input_embeds=input_embeds,
++                input_deepstack_embeds=ds_input,
++            )
+ 
+-        logits_output = outer.logits_processor(
+-            forward_batch.input_ids,
+-            hidden_states,
+-            outer.lm_head,
+-            forward_batch,
+-        )
++            logits_output = outer.logits_processor(
++                forward_batch.input_ids,
++                hidden_states,
++                outer.lm_head,
++                forward_batch,
++            )
+ 
+         return GenerationBatchResult(
+             logits_output=logits_output, can_run_cuda_graph=False
+diff --git a/sglang_omni/models/qwen3_omni/components/preprocessor.py b/sglang_omni/models/qwen3_omni/components/preprocessor.py
+index 55d41239..31d7084d 100644
+--- a/sglang_omni/models/qwen3_omni/components/preprocessor.py
++++ b/sglang_omni/models/qwen3_omni/components/preprocessor.py
+@@ -188,6 +188,45 @@ class Qwen3OmniPreprocessor:
+         num_videos: int,
+     ) -> list[dict[str, Any]]:
+         """Convert simple messages to HF's structured multimodal format."""
++        has_structured_content = any(
++            isinstance(msg.get("content"), list) for msg in messages
++        )
++        if has_structured_content:
++            expected_counts = {
++                "image": num_images,
++                "audio": num_audios,
++                "video": num_videos,
++            }
++            marker_counts = dict.fromkeys(expected_counts, 0)
++            result: list[dict[str, Any]] = []
++            for msg in messages:
++                updated = dict(msg)
++                content = updated.get("content", "")
++                if isinstance(content, list):
++                    parts: list[dict[str, Any]] = []
++                    for part in content:
++                        if not isinstance(part, dict):
++                            raise ValueError(
++                                "Structured message content parts must be dictionaries"
++                            )
++                        part_type = part.get("type")
++                        if part_type in marker_counts:
++                            marker_counts[part_type] += 1
++                        parts.append(dict(part))
++                    updated["content"] = parts
++                result.append(updated)
++            mismatches = [
++                f"{modality} markers={marker_counts[modality]} inputs={count}"
++                for modality, count in expected_counts.items()
++                if marker_counts[modality] != count
++            ]
++            if mismatches:
++                raise ValueError(
++                    "Structured message media markers must match metadata inputs: "
++                    + ", ".join(mismatches)
++                )
++            return result
++
+         if num_images == 0 and num_audios == 0 and num_videos == 0:
+             return messages
+ 
+diff --git a/sglang_omni/models/qwen3_omni/components/sglang_thinker.py b/sglang_omni/models/qwen3_omni/components/sglang_thinker.py
+index c3c3f4a3..c71151c9 100644
+--- a/sglang_omni/models/qwen3_omni/components/sglang_thinker.py
++++ b/sglang_omni/models/qwen3_omni/components/sglang_thinker.py
+@@ -9,6 +9,7 @@ prefill, so this wrapper keeps only the text model and LM head.
+ 
+ from __future__ import annotations
+ 
++import re
+ from typing import Any, Iterable, Optional, Tuple
+ 
+ import torch
+@@ -29,6 +30,29 @@ from sglang_omni.models.qwen3_omni.quantization import (
+ class Qwen3OmniThinkerForCausalLM(nn.Module):
+     """Qwen3-Omni thinker text model without duplicated audio/vision towers."""
+ 
++    # --- LoRA support (thinker text body only) --------------------------------
++    # Unlike the full sglang Qwen3-Omni model (which keeps the audio/vision
++    # towers under a ``thinker.`` prefix), this wrapper is a text-only top-level
++    # module: layers live directly under ``model.layers.*`` with no ``thinker.``
++    # prefix. The gate below only matches the language body so LoRA never leaks
++    # into anything else served in this process.
++    supports_lora = True
++    packed_modules_mapping = {
++        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++        "gate_up_proj": ["gate_proj", "up_proj"],
++    }
++    _lora_pattern = re.compile(
++        r"^(?:"
++        r"model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)"
++        r"|lm_head"
++        r"|model\.embed_tokens"
++        r")$"
++    )
++
++    def should_apply_lora(self, module_name: str) -> bool:
++        """Restrict LoRA to the thinker language body (attn/MoE/embeddings)."""
++        return bool(self._lora_pattern.match(module_name))
++
+     def __init__(
+         self,
+         config: Any,
+diff --git a/sglang_omni/models/qwen3_omni/request_builders.py b/sglang_omni/models/qwen3_omni/request_builders.py
+index 6fef9756..5f0cc06d 100644
+--- a/sglang_omni/models/qwen3_omni/request_builders.py
++++ b/sglang_omni/models/qwen3_omni/request_builders.py
+@@ -4,6 +4,7 @@
+ from __future__ import annotations
+ 
+ import logging
++from array import array
+ from collections.abc import Callable, Iterable
+ from dataclasses import dataclass
+ from typing import Any
+@@ -606,12 +607,39 @@ def build_sglang_thinker_request(
+     req = Req(
+         rid=rid,
+         origin_input_text="",
+-        origin_input_ids=input_ids_list,
++        # sglang 0.5.12 initializes Req.output_ids as array("q") and computes
++        # fill_ids = origin_input_ids + output_ids; a plain list would raise
++        # "can only concatenate list (not array.array) to list". Match native
++        # by passing origin_input_ids as an array too.
++        origin_input_ids=array("q", input_ids_list),
+         sampling_params=sampling_params,
+         vocab_size=vocab_size,
+     )
+     req.tokenizer = tokenizer
+ 
++    # Route this request to a hot-loaded LoRA adapter (loaded via the admin
++    # load_lora_adapter op with lora_id == lora_name). When absent, lora_id
++    # stays None and the request runs on the base model. LoRAManager only
++    # applies an adapter whose id is present in its memory pool, so a stale or
++    # unknown name safely falls back to base (see prepare_lora_batch guard).
++    #
++    # Accept both routing styles:
++    #   - flat top-level params (Relax / programmatic OmniRequest.params, or
++    #     HTTP extra_params which _build_params merges into the top level), and
++    #   - per-stage HTTP params under params["stage_params"]["thinker"], which
++    #     is where /generate and /v1/chat/completions place thinker-scoped
++    #     fields (they are NOT merged into the flat top level).
++    stage_params = params.get("stage_params") or {}
++    thinker_params = stage_params.get("thinker") or {}
++    lora_id = (
++        params.get("lora_id")
++        or params.get("lora_name")
++        or thinker_params.get("lora_id")
++        or thinker_params.get("lora_name")
++    )
++    if lora_id is not None:
++        req.lora_id = str(lora_id)
++
+     # Compute M-RoPE positions and attach multimodal_inputs to Req
+     if thinker_config is not None and model_inputs:
+         mrope_result = _compute_mrope_positions(
+@@ -727,7 +755,9 @@ def build_sglang_talker_request(
+     req = Req(
+         rid=rid,
+         origin_input_text="",
+-        origin_input_ids=input_ids_list,
++        # sglang 0.5.12: origin_input_ids must be array("q") to concat with
++        # output_ids (also array) in init_next_round_input.
++        origin_input_ids=array("q", input_ids_list),
+         sampling_params=sampling_params,
+         # Convert hidden states to list-of-lists for Req.input_embeds
+         input_embeds=(
+diff --git a/sglang_omni/models/qwen3_omni/talker_model_runner.py b/sglang_omni/models/qwen3_omni/talker_model_runner.py
+index fd18affa..7c11e465 100644
+--- a/sglang_omni/models/qwen3_omni/talker_model_runner.py
++++ b/sglang_omni/models/qwen3_omni/talker_model_runner.py
+@@ -3,10 +3,16 @@
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ from typing import Any
+ 
+ import torch
+ from sglang.srt.managers.scheduler import GenerationBatchResult
++from sglang.srt.model_executor.forward_context import (
++    ForwardContext,
++    forward_context,
++    has_forward_context,
++)
+ 
+ from sglang_omni.model_runner.base import ModelRunner
+ from sglang_omni.scheduling.messages import OutgoingMessage
+@@ -492,34 +498,62 @@ class QwenTalkerModelRunner(ModelRunner):
+         input_deepstack_mask: torch.Tensor | None = None,
+         input_embeds_are_projected: bool = False,
+     ) -> GenerationBatchResult:
++
++        # 🚨 ===== [YULIN-MOD] START: 为 Talker 自定义 embedding prefill 补齐 SGLang ForwardContext =====
++
++        # Talker 接收的是 Thinker 传来的投影 embedding，因此这里不会走标准
++        # SGLang ModelRunner._forward_raw()。
++        #
++        # 但 _forward_raw() 除了执行模型，还会发布当前 attention backend。
++        # KV-cache 和 attention helper 会从 ForwardContext 中读取这个 backend。
++        # Talker 绕过标准入口后，如果不在这里补齐上下文，speech decode 就可能
++        # 在 KV-cache/attention 阶段失败。
++        #
++        # 如果外层已经创建了 ForwardContext，就直接复用，避免覆盖调用者状态；
++        # 否则临时创建一个，并在本次 forward 结束后自动清理。
++
+         model_runner = self.tp_worker.model_runner
+         model_dtype = self.model.activation_dtype
+ 
+-        model_runner.attn_backend.init_forward_metadata(forward_batch)
++        # This custom projected-embed path bypasses SGLang ModelRunner._forward_raw,
++        # which normally publishes the active attention backend for KV-cache helpers.
++        # Match the standard runner contract and preserve an outer context if present.
++        ctx = (
++            contextlib.nullcontext()
++            if has_forward_context()
++            else forward_context(
++                ForwardContext(attn_backend=model_runner.attn_backend)
++            )
++        )
++        with ctx:
++            model_runner.attn_backend.init_forward_metadata(forward_batch)
+ 
+-        positions = forward_batch.positions
+-        if forward_batch.mrope_positions is not None:
+-            positions = forward_batch.mrope_positions
++            positions = forward_batch.positions
++            if forward_batch.mrope_positions is not None:
++                positions = forward_batch.mrope_positions
+ 
+-        input_embeds = input_embeds.to(
+-            device=forward_batch.input_ids.device,
+-            dtype=model_dtype,
+-        )
+-        if input_deepstack_embeds is not None:
+-            input_deepstack_embeds = input_deepstack_embeds.to(
++            input_embeds = input_embeds.to(
+                 device=forward_batch.input_ids.device,
+                 dtype=model_dtype,
+             )
++            if input_deepstack_embeds is not None:
++                input_deepstack_embeds = input_deepstack_embeds.to(
++                    device=forward_batch.input_ids.device,
++                    dtype=model_dtype,
++                )
++
++            logits_output = self.model(
++                input_ids=forward_batch.input_ids,
++                positions=positions,
++                forward_batch=forward_batch,
++                input_embeds=input_embeds,
++                input_deepstack_embeds=input_deepstack_embeds,
++                input_deepstack_mask=input_deepstack_mask,
++                input_embeds_are_projected=input_embeds_are_projected,
++            )
++
++        # 🚨 ===== [YULIN-MOD] END =====
+ 
+-        logits_output = self.model(
+-            input_ids=forward_batch.input_ids,
+-            positions=positions,
+-            forward_batch=forward_batch,
+-            input_embeds=input_embeds,
+-            input_deepstack_embeds=input_deepstack_embeds,
+-            input_deepstack_mask=input_deepstack_mask,
+-            input_embeds_are_projected=input_embeds_are_projected,
+-        )
+         return GenerationBatchResult(
+             logits_output=logits_output,
+             can_run_cuda_graph=False,
+diff --git a/sglang_omni/pipeline/coordinator.py b/sglang_omni/pipeline/coordinator.py
+index 9071ce7b..dde55998 100644
+--- a/sglang_omni/pipeline/coordinator.py
++++ b/sglang_omni/pipeline/coordinator.py
+@@ -245,6 +245,18 @@ class Coordinator:
+             timeout_s=timeout_s,
+         )
+ 
++    async def flush_cache(
++        self,
++        *,
++        stages: Sequence[str] | None = None,
++        timeout_s: float = 60.0,
++    ) -> dict[str, Any]:
++        return await self.admin(
++            "flush_cache",
++            stages=stages,
++            timeout_s=timeout_s,
++        )
++
+     async def update_weights_from_disk(
+         self,
+         payload: dict[str, Any],
+@@ -315,6 +327,48 @@ class Coordinator:
+             timeout_s=timeout_s,
+         )
+ 
++    async def load_lora_adapter(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: Sequence[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        return await self.admin(
++            "load_lora_adapter",
++            payload,
++            stages=stages,
++            timeout_s=timeout_s,
++        )
++
++    async def load_lora_adapter_from_tensors(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: Sequence[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        return await self.admin(
++            "load_lora_adapter_from_tensors",
++            payload,
++            stages=stages,
++            timeout_s=timeout_s,
++        )
++
++    async def unload_lora_adapter(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: Sequence[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        return await self.admin(
++            "unload_lora_adapter",
++            payload,
++            stages=stages,
++            timeout_s=timeout_s,
++        )
++
+     async def submit(self, request_id: str, request: OmniRequest | Any) -> Any:
+         """Submit a request to the pipeline and wait for completion."""
+         await self._submit_request(request_id, request)
+diff --git a/sglang_omni/pipeline/stage/runtime.py b/sglang_omni/pipeline/stage/runtime.py
+index 6a673c1f..104194db 100644
+--- a/sglang_omni/pipeline/stage/runtime.py
++++ b/sglang_omni/pipeline/stage/runtime.py
+@@ -671,7 +671,28 @@ class Stage:
+     def _deserialize_ipc_chunk(msg: DataReadyMessage) -> StreamItem:
+         import pickle as _pickle
+ 
++        # 🚨 ===== [YULIN-MOD] START: 保持 tensor LoRA 热更新后的 Thinker→Talker CUDA IPC 可反序列化 =====
++
++        # 标准 SGLang 在加载 tensor LoRA 时会 patch PyTorch 的 tensor reducer。
++        #
++        # Thinker 完成热更新后，后续发给 Talker 的同卡 CUDA IPC tensor 也可能
++        # 使用这个 reducer 序列化。如果 Talker 进程没有安装配套的 rebuild
++        # 函数，pickle.loads 就会找不到反序列化入口，speech 链路会在
++        # Thinker → Talker 交接处中断。
++        #
++        # 因此接收端在反序列化 IPC tensor 前执行同一个幂等 patch，
++        # 让训练权重更新和后续 speech 生成能够连续工作。
++
++        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
++
+         ipc_meta = msg.shm_metadata
++        # Tensor hot-loading patches the sender's CUDA tensor reducer. Initialize
++        # the matching rebuild function in downstream stage processes before
++        # unpickling same-GPU CUDA IPC tensors (for example Thinker -> Talker).
++        monkey_patch_torch_reductions()
++
++        # 🚨 ===== [YULIN-MOD] END =====
++
+         data = _pickle.loads(ipc_meta["tensor_bytes"])
+         metadata = {}
+         raw_meta = ipc_meta.get("metadata", {})
+diff --git a/sglang_omni/pipeline/stage_workers.py b/sglang_omni/pipeline/stage_workers.py
+index 6a74808b..18e6c9d9 100644
+--- a/sglang_omni/pipeline/stage_workers.py
++++ b/sglang_omni/pipeline/stage_workers.py
+@@ -389,6 +389,18 @@ def stage_process_main(
+         with suppress(Exception):
+             traceback.clear_frames(exc.__traceback__)
+         log.error("Stage process %s failed\n%s", spec.process_name, traceback_text)
++        # Also persist to a shared file so a co-located driver can recover the
++        # child traceback even when the platform log buffer only retains a tail.
++        _dump_dir = os.environ.get("SGLANG_OMNI_STAGE_ERROR_DIR")
++        if _dump_dir:
++            with suppress(Exception):
++                os.makedirs(_dump_dir, exist_ok=True)
++                with open(
++                    os.path.join(_dump_dir, f"{spec.process_name}.log"),
++                    "w",
++                    encoding="utf-8",
++                ) as _fh:
++                    _fh.write(traceback_text)
+         _destroy_torch_distributed_process_group(log)
+         _reclaim_process_cuda_memory(
+             _stage_gpu_ids(spec.stage_specs),
+diff --git a/sglang_omni/preprocessing/text.py b/sglang_omni/preprocessing/text.py
+index 4613ff82..a412e242 100644
+--- a/sglang_omni/preprocessing/text.py
++++ b/sglang_omni/preprocessing/text.py
+@@ -51,17 +51,24 @@ def ensure_chat_template(
+             return
+ 
+ 
+-def normalize_messages(messages: Any) -> list[dict[str, str]]:
++def normalize_messages(messages: Any) -> list[dict[str, Any]]:
+     """Normalize chat messages into a list of {role, content} dicts."""
+     if not isinstance(messages, list):
+         raise ValueError("Preprocessing expects a list of chat messages")
+ 
+-    normalized: list[dict[str, str]] = []
++    normalized: list[dict[str, Any]] = []
+     for message in messages:
+         if not isinstance(message, dict):
+             raise ValueError("Each message must be a dict with role/content")
+         content = message.get("content", "")
+-        if not isinstance(content, str):
++        if isinstance(content, list):
++            normalized_parts: list[dict[str, Any]] = []
++            for part in content:
++                if not isinstance(part, Mapping):
++                    raise ValueError("Structured message content parts must be dicts")
++                normalized_parts.append(dict(part))
++            content = normalized_parts
++        elif not isinstance(content, str):
+             content = json.dumps(content, ensure_ascii=True)
+         normalized.append({"role": message.get("role", "user"), "content": content})
+     return normalized
+diff --git a/sglang_omni/proto/admin.py b/sglang_omni/proto/admin.py
+index 8aeeb5f2..442d4524 100644
+--- a/sglang_omni/proto/admin.py
++++ b/sglang_omni/proto/admin.py
+@@ -9,12 +9,16 @@ from typing import Any
+ ADMIN_MODEL_INFO = "model_info"
+ ADMIN_PAUSE_GENERATION = "pause_generation"
+ ADMIN_CONTINUE_GENERATION = "continue_generation"
++ADMIN_FLUSH_CACHE = "flush_cache"
+ ADMIN_UPDATE_WEIGHTS_FROM_DISK = "update_weights_from_disk"
+ ADMIN_UPDATE_WEIGHTS_FROM_TENSOR = "update_weights_from_tensor"
+ ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED = "update_weights_from_distributed"
+ ADMIN_INIT_WEIGHTS_UPDATE_GROUP = "init_weights_update_group"
+ ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP = "destroy_weights_update_group"
+ ADMIN_WEIGHTS_CHECKER = "weights_checker"
++ADMIN_LOAD_LORA_ADAPTER = "load_lora_adapter"
++ADMIN_LOAD_LORA_ADAPTER_FROM_TENSORS = "load_lora_adapter_from_tensors"
++ADMIN_UNLOAD_LORA_ADAPTER = "unload_lora_adapter"
+ 
+ 
+ @dataclass
+@@ -94,7 +98,9 @@ def is_update_action(action: str) -> bool:
+     return action in {
+         ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
+         ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
++        ADMIN_FLUSH_CACHE,
+         ADMIN_UPDATE_WEIGHTS_FROM_DISK,
+         ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
+         ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED,
++        ADMIN_LOAD_LORA_ADAPTER_FROM_TENSORS,
+     }
+diff --git a/sglang_omni/scheduling/omni_scheduler.py b/sglang_omni/scheduling/omni_scheduler.py
+index 665edb50..d30986b5 100644
+--- a/sglang_omni/scheduling/omni_scheduler.py
++++ b/sglang_omni/scheduling/omni_scheduler.py
+@@ -28,6 +28,19 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+ from sglang.srt.managers.scheduler import Scheduler as _Upstream
+ from sglang.srt.managers.scheduler import validate_input_length
++from sglang.srt.managers.scheduler_components.batch_result_processor import (
++    SchedulerBatchResultProcessor,
++)
++from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
++from sglang.srt.managers.scheduler_components.load_inquirer import (
++    SchedulerLoadInquirer,
++)
++from sglang.srt.managers.scheduler_components.logprob_result_processor import (
++    SchedulerLogprobResultProcessor,
++)
++from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
++    NewTokenRatioTracker,
++)
+ from sglang.srt.mem_cache.common import release_kv_cache
+ from sglang.srt.utils import broadcast_pyobj
+ 
+@@ -36,9 +49,13 @@ from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_
+ from sglang_omni.proto.admin import (
+     ADMIN_CONTINUE_GENERATION,
+     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
++    ADMIN_FLUSH_CACHE,
+     ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
++    ADMIN_LOAD_LORA_ADAPTER,
++    ADMIN_LOAD_LORA_ADAPTER_FROM_TENSORS,
+     ADMIN_MODEL_INFO,
+     ADMIN_PAUSE_GENERATION,
++    ADMIN_UNLOAD_LORA_ADAPTER,
+     ADMIN_UPDATE_WEIGHTS_FROM_DISK,
+     ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED,
+     ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
+@@ -48,6 +65,34 @@ from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _install_req_is_chunked_compat() -> None:
++    """sglang 0.5.12 renamed ``Req.is_chunked`` -> ``Req.inflight_middle_chunks``.
++
++    sglang-omni still reads/writes ``req.is_chunked`` in many places (thinker /
++    talker model runners, request builders, backend schedulers) with identical
++    semantics: ``> 0`` means the request is a mid-prefill chunk (not the final
++    chunk). Install a class-level alias property so every call site maps onto the
++    native counter that get_new_batch_prefill / process_batch_result_prefill
++    maintain. ``Req`` has no ``__slots__``, so a descriptor on the class is safe;
++    this is purely additive (native 0.5.12 has no ``is_chunked`` of its own).
++    """
++    from sglang.srt.managers.schedule_batch import Req as _SGLReq
++
++    if isinstance(getattr(_SGLReq, "is_chunked", None), property):
++        return
++
++    def _get(self):  # noqa: ANN001
++        return getattr(self, "inflight_middle_chunks", 0)
++
++    def _set(self, value):  # noqa: ANN001
++        self.inflight_middle_chunks = value
++
++    _SGLReq.is_chunked = property(_get, _set)
++
++
++_install_req_is_chunked_compat()
++
+ _FAILED_BATCH_RESULT = object()
+ 
+ _ABORTED_REQUEST_ID_LIMIT = 10000
+@@ -61,6 +106,41 @@ class _NoOpSender:
+         pass
+ 
+ 
++class _OmniOutputStreamer:
++    """Stand-in for sglang 0.5.12's ``SchedulerOutputStreamer`` that routes the
++    one ``stream_output`` call OmniScheduler depends on back to the scheduler.
++
++    In 0.5.12 the terminal-emission call was refactored out of
++    ``Scheduler.process_batch_result`` into
++    ``batch_result_processor.output_streamer.stream_output(reqs, return_logprob,
++    skip_req)`` (see batch_result_processor.process_batch_result_{prefill,decode}).
++    OmniScheduler still overrides ``stream_output`` (it captures *finished*
++    requests and puts their terminal ``result`` message on the outbox — the
++    payload the coordinator/client actually waits for), so that override must be
++    reached: we delegate ``stream_output`` to it. Per-token chunks are emitted
++    separately by ``OmniScheduler._emit_stream_output`` in ``_run_batch``; this
++    path only handles finished requests, so there is no double emission.
++
++    The native streamer's other methods (``_stream_output_generation`` /
++    ``_stream_output_embedding`` / pool-stats hooks) would pull in
++    ``pool_stats_observer`` / ``load_inquirer.get_loads`` / a full
++    ``ParallelState`` OmniScheduler never builds; they are not on the terminal
++    path, so they resolve to no-ops via ``__getattr__``.
++    """
++
++    def __init__(self, scheduler: Any):
++        self._scheduler = scheduler
++
++    def stream_output(self, *args, **kwargs):
++        return self._scheduler.stream_output(*args, **kwargs)
++
++    def __getattr__(self, _name):
++        def _noop(*args, **kwargs):
++            return None
++
++        return _noop
++
++
+ class _NoOpGrammarManager:
+     """Stub — OmniScheduler never uses constrained decoding."""
+ 
+@@ -291,11 +371,39 @@ class OmniScheduler:
+             self.init_new_token_ratio - self.min_new_token_ratio
+         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
+         self.new_token_ratio = self.init_new_token_ratio
++        # sglang 0.5.12 replaced the loose new_token_ratio* attrs above with a
++        # NewTokenRatioTracker object; native get_new_batch_prefill()/retract
++        # paths (reached via __getattr__) read self.new_token_ratio_tracker.
++        # Keep both: loose attrs for any legacy reader, tracker for 0.5.12.
++        self.new_token_ratio_tracker = NewTokenRatioTracker.from_server_args(
++            server_args
++        )
+         self.prefill_delayer = None
+ 
++        # LoRA: mirror native Scheduler instead of hardcoding off. When enabled,
++        # upstream get_new_batch_prefill()/ _can_schedule_lora_req() (reached via
++        # __getattr__) read these attributes, so they must all exist.
++        self.enable_lora = getattr(server_args, "enable_lora", False)
++        self.enable_lora_overlap_loading = getattr(
++            server_args, "enable_lora_overlap_loading", False
++        )
++        self.max_loras_per_batch = getattr(server_args, "max_loras_per_batch", 8)
++        self.lora_drainer = None
++        self.lora_overlap_loader = None
++        if self.enable_lora:
++            self._init_lora_scheduling(server_args)
++
+         # Feature flags (all disabled)
+-        self.enable_lora = False
+         self.enable_pdmux = False
++        # Forward-pass metrics (FPM): native get_next_batch_to_run() reads
++        # self.enable_fpm on every step. _init_metrics_reporter() sets it via the
++        # metrics reporter, but seed it here so the decode loop never trips over a
++        # missing attribute if reporter init order/path changes across sglang.
++        self.enable_fpm = False
++        # sglang 0.5.12: read by get_next_batch_to_run() when a chunked req is
++        # present. Set inside _get_new_batch_prefill_raw normally, but seed here
++        # so it always exists (first-iteration / no-prefill safety).
++        self._chunked_req_scheduled_last_iter = False
+         self.enable_metrics = server_args.enable_metrics
+         self.enable_trace = False
+         self.enable_hierarchical_cache = False
+@@ -305,7 +413,6 @@ class OmniScheduler:
+         self.skip_tokenizer_init = True
+         self.stream_interval = 1
+         self.max_recv_per_poll = 64
+-        self.enable_lora_overlap_loading = False
+         self.enable_metrics_for_all_schedulers = (
+             server_args.enable_metrics_for_all_schedulers
+         )
+@@ -369,7 +476,11 @@ class OmniScheduler:
+         self.send_to_detokenizer = _NoOpSender()
+ 
+         self._init_parallel_state(tp_worker)
+-        self.init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
++        self._init_metrics_reporter()
++        # Must run after _init_metrics_reporter (needs self.metrics_reporter) and
++        # after _init_upstream_compat_flags/_init_parallel_state (needs
++        # hisparse_coordinator, dp/load components).
++        self._init_result_processing()
+ 
+         self._running = False
+         self._aborted_request_ids: set[str] = set()
+@@ -447,16 +558,64 @@ class OmniScheduler:
+             return types.MethodType(attr, self)
+         return attr
+ 
++    def _init_metrics_reporter(self) -> None:
++        """Construct the 0.5.12 ``SchedulerMetricsReporter`` in a disabled state.
++
++        Upstream sglang moved scheduler metrics out of loose ``self.*`` attributes
++        (old ``init_metrics`` mixin) into a dedicated ``self.metrics_reporter``
++        object. Native code paths reached via ``__getattr__`` (e.g.
++        ``get_next_batch_to_run`` reads ``self.enable_fpm``; ``process_batch_result``
++        calls ``self.metrics_reporter.*``) now depend on it. OmniScheduler runs
++        with metrics disabled, so we build a minimal disabled context directly
++        instead of going through ``SchedulerMetricsCollector.init_new`` (which
++        needs a full ``self.ps`` parallel-state object we don't construct).
++
++        With metrics disabled, ``SchedulerMetricsReporter.__post_init__``:
++          - ``_init_metrics`` only sets plain counters (no external deps);
++          - ``_init_fpm`` short-circuits on ``enable_forward_pass_metrics=False``
++            and just sets ``self.enable_fpm = False`` (never touches ``self.ps``);
++          - ``_install_device_timer_on_runners`` returns early (timer is None).
++        """
++        from sglang.srt.managers.scheduler_components.metrics_reporter import (
++            SchedulerMetricsReporter,
++        )
++        from sglang.srt.observability.metrics_collector import (
++            SchedulerMetricsCollectorContext,
++        )
++
++        context = SchedulerMetricsCollectorContext(
++            enable_metrics=False,
++            is_stats_logging_rank=False,
++            current_scheduler_metrics_enabled=False,
++            enable_kv_cache_events=False,
++            collector=None,
++        )
++        self.metrics_reporter = SchedulerMetricsReporter(
++            scheduler=self,
++            tp_rank=self.tp_rank,
++            pp_rank=self.pp_rank,
++            dp_rank=self.dp_rank,
++            metrics_collector_context=context,
++            metrics_collector=None,
++        )
++
+     def _init_parallel_state(self, tp_worker: Any) -> None:
+         enable_dp_attention = self.server_args.enable_dp_attention
+-        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
+-            compute_dp_attention_world_info(
+-                enable_dp_attention,
+-                self.tp_rank,
+-                self.tp_size,
+-                self.dp_size,
+-            )
++        # sglang 0.5.12 returns 4 values (adds attn_dp_size); older returned 3.
++        # Unpack the first three and keep the tail (if any) as attn_dp_size so
++        # native Scheduler methods reached via __getattr__ can still find it.
++        (
++            self.attn_tp_rank,
++            self.attn_tp_size,
++            self.attn_dp_rank,
++            *_dp_attn_tail,
++        ) = compute_dp_attention_world_info(
++            enable_dp_attention,
++            self.tp_rank,
++            self.tp_size,
++            self.dp_size,
+         )
++        self.attn_dp_size = _dp_attn_tail[0] if _dp_attn_tail else self.dp_size
+ 
+         self.tp_group = tp_worker.get_tp_group()
+         self.tp_cpu_group = self.tp_group.cpu_group
+@@ -478,6 +637,119 @@ class OmniScheduler:
+             self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+         )
+ 
++        self._init_dp_attn_adapter()
++        self._init_load_inquirer()
++
++    def _init_load_inquirer(self) -> None:
++        """Construct sglang 0.5.12's ``SchedulerLoadInquirer``.
++
++        Native ``_get_new_batch_prefill_raw`` calls
++        ``self.load_inquirer._get_num_pending_tokens(...)`` on the prefill path.
++        That method only reads ``get_waiting_queue()``/``get_chunked_req()``,
++        both of which OmniScheduler owns. The remaining fields feed only the
++        ``get_loads()`` telemetry endpoint (unused here), so disagg queues /
++        pool-stats / spec counters are stubbed with ``None``/zero callables.
++        OmniScheduler is single-TP without DP attention or disaggregation.
++        """
++        self.load_inquirer = SchedulerLoadInquirer(
++            disaggregation_mode=self.disaggregation_mode,
++            ps=None,
++            server_args=self.server_args,
++            max_total_num_tokens=self.max_total_num_tokens,
++            max_running_requests=self.max_running_requests,
++            pool_stats_observer=None,
++            tp_worker=self.tp_worker,
++            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
++            spec_algorithm=self.spec_algorithm,
++            get_running_batch=lambda: self.running_batch,
++            get_waiting_queue=lambda: self.waiting_queue,
++            get_stats=lambda: self.metrics_reporter.stats,
++            get_chunked_req=lambda: self.chunked_req,
++            get_disagg_prefill_bootstrap_queue=lambda: None,
++            get_disagg_prefill_inflight_queue=lambda: None,
++            get_disagg_decode_prealloc_queue=lambda: None,
++            get_disagg_decode_transfer_queue=lambda: None,
++            get_spec_total_num_accept_tokens=lambda: 0,
++            get_spec_total_num_forward_ct=lambda: 0,
++        )
++
++    def _init_result_processing(self) -> None:
++        """Construct sglang 0.5.12's ``SchedulerBatchResultProcessor``.
++
++        OmniScheduler does not override ``process_batch_result``; it delegates to
++        the native method (via ``__getattr__``), which in 0.5.12 dispatches to
++        ``self.batch_result_processor.process_batch_result_{prefill,decode,...}``.
++        OmniScheduler intentionally relies on that path for the token-append /
++        finish-detection / KV-release bookkeeping (see ``_make_batch_result``),
++        while emitting per-token chunks itself via ``_emit_stream_output``.
++
++        Native ``process_batch_result_{prefill,decode}`` ends by calling
++        ``output_streamer.stream_output(reqs, return_logprob, skip_req)`` — the
++        terminal-emission hook 0.5.12 moved out of ``process_batch_result``.
++        OmniScheduler overrides ``stream_output`` to capture *finished* requests
++        and put their terminal ``result`` message on the outbox (the payload the
++        client waits for), so this call MUST reach that override or requests
++        never complete. ``_OmniOutputStreamer`` delegates ``stream_output`` to
++        the scheduler; the native streamer's other methods (which would pull in
++        ``pool_stats_observer`` / ``load_inquirer.get_loads`` / a full
++        ``ParallelState``) are off the terminal path and resolve to no-ops.
++
++        ``logprob_result_processor`` is built for real (cheap, and used only when
++        ``return_logprob`` is set). ``abort_request`` resolves to the native
++        Scheduler method through ``__getattr__``. Remaining fields are attributes
++        OmniScheduler already owns; disabled subsystems (draft_worker,
++        decode_offload_manager, metrics_collector) are already ``None``.
++        """
++        self.batch_result_processor = SchedulerBatchResultProcessor(
++            is_generation=self.is_generation,
++            disaggregation_mode=self.disaggregation_mode,
++            enable_overlap=self.enable_overlap,
++            enable_overlap_mlx=self.enable_overlap_mlx,
++            server_args=self.server_args,
++            model_config=self.model_config,
++            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
++            tree_cache=self.tree_cache,
++            hisparse_coordinator=self.hisparse_coordinator,
++            req_to_token_pool=self.req_to_token_pool,
++            decode_offload_manager=self.decode_offload_manager,
++            metrics_collector=self.metrics_collector,
++            metrics_reporter=self.metrics_reporter,
++            draft_worker=self.draft_worker,
++            model_worker=self.model_worker,
++            logprob_result_processor=SchedulerLogprobResultProcessor(
++                server_args=self.server_args,
++                model_config=self.model_config,
++            ),
++            output_streamer=_OmniOutputStreamer(self),
++            abort_request=self.abort_request,
++        )
++
++    def _init_dp_attn_adapter(self) -> None:
++        """Construct sglang 0.5.12's ``SchedulerDPAttnAdapter``.
++
++        Native ``get_next_batch_to_run()``/``scheduler_pp_mixin``/disaggregation
++        paths (reached via ``__getattr__``) call
++        ``self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch, need_sync=...)``
++        unconditionally on every step. OmniScheduler runs single-TP without DP
++        attention, so ``need_sync`` is always ``self.require_mlp_sync == False``,
++        which means the adapter's ``ps``/pool fields are constructed but never
++        dereferenced (the sync-batch branch short-circuits on ``need_sync``).
++        ``ps=None`` is therefore safe here without building a full ParallelState.
++        """
++        self.dp_attn_adapter = SchedulerDPAttnAdapter(
++            tp_group=self.tp_group,
++            req_to_token_pool=self.req_to_token_pool,
++            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
++            tree_cache=self.tree_cache,
++            offload_tags=self.offload_tags,
++            ps=None,
++            server_args=self.server_args,
++            model_config=self.model_config,
++            enable_overlap=self.enable_overlap,
++            spec_algorithm=self.spec_algorithm,
++            get_require_mlp_sync=lambda: self.require_mlp_sync,
++        )
++
+     def recv_requests(self):
+         """Drain inbox on rank 0 and broadcast scheduler inputs to TP followers."""
+         recv_msgs = self._recv_scheduler_messages()
+@@ -964,6 +1236,15 @@ class OmniScheduler:
+         to the detokenizer via ZMQ.  We capture finished requests here
+         and put them in the outbox so Stage can route them downstream.
+         """
++        try:
++            n_finished = sum(1 for r in reqs if r.finished())
++        except Exception:
++            n_finished = -1
++        logger.info(
++            "OmniScheduler.stream_output ENTER: n_reqs=%d n_finished=%d",
++            len(reqs),
++            n_finished,
++        )
+         for req in reqs:
+             if skip_req is not None and req is skip_req:
+                 continue
+@@ -1013,6 +1294,13 @@ class OmniScheduler:
+ 
+             self._first_emit_done.discard(rid)
+             self._prefill_start_done.discard(rid)
++            logger.info(
++                "OmniScheduler.stream_output: emitting TERMINAL result rid=%s "
++                "n_output_ids=%d finish_reason=%s",
++                rid,
++                len(getattr(data, "output_ids", []) or []),
++                getattr(data, "finish_reason", None),
++            )
+             self.outbox.put(
+                 OutgoingMessage(
+                     request_id=rid,
+@@ -1127,6 +1415,110 @@ class OmniScheduler:
+             _remove_from_batch(self._async_pending_batch(), request_id)
+         self._drain_inbox_for_request(request_id)
+ 
++    def _admin_load_lora_adapter(self, payload: dict[str, Any]) -> dict[str, Any]:
++        """Hot-load a LoRA adapter from a path (no server restart).
++
++        Payload: ``{"lora_name": str, "lora_path": str, "pinned": bool?}``.
++        """
++        if not hasattr(self.model_worker, "load_lora_adapter"):
++            return {
++                "success": True,
++                "message": "stage does not support load_lora_adapter",
++                "data": {"skipped": True, "unsupported": True},
++            }
++        if not payload.get("lora_name") or not payload.get("lora_path"):
++            return {
++                "success": False,
++                "message": "lora_name and lora_path are required",
++                "error": "lora_name and lora_path are required",
++            }
++        with self._admin_lock:
++            success, message = self.model_worker.load_lora_adapter(payload)
++        return {
++            "success": bool(success),
++            "message": str(message),
++            "data": {"lora_name": payload.get("lora_name")},
++            "error": None if success else str(message),
++        }
++
++    def _admin_load_lora_adapter_from_tensors(
++        self, payload: dict[str, Any]
++    ) -> dict[str, Any]:
++        """Hot-load a LoRA adapter from serialized tensors."""
++        if not hasattr(self.model_worker, "load_lora_adapter_from_tensors"):
++            return {
++                "success": True,
++                "message": "stage does not support load_lora_adapter_from_tensors",
++                "data": {"skipped": True, "unsupported": True},
++            }
++        lora_name = payload.get("lora_name")
++        serialized_tensors = payload.get("serialized_tensors")
++        config_dict = payload.get("config_dict")
++        if not isinstance(lora_name, str) or not lora_name:
++            message = "lora_name is required and must be a non-empty string"
++            return {"success": False, "message": message, "error": message}
++        if not isinstance(serialized_tensors, str) or not serialized_tensors:
++            message = "serialized_tensors is required and must be a non-empty string"
++            return {"success": False, "message": message, "error": message}
++        if not isinstance(config_dict, dict):
++            message = "config_dict is required and must be a dictionary"
++            return {"success": False, "message": message, "error": message}
++        with self._admin_lock:
++            success, message = self.model_worker.load_lora_adapter_from_tensors(payload)
++        return {
++            "success": bool(success),
++            "message": str(message),
++            "data": {"lora_name": payload.get("lora_name")},
++            "error": None if success else str(message),
++        }
++
++    def _admin_unload_lora_adapter(self, payload: dict[str, Any]) -> dict[str, Any]:
++        """Unload a previously loaded LoRA adapter by name."""
++        if not hasattr(self.model_worker, "unload_lora_adapter"):
++            return {
++                "success": True,
++                "message": "stage does not support unload_lora_adapter",
++                "data": {"skipped": True, "unsupported": True},
++            }
++        if not payload.get("lora_name"):
++            return {
++                "success": False,
++                "message": "lora_name is required",
++                "error": "lora_name is required",
++            }
++        with self._admin_lock:
++            success, message = self.model_worker.unload_lora_adapter(payload)
++        return {
++            "success": bool(success),
++            "message": str(message),
++            "data": {"lora_name": payload.get("lora_name")},
++            "error": None if success else str(message),
++        }
++
++    def _init_lora_scheduling(self, server_args) -> None:
++        """Set up LoRA batch-scheduling helpers (mirrors native Scheduler).
++
++        The model-side LoRAManager is initialized independently by the native
++        ModelRunner when ``server_args.enable_lora`` is True; this only wires the
++        scheduler-side fair-scheduling helpers that upstream prefill scheduling
++        expects to find when ``self.enable_lora`` is True.
++        """
++        if getattr(server_args, "lora_drain_wait_threshold", 0.0) > 0.0:
++            from sglang.srt.lora.lora_drainer import LoRADrainer
++
++            self.lora_drainer = LoRADrainer(
++                server_args.max_loras_per_batch,
++                server_args.lora_drain_wait_threshold,
++            )
++        if self.enable_lora_overlap_loading:
++            from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
++
++            lora_manager = getattr(
++                getattr(self.tp_worker, "model_runner", None), "lora_manager", None
++            )
++            if lora_manager is not None:
++                self.lora_overlap_loader = LoRAOverlapLoader(lora_manager)
++
+     def admin(
+         self, action: str, payload: dict[str, Any] | None = None
+     ) -> dict[str, Any]:
+@@ -1188,6 +1580,8 @@ class OmniScheduler:
+             return self._admin_pause_generation(payload)
+         if action == ADMIN_CONTINUE_GENERATION:
+             return self._admin_continue_generation(payload)
++        if action == ADMIN_FLUSH_CACHE:
++            return self._admin_flush_cache()
+         if action == ADMIN_UPDATE_WEIGHTS_FROM_DISK:
+             return self._admin_update_weights_from_disk(payload)
+         if action == ADMIN_UPDATE_WEIGHTS_FROM_TENSOR:
+@@ -1200,6 +1594,12 @@ class OmniScheduler:
+             return self._admin_destroy_weights_update_group(payload)
+         if action == ADMIN_WEIGHTS_CHECKER:
+             return self._admin_weights_checker(payload)
++        if action == ADMIN_LOAD_LORA_ADAPTER:
++            return self._admin_load_lora_adapter(payload)
++        if action == ADMIN_LOAD_LORA_ADAPTER_FROM_TENSORS:
++            return self._admin_load_lora_adapter_from_tensors(payload)
++        if action == ADMIN_UNLOAD_LORA_ADAPTER:
++            return self._admin_unload_lora_adapter(payload)
+         return {
+             "success": True,
+             "message": f"unsupported admin action: {action}",
+@@ -1278,6 +1678,84 @@ class OmniScheduler:
+             "data": {"engine_paused": self._engine_paused},
+         }
+ 
++    def _is_idle_for_cache_flush(self) -> bool:
++        def _batch_is_empty(batch: Any) -> bool:
++            if batch is None:
++                return True
++            is_empty = getattr(batch, "is_empty", None)
++            if callable(is_empty):
++                return bool(is_empty())
++            return not bool(getattr(batch, "reqs", None))
++
++        if any(
++            not _batch_is_empty(self.__dict__.get(name))
++            for name in ("running_batch", "cur_batch", "last_batch")
++        ):
++            return False
++        if self.__dict__.get("chunked_req") is not None:
++            return False
++        if self.__dict__.get("result_queue"):
++            return False
++
++        admission_lock = self.__dict__.get("_request_admission_lock")
++
++        def _has_admitted_requests() -> bool:
++            return any(
++                bool(self.__dict__.get(name))
++                for name in (
++                    "waiting_queue",
++                    "_pending_request_builds",
++                    "_backlogged_request_build_payloads",
++                    "_deferred_request_payloads",
++                )
++            )
++
++        if admission_lock is None:
++            return not _has_admitted_requests()
++        with admission_lock:
++            return not _has_admitted_requests()
++
++    def flush_cache(self, empty_cache: bool = True) -> bool:
++        """Flush Omni-owned request/KV pools without upstream PP-only state."""
++        if not self._is_idle_for_cache_flush():
++            logger.warning(
++                "Cache not flushed because OmniScheduler has pending requests"
++            )
++            return False
++
++        self.cur_batch = None
++        self.last_batch = None
++        self.tree_cache.reset()
++        self.req_to_token_pool.clear()
++        self.token_to_kv_pool_allocator.clear()
++        self.grammar_manager.clear()
++
++        metrics_reporter = self.__dict__.get("metrics_reporter")
++        if metrics_reporter is not None:
++            metrics_reporter.reset_metrics()
++        else:
++            reset_metrics = self.__dict__.get("reset_metrics")
++            if callable(reset_metrics):
++                reset_metrics()
++
++        if self.draft_worker:
++            self.draft_worker.clear_cache_pool()
++        if empty_cache:
++            self._empty_torch_cache()
++        logger.info("Omni cache flushed successfully")
++        return True
++
++    def _admin_flush_cache(self) -> dict[str, Any]:
++        with self._admin_lock:
++            success = bool(self.flush_cache())
++        message = "cache flushed" if success else "failed to flush cache"
++        return {
++            "success": success,
++            "message": message,
++            "data": {"flush_cache": success},
++            "error": None if success else message,
++        }
++
+     def _admin_update_weights_from_disk(
+         self, payload: dict[str, Any]
+     ) -> dict[str, Any]:
+@@ -1621,6 +2099,16 @@ class OmniScheduler:
+             self.cur_batch = batch
+ 
+             if batch:
++                self._dbg_loop_ct = getattr(self, "_dbg_loop_ct", 0) + 1
++                if self._dbg_loop_ct <= 40:
++                    running = getattr(self, "running_batch", None)
++                    logger.info(
++                        "OmniScheduler loop#%d: mode=%s bs=%d running_bs=%d",
++                        self._dbg_loop_ct,
++                        getattr(batch.forward_mode, "name", batch.forward_mode),
++                        len(batch.reqs),
++                        len(running.reqs) if running is not None else -1,
++                    )
+                 result = self.run_batch(batch)
+                 if result is not _FAILED_BATCH_RESULT:
+                     self.process_batch_result(batch, result)
+diff --git a/sglang_omni/serve/openai_api.py b/sglang_omni/serve/openai_api.py
+index d8c15ab9..3cd0f6eb 100644
+--- a/sglang_omni/serve/openai_api.py
++++ b/sglang_omni/serve/openai_api.py
+@@ -80,11 +80,14 @@ from sglang_omni.serve.protocol import (
+     ContinueGenerationRequest,
+     CreateSpeechBatchRequest,
+     DestroyWeightsUpdateGroupRequest,
++    FlushCacheRequest,
+     GenerateAudio,
+     GenerateFinishReason,
+     GenerateMetaInfo,
+     GenerateResponse,
+     InitWeightsUpdateGroupRequest,
++    LoadLoraAdapterRequest,
++    LoadLoraAdapterFromTensorsRequest,
+     ModelCard,
+     ModelList,
+     PauseGenerationRequest,
+@@ -95,6 +98,7 @@ from sglang_omni.serve.protocol import (
+     TranscriptionTextDeltaEvent,
+     TranscriptionTextDoneEvent,
+     TranscriptionUsage,
++    UnloadLoraAdapterRequest,
+     UpdateWeightFromDiskRequest,
+     UpdateWeightsFromDistributedRequest,
+     UsageResponse,
+@@ -442,6 +446,16 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
+             )
+         )
+ 
++    @app.post("/flush_cache", dependencies=[Depends(_auth)])
++    async def flush_cache(req: FlushCacheRequest) -> JSONResponse:
++        client: Client = app.state.client
++        return _admin_response(
++            await client.flush_cache(
++                stages=req.stages if req.stages is not None else ["thinker"],
++                timeout_s=_timeout_or_default(req.timeout_s, 60.0),
++            )
++        )
++
+     @app.post("/update_weights_from_disk", dependencies=[Depends(_auth)])
+     async def update_weights_from_disk(
+         req: UpdateWeightFromDiskRequest,
+@@ -532,6 +546,44 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
+             )
+         )
+ 
++    @app.post("/load_lora_adapter", dependencies=[Depends(_auth)])
++    async def load_lora_adapter(req: LoadLoraAdapterRequest) -> JSONResponse:
++        client: Client = app.state.client
++        payload = _request_payload(req)
++        return _admin_response(
++            await client.load_lora_adapter(
++                payload,
++                stages=req.stages if req.stages is not None else ["thinker"],
++                timeout_s=_timeout_or_default(req.timeout_s, 120.0),
++            )
++        )
++
++    @app.post("/load_lora_adapter_from_tensors", dependencies=[Depends(_auth)])
++    async def load_lora_adapter_from_tensors(
++        req: LoadLoraAdapterFromTensorsRequest,
++    ) -> JSONResponse:
++        client: Client = app.state.client
++        payload = _request_payload(req)
++        return _admin_response(
++            await client.load_lora_adapter_from_tensors(
++                payload,
++                stages=req.stages if req.stages is not None else ["thinker"],
++                timeout_s=_timeout_or_default(req.timeout_s, 120.0),
++            )
++        )
++
++    @app.post("/unload_lora_adapter", dependencies=[Depends(_auth)])
++    async def unload_lora_adapter(req: UnloadLoraAdapterRequest) -> JSONResponse:
++        client: Client = app.state.client
++        payload = _request_payload(req)
++        return _admin_response(
++            await client.unload_lora_adapter(
++                payload,
++                stages=req.stages if req.stages is not None else ["thinker"],
++                timeout_s=_timeout_or_default(req.timeout_s, 120.0),
++            )
++        )
++
+ 
+ def _timeout_or_default(timeout_s: float | None, default: float) -> float:
+     return default if timeout_s is None else timeout_s
+diff --git a/sglang_omni/serve/protocol.py b/sglang_omni/serve/protocol.py
+index 3369ba4e..174a5350 100644
+--- a/sglang_omni/serve/protocol.py
++++ b/sglang_omni/serve/protocol.py
+@@ -551,6 +551,10 @@ class ContinueGenerationRequest(AdminRequestBase):
+     torch_empty_cache: bool = True
+ 
+ 
++class FlushCacheRequest(AdminRequestBase):
++    pass
++
++
+ class UpdateWeightFromDiskRequest(AdminRequestBase):
+     model_path: str
+     load_format: str | None = None
+@@ -602,3 +606,27 @@ class DestroyWeightsUpdateGroupRequest(AdminRequestBase):
+ 
+ class WeightsCheckerRequest(AdminRequestBase):
+     action: str = "checksum"
++
++
++class LoadLoraAdapterRequest(AdminRequestBase):
++    lora_name: str
++    lora_path: str
++    pinned: bool = False
++    # Optional explicit adapter id; defaults to lora_name so generate requests
++    # can route to it via params={"lora_name": ...}.
++    lora_id: str | None = None
++
++
++class LoadLoraAdapterFromTensorsRequest(AdminRequestBase):
++    lora_name: str
++    serialized_tensors: str
++    config_dict: dict[str, Any]
++    load_format: str | None = None
++    pinned: bool = False
++    added_tokens_config: dict[str, Any] | None = None
++    lora_id: str | None = None
++
++
++class UnloadLoraAdapterRequest(AdminRequestBase):
++    lora_name: str
++    lora_id: str | None = None
+diff --git a/sglang_omni_router/app.py b/sglang_omni_router/app.py
+index 6fdf25a5..53e38632 100644
+--- a/sglang_omni_router/app.py
++++ b/sglang_omni_router/app.py
+@@ -40,10 +40,14 @@ logger = logging.getLogger(__name__)
+ 
+ _ADMIN_UPDATE_PATHS = {
+     "/pause_generation",
++    "/flush_cache",
+     "/update_weights_from_disk",
+     "/update_weights_from_distributed",
+     "/init_weights_update_group",
+     "/destroy_weights_update_group",
++    "/load_lora_adapter",
++    "/load_lora_adapter_from_tensors",
++    "/unload_lora_adapter",
+ }
+ _ADMIN_UPDATE_LOCK_TIMEOUT_S = 300.0
+ 
+@@ -336,6 +340,10 @@ def register_routes(
+     async def continue_generation(request: Request) -> JSONResponse:
+         return await _broadcast_admin_request(app, request, "/continue_generation")
+ 
++    @app.post("/flush_cache", dependencies=[Depends(_auth)])
++    async def flush_cache(request: Request) -> JSONResponse:
++        return await _broadcast_admin_request(app, request, "/flush_cache")
++
+     @app.post("/update_weights_from_disk", dependencies=[Depends(_auth)])
+     async def update_weights_from_disk(request: Request) -> JSONResponse:
+         return await _broadcast_admin_request(
+@@ -380,6 +388,20 @@ def register_routes(
+     async def weights_checker(request: Request) -> JSONResponse:
+         return await _broadcast_admin_request(app, request, "/weights_checker")
+ 
++    @app.post("/load_lora_adapter", dependencies=[Depends(_auth)])
++    async def load_lora_adapter(request: Request) -> JSONResponse:
++        return await _broadcast_admin_request(app, request, "/load_lora_adapter")
++
++    @app.post("/load_lora_adapter_from_tensors", dependencies=[Depends(_auth)])
++    async def load_lora_adapter_from_tensors(request: Request) -> JSONResponse:
++        return await _broadcast_admin_request(
++            app, request, "/load_lora_adapter_from_tensors"
++        )
++
++    @app.post("/unload_lora_adapter", dependencies=[Depends(_auth)])
++    async def unload_lora_adapter(request: Request) -> JSONResponse:
++        return await _broadcast_admin_request(app, request, "/unload_lora_adapter")
++
+     @app.post("/generate")
+     async def generate(request: Request) -> Response:
+         return await proxy.forward_model_request(request, "/generate")
+diff --git a/tests/unit_test/pipeline/test_admin_control.py b/tests/unit_test/pipeline/test_admin_control.py
+index 44f8ce38..b9ed11ed 100644
+--- a/tests/unit_test/pipeline/test_admin_control.py
++++ b/tests/unit_test/pipeline/test_admin_control.py
+@@ -216,7 +216,7 @@ def test_omni_scheduler_update_weights_flushes_cache_without_kwargs() -> None:
+     assert empty_cache_calls == 1
+ 
+ 
+-def test_omni_scheduler_flush_cache_has_upstream_idle_compat_fields() -> None:
++def test_omni_scheduler_flush_cache_uses_omni_idle_state() -> None:
+     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+ 
+     class EmptyBatch:
+@@ -260,6 +260,7 @@ def test_omni_scheduler_flush_cache_has_upstream_idle_compat_fields() -> None:
+ 
+     assert OmniScheduler._flush_cache_after_update(scheduler) is True
+     assert scheduler.device_module is not None
++    assert "ps" not in scheduler.__dict__
+     assert reset_calls == [
+         "tree",
+         "req_pool",
+@@ -269,6 +270,23 @@ def test_omni_scheduler_flush_cache_has_upstream_idle_compat_fields() -> None:
+     ]
+ 
+ 
++def test_omni_scheduler_flush_cache_rejects_pending_requests() -> None:
++    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
++
++    scheduler = object.__new__(OmniScheduler)
++    scheduler._admin_lock = threading.Lock()
++    scheduler.running_batch = SimpleNamespace(is_empty=lambda: False)
++
++    result = OmniScheduler._admin_flush_cache(scheduler)
++
++    assert result == {
++        "success": False,
++        "message": "failed to flush cache",
++        "data": {"flush_cache": False},
++        "error": "failed to flush cache",
++    }
++
++
+ def test_omni_scheduler_distributed_update_rejects_active_requests_by_default() -> None:
+     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+ 
+diff --git a/tests/unit_test/pipeline/test_stage_streaming.py b/tests/unit_test/pipeline/test_stage_streaming.py
+index 0b40ed75..791b3502 100644
+--- a/tests/unit_test/pipeline/test_stage_streaming.py
++++ b/tests/unit_test/pipeline/test_stage_streaming.py
+@@ -929,13 +929,19 @@ def test_send_stream_chunk_uses_relay_for_cuda_non_same_gpu_chunk() -> None:
+     asyncio.run(_run())
+ 
+ 
+-def test_ipc_stream_chunk_survives_control_plane_serialization() -> None:
++def test_ipc_stream_chunk_survives_control_plane_serialization(monkeypatch) -> None:
+     pytest.importorskip("msgpack")
+     from sglang_omni.pipeline.control_plane import (
+         deserialize_message,
+         serialize_message,
+     )
+ 
++    patch_calls = []
++    monkeypatch.setattr(
++        "sglang.srt.utils.patch_torch.monkey_patch_torch_reductions",
++        lambda: patch_calls.append("before_unpickle"),
++    )
++
+     codes = torch.arange(3, dtype=torch.float32)
+     hidden = torch.tensor([4.0, 5.0])
+     msg = DataReadyMessage(
+@@ -957,6 +963,7 @@ def test_ipc_stream_chunk_survives_control_plane_serialization() -> None:
+     round_tripped = deserialize_message(serialize_message(msg))
+     item = Stage._deserialize_ipc_chunk(round_tripped)
+ 
++    assert patch_calls == ["before_unpickle"]
+     assert torch.equal(item.data, codes)
+     assert item.metadata["modality"] == "audio_codes"
+     assert torch.equal(item.metadata["nested"]["hidden"], hidden)
+diff --git a/tests/unit_test/qwen3_omni/test_fp8_backend_config.py b/tests/unit_test/qwen3_omni/test_fp8_backend_config.py
+index f633109d..e99ebba0 100644
+--- a/tests/unit_test/qwen3_omni/test_fp8_backend_config.py
++++ b/tests/unit_test/qwen3_omni/test_fp8_backend_config.py
+@@ -336,6 +336,7 @@ def test_model_worker_backend_policy_precedence(
+         lambda: case.cutlass_supported,
+     )
+     monkeypatch.setattr(model_worker, "_is_h20_device", lambda: False)
++    monkeypatch.setattr(model_worker, "_is_sm80_device", lambda: False)
+     server_args = _server_args(
+         quantization=case.server_quantization,
+         moe_runner_backend=case.initial_moe_backend,
+@@ -369,6 +370,24 @@ def test_model_worker_backend_policy_precedence(
+     assert server_args.fp8_gemm_runner_backend == case.expected_fp8_gemm_backend
+ 
+ 
++def test_bf16_talker_auto_uses_triton_on_sm80(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A100 cannot run FlashInfer's BF16 CUTLASS fused-MoE backend."""
++    monkeypatch.setattr(model_worker, "_is_h20_device", lambda: False)
++    monkeypatch.setattr(model_worker, "_is_sm80_device", lambda: True)
++    server_args = _server_args(moe_runner_backend="auto")
++
++    effective_quantization = model_worker._apply_model_worker_backend_policy(
++        server_args,
++        _model_config(quantization=None),
++        "Qwen3OmniTalker",
++    )
++
++    assert effective_quantization is None
++    assert server_args.moe_runner_backend == "triton"
++
++
+ def test_model_config_has_moe_prefers_effective_text_config() -> None:
+     model_config = SimpleNamespace(
+         hf_config=SimpleNamespace(text_config=SimpleNamespace()),
+diff --git a/tests/unit_test/qwen3_omni/test_pipeline.py b/tests/unit_test/qwen3_omni/test_pipeline.py
+index ac68120d..d2547173 100644
+--- a/tests/unit_test/qwen3_omni/test_pipeline.py
++++ b/tests/unit_test/qwen3_omni/test_pipeline.py
+@@ -281,6 +281,87 @@ def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
+     assert state.encoder_inputs["audio_encoder"]["_skip"] is True
+ 
+ 
++def test_qwen_preprocess_structured_audio_markers_preserve_turn_order() -> None:
++    from sglang_omni.models.qwen3_omni.components.preprocessor import (
++        Qwen3OmniPreprocessor,
++    )
++    from sglang_omni.preprocessing.text import normalize_messages
++
++    messages = [
++        {
++            "role": "user",
++            "content": [
++                {"type": "audio"},
++                {"type": "text", "text": "Translate this chunk."},
++            ],
++        },
++        {"role": "assistant", "content": "first"},
++        {
++            "role": "user",
++            "content": [
++                {"type": "audio"},
++                {"type": "text", "text": "Continue."},
++            ],
++        },
++    ]
++
++    normalized = normalize_messages(messages)
++    result = Qwen3OmniPreprocessor._build_multimodal_messages(
++        object.__new__(Qwen3OmniPreprocessor),
++        normalized,
++        num_images=0,
++        num_audios=2,
++        num_videos=0,
++    )
++
++    assert result == messages
++    assert [message["role"] for message in result] == ["user", "assistant", "user"]
++
++
++def test_qwen_preprocess_structured_audio_marker_count_must_match() -> None:
++    from sglang_omni.models.qwen3_omni.components.preprocessor import (
++        Qwen3OmniPreprocessor,
++    )
++
++    messages = [
++        {"role": "user", "content": [{"type": "audio"}]},
++        {"role": "assistant", "content": "first"},
++    ]
++
++    with pytest.raises(ValueError, match=r"audio markers=1 inputs=2"):
++        Qwen3OmniPreprocessor._build_multimodal_messages(
++            object.__new__(Qwen3OmniPreprocessor),
++            messages,
++            num_images=0,
++            num_audios=2,
++            num_videos=0,
++        )
++
++
++def test_qwen_preprocess_legacy_string_messages_still_auto_inject_audio() -> None:
++    from sglang_omni.models.qwen3_omni.components.preprocessor import (
++        Qwen3OmniPreprocessor,
++    )
++
++    result = Qwen3OmniPreprocessor._build_multimodal_messages(
++        object.__new__(Qwen3OmniPreprocessor),
++        [{"role": "user", "content": "Translate."}],
++        num_images=0,
++        num_audios=1,
++        num_videos=0,
++    )
++
++    assert result == [
++        {
++            "role": "user",
++            "content": [
++                {"type": "audio"},
++                {"type": "text", "text": "Translate."},
++            ],
++        }
++    ]
++
++
+ def test_qwen_talker_to_code2wav_projection_keeps_only_request_latch() -> None:
+     payload = StagePayload(
+         request_id="req-1",
+diff --git a/tests/unit_test/qwen3_omni/test_talker_forward_context.py b/tests/unit_test/qwen3_omni/test_talker_forward_context.py
+new file mode 100644
+index 00000000..f46b4b8c
+--- /dev/null
++++ b/tests/unit_test/qwen3_omni/test_talker_forward_context.py
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import torch
++from sglang.srt.model_executor.forward_context import (
++    get_attn_backend,
++    has_forward_context,
++)
++
++from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
++
++
++def test_projected_prefill_forward_publishes_attention_backend() -> None:
++    """Custom Talker prefill keeps SGLang KV-cache helpers inside a context."""
++    seen_backends: list[object] = []
++
++    class FakeAttentionBackend:
++        def init_forward_metadata(self, _forward_batch: object) -> None:
++            seen_backends.append(get_attn_backend())
++
++    class FakeModel:
++        activation_dtype = torch.float32
++
++        def __call__(self, **_kwargs: object) -> SimpleNamespace:
++            seen_backends.append(get_attn_backend())
++            return SimpleNamespace(hidden_states=None)
++
++    backend = FakeAttentionBackend()
++    runner = object.__new__(QwenTalkerModelRunner)
++    runner.tp_worker = SimpleNamespace(
++        model_runner=SimpleNamespace(attn_backend=backend)
++    )
++    runner.model = FakeModel()
++    forward_batch = SimpleNamespace(
++        input_ids=torch.tensor([1, 2]),
++        positions=torch.tensor([0, 1]),
++        mrope_positions=None,
++    )
++
++    assert not has_forward_context()
++    result = runner._forward_with_input_embeds(
++        forward_batch,
++        input_embeds=torch.randn(2, 4),
++        input_embeds_are_projected=True,
++    )
++
++    assert result.logits_output.hidden_states is None
++    assert seen_backends == [backend, backend]
++    assert not has_forward_context()
+diff --git a/tests/unit_test/router/test_app.py b/tests/unit_test/router/test_app.py
+index 0d65c071..e0eedcc3 100644
+--- a/tests/unit_test/router/test_app.py
++++ b/tests/unit_test/router/test_app.py
+@@ -2046,6 +2046,7 @@ _ROUTER_ADMIN_PATHS = [
+     ("POST", "/model_info"),
+     ("POST", "/pause_generation"),
+     ("POST", "/continue_generation"),
++    ("POST", "/flush_cache"),
+     ("POST", "/update_weights_from_disk"),
+     ("POST", "/update_weights_from_tensor"),
+     ("POST", "/update_weights_from_distributed"),
+@@ -2053,8 +2054,18 @@ _ROUTER_ADMIN_PATHS = [
+     ("POST", "/destroy_weights_update_group"),
+     ("GET", "/weights_checker"),
+     ("POST", "/weights_checker"),
++    ("POST", "/load_lora_adapter"),
++    ("POST", "/load_lora_adapter_from_tensors"),
++    ("POST", "/unload_lora_adapter"),
+ ]
+ 
++
++def test_flush_cache_uses_admin_update_lock() -> None:
++    from sglang_omni_router.app import _ADMIN_UPDATE_PATHS
++
++    assert "/flush_cache" in _ADMIN_UPDATE_PATHS
++
++
+ _ROUTER_ADMIN_API_KEY = "router-secret"
+ 
+ 
+@@ -2171,6 +2182,45 @@ def test_router_unimplemented_tensor_weight_update_returns_501() -> None:
+     assert resp.json()["error"]["code"] == "not_implemented"
+ 
+ 
++def test_router_tensor_lora_update_broadcasts_under_admin_lock() -> None:
++    app_holder: dict[str, Any] = {}
++    seen_bodies: list[dict[str, Any]] = []
++    disabled_snapshots: list[tuple[bool, bool]] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/health":
++            return httpx.Response(200, json={"status": "healthy"}, request=request)
++        if request.url.path == "/load_lora_adapter_from_tensors":
++            workers = app_holder["app"].state.workers
++            disabled_snapshots.append(tuple(worker.disabled for worker in workers))
++            seen_bodies.append(json.loads(request.content))
++            return httpx.Response(
++                200,
++                json={"success": True, "message": "ok", "results": []},
++                request=request,
++            )
++        raise AssertionError(f"unexpected request path: {request.url.path}")
++
++    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
++    app = create_app(_router_config(), client=async_client)
++    app_holder["app"] = app
++    payload = {
++        "lora_name": "policy",
++        "serialized_tensors": "encoded",
++        "config_dict": {"peft_type": "LORA"},
++        "load_format": "flattened_bucket",
++    }
++
++    with TestClient(app) as client:
++        resp = client.post("/load_lora_adapter_from_tensors", json=payload)
++
++    assert resp.status_code == 200
++    assert resp.json()["success"] is True
++    assert seen_bodies == [payload, payload]
++    assert disabled_snapshots == [(True, True), (True, True)]
++    assert [worker.disabled for worker in app.state.workers] == [False, False]
++
++
+ @pytest.mark.parametrize(
+     ("path", "payload"),
+     [
+diff --git a/tests/unit_test/scheduling/test_lora_admin.py b/tests/unit_test/scheduling/test_lora_admin.py
+new file mode 100644
+index 00000000..13d22628
+--- /dev/null
++++ b/tests/unit_test/scheduling/test_lora_admin.py
+@@ -0,0 +1,626 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU-only wiring tests for LoRA hot-load support in sglang-omni.
++
++These do not load a model or start a GPU. They pin the plumbing added to enable
++LoRA on the Qwen3-Omni thinker: admin dispatch, ModelWorker delegation, the
++scheduler-side enable_lora flag helpers, and the thinker model's LoRA gate.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from sglang_omni.proto.admin import (
++    ADMIN_FLUSH_CACHE,
++    ADMIN_LOAD_LORA_ADAPTER,
++    ADMIN_LOAD_LORA_ADAPTER_FROM_TENSORS,
++    ADMIN_UNLOAD_LORA_ADAPTER,
++    is_update_action,
++)
++from sglang_omni.scheduling.omni_scheduler import OmniScheduler
++
++
++def _bare_scheduler(model_worker) -> OmniScheduler:
++    scheduler = object.__new__(OmniScheduler)
++    scheduler._admin_lock = threading.Lock()
++    scheduler.model_worker = model_worker
++    return scheduler
++
++
++def test_admin_load_lora_adapter_delegates_to_worker() -> None:
++    calls: list[dict] = []
++    scheduler = _bare_scheduler(
++        SimpleNamespace(
++            load_lora_adapter=lambda payload: calls.append(payload) or (True, "ok")
++        )
++    )
++
++    result = OmniScheduler._admin_load_lora_adapter(
++        scheduler,
++        {"lora_name": "adapter0", "lora_path": "/tmp/adapter0"},
++    )
++
++    assert result["success"] is True
++    assert result["data"]["lora_name"] == "adapter0"
++    assert calls == [{"lora_name": "adapter0", "lora_path": "/tmp/adapter0"}]
++
++
++def test_admin_load_lora_adapter_requires_name_and_path() -> None:
++    scheduler = _bare_scheduler(
++        SimpleNamespace(load_lora_adapter=lambda payload: (True, "ok"))
++    )
++
++    result = OmniScheduler._admin_load_lora_adapter(
++        scheduler, {"lora_name": "adapter0"}
++    )
++
++    assert result["success"] is False
++    assert "lora_path" in result["message"]
++
++
++def test_admin_load_lora_adapter_unsupported_stage_is_skipped() -> None:
++    # A stage whose worker lacks load_lora_adapter (e.g. vocoder) must no-op.
++    scheduler = _bare_scheduler(SimpleNamespace())
++
++    result = OmniScheduler._admin_load_lora_adapter(
++        scheduler,
++        {"lora_name": "adapter0", "lora_path": "/tmp/adapter0"},
++    )
++
++    assert result["success"] is True
++    assert result["data"]["unsupported"] is True
++
++
++def test_admin_load_lora_adapter_from_tensors_delegates_to_worker() -> None:
++    calls: list[dict] = []
++    scheduler = _bare_scheduler(
++        SimpleNamespace(
++            load_lora_adapter_from_tensors=lambda payload: calls.append(payload)
++            or (True, "ok")
++        )
++    )
++    payload = {
++        "lora_name": "policy",
++        "serialized_tensors": "encoded",
++        "config_dict": {"peft_type": "LORA"},
++        "load_format": "flattened_bucket",
++    }
++
++    result = OmniScheduler._admin_load_lora_adapter_from_tensors(
++        scheduler, payload
++    )
++
++    assert result["success"] is True
++    assert result["data"]["lora_name"] == "policy"
++    assert calls == [payload]
++
++
++@pytest.mark.parametrize(
++    "payload",
++    [
++        {"serialized_tensors": "encoded", "config_dict": {}},
++        {"lora_name": "policy", "config_dict": {}},
++        {"lora_name": "policy", "serialized_tensors": "encoded"},
++        {
++            "lora_name": "policy",
++            "serialized_tensors": "encoded",
++            "config_dict": [],
++        },
++    ],
++)
++def test_admin_load_lora_adapter_from_tensors_requires_payload_fields(
++    payload: dict,
++) -> None:
++    scheduler = _bare_scheduler(
++        SimpleNamespace(load_lora_adapter_from_tensors=lambda payload: (True, "ok"))
++    )
++
++    result = OmniScheduler._admin_load_lora_adapter_from_tensors(
++        scheduler, payload
++    )
++
++    assert result["success"] is False
++    assert result["error"]
++
++
++def test_admin_load_lora_adapter_from_tensors_unsupported_stage_is_skipped() -> None:
++    scheduler = _bare_scheduler(SimpleNamespace())
++
++    result = OmniScheduler._admin_load_lora_adapter_from_tensors(
++        scheduler,
++        {
++            "lora_name": "policy",
++            "serialized_tensors": "encoded",
++            "config_dict": {},
++        },
++    )
++
++    assert result["success"] is True
++    assert result["data"] == {"skipped": True, "unsupported": True}
++    assert is_update_action(ADMIN_LOAD_LORA_ADAPTER_FROM_TENSORS)
++
++
++def test_admin_unload_lora_adapter_delegates_to_worker() -> None:
++    calls: list[dict] = []
++    scheduler = _bare_scheduler(
++        SimpleNamespace(
++            unload_lora_adapter=lambda payload: calls.append(payload) or (True, "ok")
++        )
++    )
++
++    result = OmniScheduler._admin_unload_lora_adapter(
++        scheduler, {"lora_name": "adapter0"}
++    )
++
++    assert result["success"] is True
++    assert calls == [{"lora_name": "adapter0"}]
++
++
++def test_run_admin_action_routes_lora_actions() -> None:
++    load_calls: list[dict] = []
++    tensor_calls: list[dict] = []
++    unload_calls: list[dict] = []
++    scheduler = _bare_scheduler(
++        SimpleNamespace(
++            load_lora_adapter=lambda payload: load_calls.append(payload) or (True, "l"),
++            load_lora_adapter_from_tensors=lambda payload: tensor_calls.append(payload)
++            or (True, "t"),
++            unload_lora_adapter=lambda payload: unload_calls.append(payload)
++            or (True, "u"),
++        )
++    )
++
++    load_result = OmniScheduler._run_admin_action(
++        scheduler,
++        ADMIN_LOAD_LORA_ADAPTER,
++        {"lora_name": "a", "lora_path": "/tmp/a"},
++    )
++    tensor_result = OmniScheduler._run_admin_action(
++        scheduler,
++        ADMIN_LOAD_LORA_ADAPTER_FROM_TENSORS,
++        {
++            "lora_name": "a",
++            "serialized_tensors": "encoded",
++            "config_dict": {},
++        },
++    )
++    unload_result = OmniScheduler._run_admin_action(
++        scheduler, ADMIN_UNLOAD_LORA_ADAPTER, {"lora_name": "a"}
++    )
++
++    assert load_result["success"] is True and len(load_calls) == 1
++    assert tensor_result["success"] is True and len(tensor_calls) == 1
++    assert unload_result["success"] is True and len(unload_calls) == 1
++
++
++def test_admin_flush_cache_routes_action_and_reports_result() -> None:
++    scheduler = _bare_scheduler(SimpleNamespace())
++    calls: list[bool] = []
++    scheduler.flush_cache = lambda: calls.append(True) or True
++
++    result = OmniScheduler._run_admin_action(scheduler, ADMIN_FLUSH_CACHE, {})
++
++    assert result == {
++        "success": True,
++        "message": "cache flushed",
++        "data": {"flush_cache": True},
++        "error": None,
++    }
++    assert calls == [True]
++    assert is_update_action(ADMIN_FLUSH_CACHE)
++
++
++def test_init_lora_scheduling_no_drainer_when_threshold_zero() -> None:
++    scheduler = object.__new__(OmniScheduler)
++    scheduler.enable_lora_overlap_loading = False
++    scheduler.lora_drainer = None
++    scheduler.lora_overlap_loader = None
++    scheduler.tp_worker = SimpleNamespace(model_runner=None)
++
++    OmniScheduler._init_lora_scheduling(
++        scheduler,
++        SimpleNamespace(lora_drain_wait_threshold=0.0, max_loras_per_batch=4),
++    )
++
++    assert scheduler.lora_drainer is None
++    assert scheduler.lora_overlap_loader is None
++
++
++def test_model_worker_load_lora_adapter_builds_ref() -> None:
++    from sglang_omni.model_runner.model_worker import ModelWorker
++
++    captured: list = []
++
++    def fake_load(lora_ref):
++        captured.append(lora_ref)
++        return SimpleNamespace(success=True, error_message="")
++
++    worker = object.__new__(ModelWorker)
++    worker.model_runner = SimpleNamespace(load_lora_adapter=fake_load)
++
++    ok, msg = ModelWorker.load_lora_adapter(
++        worker, {"lora_name": "adapter0", "lora_path": "/tmp/adapter0", "pinned": True}
++    )
++
++    assert ok is True
++    assert len(captured) == 1
++    ref = captured[0]
++    assert ref.lora_name == "adapter0"
++    assert ref.lora_path == "/tmp/adapter0"
++    assert ref.pinned is True
++    # lora_id defaults to lora_name so generate requests can route by name.
++    assert ref.lora_id == "adapter0"
++
++
++def test_model_worker_load_lora_adapter_from_flattened_tensors() -> None:
++    import pickle
++
++    import pybase64
++    import torch
++    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
++
++    from sglang_omni.model_runner.model_worker import ModelWorker
++
++    tensor_name = (
++        "base_model.model.thinker.model.layers.0."
++        "self_attn.o_proj.lora_A.weight"
++    )
++    expected = torch.arange(6, dtype=torch.float32).reshape(2, 3)
++    bucket = FlattenedTensorBucket(named_tensors=[(tensor_name, expected)])
++    flattened_tensor_data = {
++        "flattened_tensor": bucket.flattened_tensor,
++        "metadata": bucket.metadata,
++    }
++    serialized_tensors = pybase64.b64encode(
++        pickle.dumps(flattened_tensor_data)
++    ).decode("utf-8")
++    config_dict = {
++        "peft_type": "LORA",
++        "r": 2,
++        "lora_alpha": 4,
++        "target_modules": ["o_proj"],
++    }
++    added_tokens_config = {"added_tokens_decoder": {}}
++    captured: dict = {}
++
++    def fake_load(lora_ref, tensors, config, added_tokens_config):
++        captured.update(
++            lora_ref=lora_ref,
++            tensors=tensors,
++            config=config,
++            added_tokens_config=added_tokens_config,
++        )
++        return SimpleNamespace(success=True, error_message="")
++
++    worker = object.__new__(ModelWorker)
++    worker.model_runner = SimpleNamespace(
++        load_lora_adapter_from_tensors=fake_load
++    )
++
++    ok, msg = ModelWorker.load_lora_adapter_from_tensors(
++        worker,
++        {
++            "lora_name": "policy",
++            "serialized_tensors": serialized_tensors,
++            "config_dict": config_dict,
++            "load_format": "flattened_bucket",
++            "pinned": True,
++            "added_tokens_config": added_tokens_config,
++        },
++    )
++
++    assert ok is True
++    assert msg == ""
++    assert set(captured["tensors"]) == {tensor_name}
++    restored = captured["tensors"][tensor_name]
++    assert restored.shape == expected.shape
++    assert restored.dtype == expected.dtype
++    assert torch.equal(restored, expected)
++    assert captured["config"] is config_dict
++    assert captured["added_tokens_config"] is added_tokens_config
++    ref = captured["lora_ref"]
++    assert ref.lora_name == "policy"
++    assert ref.lora_id == "policy"
++    assert ref.lora_path == "__tensor__"
++    assert ref.pinned is True
++
++
++def test_model_worker_load_lora_adapter_from_tensors_reports_decode_error() -> None:
++    from sglang_omni.model_runner.model_worker import ModelWorker
++
++    worker = object.__new__(ModelWorker)
++    worker.model_runner = SimpleNamespace(
++        load_lora_adapter_from_tensors=lambda *args: None
++    )
++
++    ok, msg = ModelWorker.load_lora_adapter_from_tensors(
++        worker,
++        {
++            "lora_name": "policy",
++            "serialized_tensors": "not-base64",
++            "config_dict": {},
++            "load_format": "flattened_bucket",
++        },
++    )
++
++    assert ok is False
++    assert "failed to deserialize LoRA tensors" in msg
++    assert "not-base64" not in msg
++
++
++def test_model_worker_unload_invalidates_same_id_memory_pool_slot() -> None:
++    from sglang.srt.lora.mem_pool import EMPTY_SLOT
++
++    from sglang_omni.model_runner.model_worker import ModelWorker
++
++    removed: list[str] = []
++    memory_pool = SimpleNamespace(
++        uid_to_buffer_id={"policy": 1},
++        buffer_id_to_uid=[EMPTY_SLOT, "policy"],
++        eviction_policy=SimpleNamespace(remove=removed.append),
++    )
++    captured: list = []
++
++    def fake_unload(lora_ref):
++        captured.append(lora_ref)
++        return SimpleNamespace(success=True, error_message="")
++
++    worker = object.__new__(ModelWorker)
++    worker.model_runner = SimpleNamespace(
++        unload_lora_adapter=fake_unload,
++        lora_manager=SimpleNamespace(memory_pool=memory_pool),
++    )
++
++    ok, msg = ModelWorker.unload_lora_adapter(
++        worker,
++        {"lora_name": "policy"},
++    )
++
++    assert ok is True
++    assert msg == ""
++    assert captured[0].lora_id == "policy"
++    assert memory_pool.uid_to_buffer_id == {}
++    assert memory_pool.buffer_id_to_uid == [EMPTY_SLOT, EMPTY_SLOT]
++    assert removed == ["policy"]
++
++
++def test_thinker_should_apply_lora_gate() -> None:
++    try:
++        from sglang_omni.models.qwen3_omni.components.sglang_thinker import (
++            Qwen3OmniThinkerForCausalLM,
++        )
++    except Exception as exc:  # torch / sglang unavailable in this env
++        pytest.skip(f"thinker import unavailable: {exc}")
++
++    gate = Qwen3OmniThinkerForCausalLM.should_apply_lora
++    dummy = SimpleNamespace(
++        _lora_pattern=Qwen3OmniThinkerForCausalLM._lora_pattern
++    )
++
++    # Language body: matched.
++    assert gate(dummy, "model.layers.0.self_attn.qkv_proj")
++    assert gate(dummy, "model.layers.12.self_attn.o_proj")
++    assert gate(dummy, "model.layers.3.mlp.experts")
++    assert gate(dummy, "lm_head")
++    assert gate(dummy, "model.embed_tokens")
++
++    # Non-body / other towers: rejected.
++    assert not gate(dummy, "audio_tower.layers.0.self_attn.qkv_proj")
++    assert not gate(dummy, "visual.blocks.0.attn.qkv")
++    assert not gate(dummy, "model.layers.0.mlp.gate")
++    assert Qwen3OmniThinkerForCausalLM.supports_lora is True
++
++
++def test_cli_enable_lora_sets_thinker_server_args() -> None:
++    try:
++        from sglang_omni.cli.serve import apply_thinker_server_args_cli_overrides
++        from sglang_omni.models.qwen3_omni.config import (
++            Qwen3OmniSpeechPipelineConfig,
++        )
++    except ImportError as exc:
++        pytest.skip(f"cli deps unavailable: {exc}")
++
++    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
++    apply_thinker_server_args_cli_overrides(
++        config,
++        cpu_offload_gb=None,
++        quantization=None,
++        enable_lora=True,
++        max_lora_rank=64,
++        lora_target_modules="qkv_proj, o_proj ,gate_up_proj",
++        max_loras_per_batch=4,
++    )
++
++    thinker = next(s for s in config.stages if s.name == "thinker")
++    overrides = thinker.factory_args["server_args_overrides"]
++    assert overrides["enable_lora"] is True
++    assert overrides["max_lora_rank"] == 64
++    assert overrides["lora_target_modules"] == ["qkv_proj", "o_proj", "gate_up_proj"]
++    assert overrides["max_loras_per_batch"] == 4
++
++
++def test_cli_lora_params_without_enable_lora_raise() -> None:
++    try:
++        import typer
++
++        from sglang_omni.cli.serve import apply_thinker_server_args_cli_overrides
++        from sglang_omni.models.qwen3_omni.config import (
++            Qwen3OmniSpeechPipelineConfig,
++        )
++    except ImportError as exc:
++        pytest.skip(f"cli deps unavailable: {exc}")
++
++    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
++    with pytest.raises(typer.BadParameter):
++        apply_thinker_server_args_cli_overrides(
++            config,
++            cpu_offload_gb=None,
++            quantization=None,
++            enable_lora=False,
++            max_lora_rank=64,
++        )
++
++
++def test_coordinator_load_lora_adapter_routes_admin_action() -> None:
++    try:
++        from sglang_omni.pipeline.coordinator import Coordinator
++    except ImportError as exc:
++        pytest.skip(f"coordinator deps unavailable: {exc}")
++
++    recorded: dict = {}
++
++    async def fake_admin(action, payload=None, *, stages=None, timeout_s=60.0):
++        recorded.update(action=action, payload=payload, stages=list(stages or []))
++        return {"success": True}
++
++    coord = object.__new__(Coordinator)
++    coord.admin = fake_admin
++
++    result = asyncio.run(
++        Coordinator.load_lora_adapter(
++            coord,
++            {"lora_name": "a", "lora_path": "/tmp/a"},
++            stages=["thinker"],
++        )
++    )
++
++    assert result["success"] is True
++    assert recorded["action"] == "load_lora_adapter"
++    assert recorded["stages"] == ["thinker"]
++    assert recorded["payload"] == {"lora_name": "a", "lora_path": "/tmp/a"}
++
++
++def test_coordinator_load_lora_adapter_from_tensors_routes_admin_action() -> None:
++    try:
++        from sglang_omni.pipeline.coordinator import Coordinator
++    except ImportError as exc:
++        pytest.skip(f"coordinator deps unavailable: {exc}")
++
++    recorded: dict = {}
++
++    async def fake_admin(action, payload=None, *, stages=None, timeout_s=60.0):
++        recorded.update(action=action, payload=payload, stages=list(stages or []))
++        return {"success": True}
++
++    coord = object.__new__(Coordinator)
++    coord.admin = fake_admin
++    payload = {
++        "lora_name": "policy",
++        "serialized_tensors": "encoded",
++        "config_dict": {},
++    }
++
++    result = asyncio.run(
++        Coordinator.load_lora_adapter_from_tensors(
++            coord,
++            payload,
++            stages=["thinker"],
++        )
++    )
++
++    assert result["success"] is True
++    assert recorded == {
++        "action": "load_lora_adapter_from_tensors",
++        "payload": payload,
++        "stages": ["thinker"],
++    }
++
++
++def test_client_load_lora_adapter_delegates_to_coordinator() -> None:
++    try:
++        from sglang_omni.client.client import Client
++    except ImportError as exc:
++        pytest.skip(f"client deps unavailable: {exc}")
++
++    recorded: dict = {}
++
++    async def fake_load(payload, *, stages=None, timeout_s=120.0):
++        recorded.update(payload=payload, stages=list(stages or []))
++        return {"success": True}
++
++    client = object.__new__(Client)
++    client._coordinator = SimpleNamespace(load_lora_adapter=fake_load)
++
++    result = asyncio.run(
++        Client.load_lora_adapter(
++            client, {"lora_name": "a", "lora_path": "/tmp/a"}, stages=["thinker"]
++        )
++    )
++
++    assert result["success"] is True
++    assert recorded["stages"] == ["thinker"]
++
++
++def test_client_load_lora_adapter_from_tensors_delegates_to_coordinator() -> None:
++    try:
++        from sglang_omni.client.client import Client
++    except ImportError as exc:
++        pytest.skip(f"client deps unavailable: {exc}")
++
++    recorded: dict = {}
++
++    async def fake_load(payload, *, stages=None, timeout_s=120.0):
++        recorded.update(payload=payload, stages=list(stages or []))
++        return {"success": True}
++
++    client = object.__new__(Client)
++    client._coordinator = SimpleNamespace(
++        load_lora_adapter_from_tensors=fake_load
++    )
++    payload = {
++        "lora_name": "policy",
++        "serialized_tensors": "encoded",
++        "config_dict": {},
++    }
++
++    result = asyncio.run(
++        Client.load_lora_adapter_from_tensors(
++            client,
++            payload,
++            stages=["thinker"],
++        )
++    )
++
++    assert result["success"] is True
++    assert recorded == {"payload": payload, "stages": ["thinker"]}
++
++
++def test_coordinator_and_client_flush_cache_preserve_stages() -> None:
++    from sglang_omni.client.client import Client
++    from sglang_omni.pipeline.coordinator import Coordinator
++
++    recorded: list[dict] = []
++
++    async def fake_admin(action, payload=None, *, stages=None, timeout_s=60.0):
++        recorded.append(
++            {
++                "action": action,
++                "payload": payload,
++                "stages": list(stages or []),
++                "timeout_s": timeout_s,
++            }
++        )
++        return {"success": True}
++
++    coordinator = object.__new__(Coordinator)
++    coordinator.admin = fake_admin
++    client = object.__new__(Client)
++    client._coordinator = coordinator
++
++    result = asyncio.run(
++        Client.flush_cache(client, stages=["thinker"], timeout_s=7.5)
++    )
++
++    assert result["success"] is True
++    assert recorded == [
++        {
++            "action": "flush_cache",
++            "payload": None,
++            "stages": ["thinker"],
++            "timeout_s": 7.5,
++        }
++    ]
+diff --git a/tests/unit_test/serve/test_openai_api.py b/tests/unit_test/serve/test_openai_api.py
+index 59486427..5f432a4c 100644
+--- a/tests/unit_test/serve/test_openai_api.py
++++ b/tests/unit_test/serve/test_openai_api.py
+@@ -317,6 +317,15 @@ class AdminClient:
+         self.calls.append(("continue_generation", payload or {}, stages, timeout_s))
+         return {"success": True, "message": "ok", "results": []}
+ 
++    async def flush_cache(
++        self,
++        *,
++        stages: list[str] | None = None,
++        timeout_s: float = 60.0,
++    ) -> dict[str, Any]:
++        self.calls.append(("flush_cache", {}, stages, timeout_s))
++        return {"success": True, "message": "ok", "results": []}
++
+     async def update_weights_from_disk(
+         self,
+         payload: dict[str, Any],
+@@ -370,6 +379,38 @@ class AdminClient:
+         self.calls.append((action, payload or {}, stages, timeout_s))
+         return {"success": True, "message": "ok", "results": []}
+ 
++    async def load_lora_adapter(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: list[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        self.calls.append(("load_lora_adapter", payload, stages, timeout_s))
++        return {"success": True, "message": "ok", "results": []}
++
++    async def load_lora_adapter_from_tensors(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: list[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        self.calls.append(
++            ("load_lora_adapter_from_tensors", payload, stages, timeout_s)
++        )
++        return {"success": True, "message": "ok", "results": []}
++
++    async def unload_lora_adapter(
++        self,
++        payload: dict[str, Any],
++        *,
++        stages: list[str] | None = None,
++        timeout_s: float = 120.0,
++    ) -> dict[str, Any]:
++        self.calls.append(("unload_lora_adapter", payload, stages, timeout_s))
++        return {"success": True, "message": "ok", "results": []}
++
+     async def weights_checker(
+         self,
+         payload: dict[str, Any] | None = None,
+@@ -1135,6 +1176,7 @@ _ADMIN_PATHS_THAT_NEED_AUTH = [
+     ("POST", "/model_info"),
+     ("POST", "/pause_generation"),
+     ("POST", "/continue_generation"),
++    ("POST", "/flush_cache"),
+     ("POST", "/update_weights_from_disk"),
+     ("POST", "/update_weights_from_tensor"),
+     ("POST", "/update_weights_from_distributed"),
+@@ -1142,6 +1184,9 @@ _ADMIN_PATHS_THAT_NEED_AUTH = [
+     ("POST", "/destroy_weights_update_group"),
+     ("GET", "/weights_checker"),
+     ("POST", "/weights_checker"),
++    ("POST", "/load_lora_adapter"),
++    ("POST", "/load_lora_adapter_from_tensors"),
++    ("POST", "/unload_lora_adapter"),
+ ]
+ 
+ _ADMIN_API_KEY = "secret-key"
+@@ -1241,6 +1286,91 @@ def test_unimplemented_tensor_weight_update_returns_501() -> None:
+     assert "update_weights_from_disk" in resp.json()["error"]["message"]
+ 
+ 
++def test_lora_admin_endpoints_default_to_thinker_and_preserve_explicit_stages() -> (
++    None
++):
++    admin = AdminClient()
++    client = TestClient(create_app(admin, model_name="qwen3-omni"))
++    tensor_payload = {
++        "lora_name": "policy",
++        "serialized_tensors": "encoded",
++        "config_dict": {"peft_type": "LORA"},
++        "load_format": "flattened_bucket",
++    }
++
++    load = client.post(
++        "/load_lora_adapter",
++        json={"lora_name": "disk", "lora_path": "/tmp/disk"},
++    )
++    tensor = client.post(
++        "/load_lora_adapter_from_tensors",
++        json=tensor_payload,
++    )
++    unload = client.post(
++        "/unload_lora_adapter",
++        json={"lora_name": "policy"},
++    )
++    explicit = client.post(
++        "/load_lora_adapter_from_tensors",
++        json=tensor_payload | {"stages": ["talker"], "timeout_s": 7.5},
++    )
++
++    assert [response.status_code for response in (load, tensor, unload, explicit)] == [
++        200,
++        200,
++        200,
++        200,
++    ]
++    assert admin.calls == [
++        (
++            "load_lora_adapter",
++            {
++                "lora_name": "disk",
++                "lora_path": "/tmp/disk",
++                "pinned": False,
++            },
++            ["thinker"],
++            120.0,
++        ),
++        (
++            "load_lora_adapter_from_tensors",
++            tensor_payload | {"pinned": False},
++            ["thinker"],
++            120.0,
++        ),
++        (
++            "unload_lora_adapter",
++            {"lora_name": "policy"},
++            ["thinker"],
++            120.0,
++        ),
++        (
++            "load_lora_adapter_from_tensors",
++            tensor_payload | {"pinned": False},
++            ["talker"],
++            7.5,
++        ),
++    ]
++
++
++def test_flush_cache_defaults_to_thinker_and_preserves_explicit_stages() -> None:
++    admin = AdminClient()
++    client = TestClient(create_app(admin, model_name="qwen3-omni"))
++
++    default = client.post("/flush_cache", json={})
++    explicit = client.post(
++        "/flush_cache",
++        json={"stages": ["decode"], "timeout_s": 7.5},
++    )
++
++    assert default.status_code == 200
++    assert explicit.status_code == 200
++    assert admin.calls == [
++        ("flush_cache", {}, ["thinker"], 60.0),
++        ("flush_cache", {}, ["decode"], 7.5),
++    ]
++
++
+ def test_distributed_weight_update_routes_forward_to_client() -> None:
+     admin = AdminClient()
+     client = TestClient(create_app(admin, model_name="qwen3-omni"))

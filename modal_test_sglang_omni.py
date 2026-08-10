@@ -33,7 +33,11 @@ SGLANG_OMNI_REMOTE = "/root/sglang-omni"         # 仓库根（pyproject pythonp
 # sglang 最前 -> sglang-omni 仓库根
 PYTHONPATH = f"{SGLANG_REMOTE}:{SGLANG_OMNI_REMOTE}"
 
-BASE_IMAGE = os.environ.get("RELAX_BASE_IMAGE", "slimerl/slime:latest")
+# v1 冻结镜像 = slime nightly-dev-20260428a（:latest 会漂移，认定过程见 README_v1.md）
+BASE_IMAGE = os.environ.get(
+    "RELAX_BASE_IMAGE",
+    "slimerl/slime@sha256:bd219aba21be6e404ff09e385f34f40993b60773b928e13f341e8d77590da6aa",
+)
 
 image = (
     modal.Image.from_registry(BASE_IMAGE, add_python=None)

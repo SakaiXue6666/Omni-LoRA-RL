@@ -6,7 +6,7 @@
 
 ────────────────────────────────────────────────────────────────────────────
 【镜像策略】没有现成的 Relax 镜像，所以基于能拉到的 slime 预构建镜像
-`slimerl/slime:latest`（已含 Megatron-LM + Megatron-Bridge + TransformerEngine
+`slimerl/slime`（nightly-dev-20260428a，已含 Megatron-LM + Megatron-Bridge + TransformerEngine
 + flash-attn + ray），在 build 阶段补上 Relax 的 python 依赖 + redai fork 的
 megatron-bridge（Qwen3OmniMoEBridge 在这里），并把【本地这份】sglang（含 Block
 1/2 的 Qwen3-Omni LoRA 改动）通过 PYTHONPATH 注入到最前面覆盖镜像自带的 sglang。
@@ -52,7 +52,11 @@ PYTHONPATH = f"{SGLANG_REMOTE}:{RELAX_REMOTE}:{MEGATRON_REMOTE}"
 # 纯文本冒烟（最快路径，不喂 image/audio）。设 "0" 则走多模态（需准备真实数据）。
 TEXT_ONLY = os.environ.get("TEXT_ONLY", "1") == "1"
 
-BASE_IMAGE = os.environ.get("RELAX_BASE_IMAGE", "slimerl/slime:latest")
+# v1 冻结镜像 = slime nightly-dev-20260428a（:latest 会漂移，认定过程见 README_v1.md）
+BASE_IMAGE = os.environ.get(
+    "RELAX_BASE_IMAGE",
+    "slimerl/slime@sha256:bd219aba21be6e404ff09e385f34f40993b60773b928e13f341e8d77590da6aa",
+)
 
 
 image = (

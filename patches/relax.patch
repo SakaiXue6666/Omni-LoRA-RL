@@ -1,0 +1,5272 @@
+diff --git a/examples/simul_s2tt/__init__.py b/examples/simul_s2tt/__init__.py
+new file mode 100644
+index 0000000..1342439
+--- /dev/null
++++ b/examples/simul_s2tt/__init__.py
+@@ -0,0 +1,15 @@
++# 🚨 ===== [YULIN-MOD] START: 定义定长音频分块的多轮同传 rollout 示例 =====
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++"""同传（simultaneous speech-to-text translation）多轮 rollout 示例。
++
++把已实现的单轮 s2tt（英语音频→中文，核心走 relax.engine.rollout.sglang_rollout
++的内置 generate）扩展成「定长 chunk 多轮」：整段音频按固定时长（默认 960ms）切块，
++每轮喂一个 chunk、模型输出一段增量译文，直到 chunk 用完。
++
++- 多轮骨架参考 examples/deepeyes/rollout.py（同一套 sglang_rollout 编排 + 同一个
++  sglang engine，仅替换「生成一条样本」这层）。
++- 与 deepeyes 的差异：环境是「脚本化」的（每轮直接吐下一个 chunk，不依赖模型动作），
++  且观测是音频而非图像。
++"""
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/examples/simul_s2tt/_selftest_env.py b/examples/simul_s2tt/_selftest_env.py
+new file mode 100644
+index 0000000..cb8eea3
+--- /dev/null
++++ b/examples/simul_s2tt/_selftest_env.py
+@@ -0,0 +1,114 @@
++# 🚨 ===== [YULIN-MOD] START: 用纯 Python 自测音频切块和多轮环境，不依赖 GPU =====
++"""本地自测：只验证纯 Python 的切块 env 逻辑（不依赖 GPU/relax 重栈）。
++
++跑法（在 Relax 根目录）：
++    python -m examples.simul_s2tt._selftest_env
++"""
++
++from __future__ import annotations
++
++import math
++import types
++
++import numpy as np
++
++from examples.simul_s2tt.audio_chunk_env import (
++    DEFAULT_CHUNK_MS,
++    DEFAULT_SAMPLE_RATE,
++    AudioChunkEnv,
++    build_env,
++    split_audio_into_chunks,
++)
++
++
++def _mk_sample(waveform):
++    # 模拟 Sample：只需 multimodal_inputs（三键，和 dataset 一致）。
++    return types.SimpleNamespace(
++        multimodal_inputs={"images": [], "videos": [], "audio": [waveform]},
++    )
++
++
++def _mk_args(chunk_ms=DEFAULT_CHUNK_MS, sr=DEFAULT_SAMPLE_RATE):
++    return types.SimpleNamespace(simul_chunk_ms=chunk_ms, audio_sample_rate=sr)
++
++
++def test_split_counts():
++    sr, chunk_ms = 16000, 960
++    chunk_len = int(round(sr * chunk_ms / 1000.0))  # 15360
++    assert chunk_len == 15360
++
++    # 4s -> 64000 样本 -> ceil(64000/15360)=5 块（末块 2560）
++    wav = np.zeros(64000, dtype=np.float32)
++    chunks = split_audio_into_chunks(wav, chunk_ms, sr)
++    assert len(chunks) == math.ceil(64000 / chunk_len) == 5
++    assert sum(c.shape[0] for c in chunks) == 64000  # 不丢样本
++    assert chunks[-1].shape[0] == 64000 - 4 * chunk_len == 2560
++    print(f"[ok] split 4s -> {len(chunks)} chunks, last={chunks[-1].shape[0]}")
++
++    # 短于一个 chunk -> 单块（整段）
++    short = np.zeros(1000, dtype=np.float32)
++    assert len(split_audio_into_chunks(short, chunk_ms, sr)) == 1
++    print("[ok] short audio -> 1 chunk")
++
++
++def test_env_loop():
++    sr, chunk_ms = 16000, 960
++    wav = np.arange(64000, dtype=np.float32)  # 用递增值便于校验切块内容
++    sample = _mk_sample(wav)
++    args = _mk_args(chunk_ms, sr)
++
++    env = build_env(sample, args)
++    assert isinstance(env, AudioChunkEnv)
++    assert env.num_chunks == 5
++
++    # 首轮：sample.multimodal_inputs 只保留第 0 块，其余键不动
++    assert len(sample.multimodal_inputs["audio"]) == 1
++    first_chunk = sample.multimodal_inputs["audio"][0]
++    assert first_chunk.shape[0] == 15360
++    assert first_chunk[0] == 0.0 and first_chunk[-1] == 15359.0
++    assert sample.multimodal_inputs["images"] == [] and sample.multimodal_inputs["videos"] == []
++    print("[ok] initial turn carries chunk0 only, images/videos preserved")
++
++    # 模拟 rollout 循环：首轮已用 chunk0，之后 step() 逐块吐，直到 done。
++    env.reset()
++    served = [first_chunk]  # 首轮
++    fmt_ok = True
++    for _ in range(100):  # 安全上限
++        obs, done, info = env.step("模型输出(被忽略)")
++        if done:
++            assert info["chunk_index"] == info["num_chunks"] == 5
++            break
++        m = env.format_observation(obs)
++        # observation 必须是一个含 audio 的 user turn
++        assert m["role"] == "user"
++        audio_items = [c for c in m["content"] if c.get("type") == "audio"]
++        assert len(audio_items) == 1
++        served.append(audio_items[0]["audio"])
++    else:
++        fmt_ok = False
++    assert fmt_ok, "step 循环没有正常结束（可能死循环）"
++
++    # 一共服务 5 块 = num_chunks；拼回去应等于原始波形（顺序/内容都对）。
++    assert len(served) == env.num_chunks == 5
++    recon = np.concatenate(served)
++    assert recon.shape[0] == 64000
++    assert np.array_equal(recon, wav)
++    print(f"[ok] served {len(served)} chunks, reconstruct == original waveform")
++
++
++def test_last_chunk_not_dropped():
++    # 恰好整除时不应产生空尾块
++    sr, chunk_ms = 16000, 1000  # chunk_len=16000
++    wav = np.zeros(48000, dtype=np.float32)  # 正好 3 块
++    chunks = split_audio_into_chunks(wav, chunk_ms, sr)
++    assert len(chunks) == 3
++    assert all(c.shape[0] == 16000 for c in chunks)
++    print("[ok] exact-divisible -> no empty tail chunk")
++
++
++if __name__ == "__main__":
++    test_split_counts()
++    test_env_loop()
++    test_last_chunk_not_dropped()
++    print("\nALL ENV SELFTESTS PASSED")
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/examples/simul_s2tt/audio_chunk_env.py b/examples/simul_s2tt/audio_chunk_env.py
+new file mode 100644
+index 0000000..810927f
+--- /dev/null
++++ b/examples/simul_s2tt/audio_chunk_env.py
+@@ -0,0 +1,104 @@
++# 🚨 ===== [YULIN-MOD] START: 将整段音频切成定长 chunk，并逐轮提供给同传 rollout =====
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++"""定长同传环境：把整段音频切成固定时长 chunk，每轮吐一个。
++
++约定（与 rollout.py 配合）：
++- ``build_env(sample, args)`` 时把整段音频从 ``sample.multimodal_inputs["audio"]``
++  取出、按 ``simul_chunk_ms`` 切块，**只把第 0 块留在初始 prompt 里**（首轮就带音频），
++  其余块由 ``step()`` 逐轮吐出。
++- 环境是脚本化的：``step()`` 忽略模型输出，直接推进到下一块；chunk 用完 ``done=True``。
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++import numpy as np
++
++from examples.deepeyes.base_env import BaseInteractionEnv
++
++
++DEFAULT_SAMPLE_RATE = 16000
++DEFAULT_CHUNK_MS = 960
++
++
++def split_audio_into_chunks(
++    waveform: np.ndarray, chunk_ms: int = DEFAULT_CHUNK_MS, sample_rate: int = DEFAULT_SAMPLE_RATE
++) -> list[np.ndarray]:
++    """把 1-D 波形按固定时长切块；最后一块不足时长也保留（不丢尾音）。"""
++    waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
++    chunk_len = int(round(sample_rate * chunk_ms / 1000.0))
++    if chunk_len <= 0 or waveform.shape[0] <= chunk_len:
++        return [waveform]
++    chunks = [waveform[i : i + chunk_len] for i in range(0, waveform.shape[0], chunk_len)]
++    return [c for c in chunks if c.shape[0] > 0]
++
++
++class AudioChunkEnv(BaseInteractionEnv):
++    """脚本化的定长切块环境。"""
++
++    def __init__(self, sample: Any, args: Any) -> None:
++        self.args = args
++        self.sample = sample
++
++        chunk_ms = int(getattr(args, "simul_chunk_ms", DEFAULT_CHUNK_MS))
++        sample_rate = int(getattr(args, "audio_sample_rate", None) or DEFAULT_SAMPLE_RATE)
++        self.sample_rate = sample_rate
++
++        mm = dict(sample.multimodal_inputs or {})
++        audios = list(mm.get("audio") or [])
++        assert len(audios) == 1, (
++            f"AudioChunkEnv 期望初始恰好 1 段完整音频，实际拿到 {len(audios)} 段。"
++            "请确认数据里每条样本只有一个 <audio> 占位符。"
++        )
++
++        self._chunks = split_audio_into_chunks(audios[0], chunk_ms=chunk_ms, sample_rate=sample_rate)
++
++        # 首轮只带第 0 块；其余留给 step()。用新 dict/list，避免污染同组其他样本共享的对象。
++        mm["audio"] = [self._chunks[0]]
++        sample.multimodal_inputs = mm
++
++        self._next_idx = 1
++
++    @property
++    def num_chunks(self) -> int:
++        return len(self._chunks)
++
++    def reset(self) -> None:
++        self._next_idx = 1
++
++    def step(self, response_text: str):
++        """脚本化推进：忽略模型输出，吐下一个 chunk；没有更多 chunk 则结束。
++
++        返回 ``(observation, done, info)``：
++        - 还有 chunk：observation 携带下一块音频，done=False；
++        - 没有 chunk：done=True（上一轮已翻译完最后一块）。
++        """
++        info = {"chunk_index": self._next_idx, "num_chunks": len(self._chunks)}
++        if self._next_idx >= len(self._chunks):
++            return {}, True, info
++
++        chunk = self._chunks[self._next_idx]
++        self._next_idx += 1
++        observation = {"role": "user", "audio": chunk, "obs_str": ""}
++        return observation, False, info
++
++    def format_observation(self, observation: dict) -> dict:
++        """把观测拼成一个 user turn（音频 + 可选文本）。覆盖基类的「只处理图像」版本。"""
++        observation = observation or {}
++        content: list[dict] = []
++        chunk = observation.get("audio")
++        if chunk is not None:
++            content.append({"type": "audio", "audio": chunk})
++        obs_str = observation.get("obs_str", "")
++        if obs_str:
++            content.append({"type": "text", "text": obs_str})
++        role = observation.get("role") or "user"
++        return {"role": role, "content": content}
++
++
++def build_env(sample: Any, args: Any) -> AudioChunkEnv:
++    """rollout.py 通过 ``--rollout-interaction-env-path`` 找到这个工厂函数。"""
++    return AudioChunkEnv(sample=sample, args=args)
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/examples/simul_s2tt/config.yaml b/examples/simul_s2tt/config.yaml
+new file mode 100644
+index 0000000..213ec59
+--- /dev/null
++++ b/examples/simul_s2tt/config.yaml
+@@ -0,0 +1,6 @@
++# 🚨 ===== [YULIN-MOD] START: 配置同传音频分块时长和最大轮数 =====
++# 同传自定义 rollout 的额外参数（--custom-config-path 加载，键会 setattr 到 args）。
++# 实际轮数 = ceil(音频时长 / simul_chunk_ms)；max_turns 只是安全上限。
++max_turns: 64
++simul_chunk_ms: 960
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/examples/simul_s2tt/omni_rollout.py b/examples/simul_s2tt/omni_rollout.py
+new file mode 100644
+index 0000000..e7947d3
+--- /dev/null
++++ b/examples/simul_s2tt/omni_rollout.py
+@@ -0,0 +1,397 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: (omni) 使用 messages 和 metadata.audios 调用 Omni Thinker 执行多轮同传 =====
++
++# 这个文件可以理解成 Relax 和 SGLang-Omni 之间的“请求翻译器”。
++#
++# 原有标准 SGLang 同传路径发送的是：
++#
++# Relax Sample
++# → input_ids + audio_data
++# → POST /generate
++# → lora_path="policy"
++# → 返回文本 token 和 logprob
++#
++# SGLang-Omni 使用另一套请求契约：
++#
++# Relax Sample
++# → structured messages
++# → metadata.audios
++# → stage_params.thinker.lora_name="policy"
++# → POST /generate
++# → 从 Thinker 结果中取文本 token 和 logprob
++#
++# 所以这里不重写 Relax 的训练、reward 或 batch 调度，只负责：
++# 1. 把每轮音频 chunk 转成 Omni 能理解的 messages/metadata.audios；
++# 2. 把 LoRA 选择放到 thinker stage；
++# 3. 把 Omni 返回的文本和 logprob 重新装回 Sample；
++# 4. 继续维护 Megatron 训练所需的展开 token、loss mask 和音频特征。
++#
++# 当前 output_modalities 仍然只有 text：
++# 这里只验证 Omni Thinker rollout，还没有启用 Talker/Code2Wav 语音输出。
++
++"""SGLang-Omni multi-turn S2TT rollout using structured messages."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from typing import Any
++
++from examples.simul_s2tt.audio_chunk_env import build_env
++from examples.simul_s2tt.rollout import (
++    _append_generated,
++    _append_observation,
++    _clean_gen_text,
++    _encode_audio_observation,
++    _merge_mm_train,
++    _run_processor,
++)
++from relax.engine.rollout.sglang_rollout import GenerateState
++from relax.utils.data.processing_utils import (
++    _ENCODE_EXECUTOR,
++    encode_audio_for_rollout_engine,
++)
++from relax.utils.http_utils import post
++from relax.utils.types import Sample
++
++
++_OMNI_SAMPLING_PARAM_KEYS = {
++    "temperature",
++    "top_p",
++    "top_k",
++    "min_p",
++    "repetition_penalty",
++    "stop",
++    "stop_token_ids",
++    "seed",
++    "max_new_tokens",
++    "max_tokens",
++}
++
++
++def _sanitize_sampling_params(
++    sampling_params: dict[str, Any],
++) -> dict[str, Any]:
++    """Translate Relax sampling params to SGLang-Omni's strict protocol."""
++    sanitized = {
++        key: value
++        for key, value in sampling_params.items()
++        if key in _OMNI_SAMPLING_PARAM_KEYS
++    }
++    if "sampling_seed" in sampling_params:
++        sanitized["seed"] = sampling_params["sampling_seed"]
++    return sanitized
++
++
++def _reject_unsupported_media_markers(text: str) -> None:
++    markers = [marker for marker in ("<image>", "<video>") if marker in text]
++    if markers:
++        raise NotImplementedError(
++            "The initial SGLang-Omni S2TT rollout supports audio and text only; "
++            f"found unsupported marker(s): {', '.join(markers)}"
++        )
++
++
++def _sanitize_messages(messages: Any) -> list[dict[str, Any]]:
++    if not isinstance(messages, list):
++        raise ValueError(
++            "SGLang-Omni rollout requires a structured prompt; do not use --apply-chat-template"
++        )
++    sanitized: list[dict[str, Any]] = []
++    audio_markers = 0
++    for original_message in messages:
++        if not isinstance(original_message, dict):
++            raise ValueError("Each SGLang-Omni prompt message must be a dictionary")
++        message = dict(original_message)
++        content = message.get("content", "")
++        if isinstance(content, str):
++            _reject_unsupported_media_markers(content)
++            sanitized.append(message)
++            continue
++        if not isinstance(content, list):
++            raise ValueError("SGLang-Omni message content must be a string or a list")
++        parts: list[dict[str, Any]] = []
++        for part in content:
++            if not isinstance(part, dict):
++                raise ValueError("SGLang-Omni structured content parts must be dictionaries")
++            part_type = part.get("type")
++            if part_type == "audio":
++                audio_markers += 1
++                parts.append({"type": "audio"})
++            elif part_type == "text":
++                text = str(part.get("text") or "")
++                _reject_unsupported_media_markers(text)
++                parts.append({"type": "text", "text": text})
++            elif part_type in {"image", "video"}:
++                raise NotImplementedError(
++                    "The initial SGLang-Omni S2TT rollout supports audio and text only"
++                )
++            else:
++                parts.append(dict(part))
++        message["content"] = parts
++        sanitized.append(message)
++    if audio_markers != 1:
++        raise ValueError(
++            f"SGLang-Omni S2TT expects exactly one initial audio marker, got {audio_markers}"
++        )
++    return sanitized
++
++
++def _as_omni_audio_data_url(encoded_audio: str) -> str:
++    """Adapt Relax's legacy SGLang audio encoding to a standards-compliant data URL."""
++    if encoded_audio.startswith("data:,"):
++        return "data:audio/wav;base64," + encoded_audio.removeprefix("data:,")
++    return encoded_audio
++
++
++def _ensure_omni_chat_template(
++    tokenizer: Any,
++    processor: Any,
++    apply_kwargs: dict[str, Any],
++) -> None:
++    """Expose the processor-owned Qwen3-Omni template to the tokenizer."""
++    if getattr(tokenizer, "chat_template", None) or apply_kwargs.get("chat_template"):
++        return
++    processor_template = getattr(processor, "chat_template", None)
++    if not processor_template:
++        raise ValueError(
++            "Qwen3-Omni chat template is missing from both tokenizer and processor; "
++            "provide it through --apply-chat-template-kwargs"
++        )
++    tokenizer.chat_template = processor_template
++
++
++def _encode_initial_inputs(
++    sample: Sample,
++    messages: list[dict[str, Any]],
++    processor: Any,
++    tokenizer: Any,
++    args: Any,
++) -> tuple[list[int], list[int], list[str], dict | None]:
++    mm_inputs = sample.multimodal_inputs or {}
++    audios = list(mm_inputs.get("audio") or [])
++    if len(audios) != 1:
++        raise ValueError(
++            f"SGLang-Omni S2TT expects one initial audio chunk, got {len(audios)}"
++        )
++    apply_kwargs = getattr(args, "apply_chat_template_kwargs", None) or {}
++    _ensure_omni_chat_template(tokenizer, processor, apply_kwargs)
++    prompt_text = tokenizer.apply_chat_template(
++        messages,
++        tokenize=False,
++        add_generation_prompt=True,
++        **apply_kwargs,
++    )
++    unexpanded_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
++    if processor is None:
++        expanded_ids = unexpanded_ids
++        mm_train = None
++    else:
++        expanded_ids, mm_train = _run_processor(
++            processor,
++            tokenizer,
++            prompt_text,
++            mm_inputs,
++            args,
++        )
++    sample_rate = int(getattr(args, "audio_sample_rate", None) or 16000)
++    encoded_audios = [
++        encode_audio_for_rollout_engine(audio, sample_rate) for audio in audios
++    ]
++    return unexpanded_ids, expanded_ids, encoded_audios, mm_train
++
++
++async def _run_inference_step(
++    url: str,
++    messages: list[dict[str, Any]],
++    sampling_params: dict[str, Any],
++    encoded_audios: list[str],
++    args: Any,
++) -> tuple[str, list[int], list[float], str]:
++    payload: dict[str, Any] = {
++        "messages": messages,
++        "sampling_params": _sanitize_sampling_params(sampling_params),
++        "metadata": {
++            "audios": [_as_omni_audio_data_url(audio) for audio in encoded_audios]
++        },
++        "return_logprob": True,
++        "output_modalities": ["text"],
++    }
++    if getattr(args, "lora_enable", False):
++        payload["stage_params"] = {
++            "thinker": {"lora_name": getattr(args, "lora_name", None) or "policy"}
++        }
++    output = await post(url, payload)
++    meta = output.get("meta_info") or {}
++    token_logprobs = meta.get("output_token_logprobs")
++    if not isinstance(token_logprobs, list):
++        raise RuntimeError("SGLang-Omni response is missing output_token_logprobs")
++    try:
++        new_logprobs = [float(item[0]) for item in token_logprobs]
++        new_tokens = [int(item[1]) for item in token_logprobs]
++    except (IndexError, TypeError, ValueError) as exc:
++        raise RuntimeError("SGLang-Omni returned malformed output_token_logprobs") from exc
++    if len(new_tokens) != len(new_logprobs):
++        raise RuntimeError("SGLang-Omni token and logprob counts do not match")
++    finish_reason = meta.get("finish_reason")
++    if not isinstance(finish_reason, dict) or not finish_reason.get("type"):
++        raise RuntimeError("SGLang-Omni response is missing finish_reason.type")
++    return str(output.get("text") or ""), new_tokens, new_logprobs, str(finish_reason["type"])
++
++
++async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
++    """Generate one chunked S2TT sample against an external SGLang-Omni router."""
++    if getattr(args, "partial_rollout", False) or sample.response_length:
++        raise NotImplementedError("SGLang-Omni multi-turn partial rollout is not supported")
++    if getattr(args, "optimize_routing_replay", False):
++        raise NotImplementedError("SGLang-Omni multi-turn routing replay is not supported")
++
++    max_turns = getattr(args, "max_turns", None)
++    if max_turns is None or max_turns <= 0:
++        raise ValueError("SGLang-Omni simul rollout requires max_turns > 0")
++
++    state = GenerateState(args)
++    tokenizer, processor = state.tokenizer, state.processor
++    messages = _sanitize_messages(sample.prompt)
++    env = build_env(sample, args)
++    env.reset()
++    loop = asyncio.get_running_loop()
++    unexpanded_ids, expanded_ids, encoded_audios, initial_mm_train = await loop.run_in_executor(
++        _ENCODE_EXECUTOR,
++        _encode_initial_inputs,
++        sample,
++        messages,
++        processor,
++        tokenizer,
++        args,
++    )
++
++    sample.tokens = list(expanded_ids)
++    sample.rollout_tokens = list(unexpanded_ids)
++    sample.loss_mask = []
++    sample.rollout_log_probs = []
++    sample.response_length = 0
++    sample.metadata = sample.metadata or {}
++    response_tokens: list[int] = []
++    response_text_parts: list[str] = []
++    mm_train_buffer = [initial_mm_train] if initial_mm_train else []
++    max_response_len = getattr(args, "rollout_max_response_len", None)
++    generated_count = 0
++    rollout_turns = 0
++    stop_reason = "completed"
++    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
++
++    for turn_idx in range(max_turns):
++        current_sampling_params = sampling_params.copy()
++        if max_response_len is not None:
++            remaining = max_response_len - generated_count
++            if remaining <= 0:
++                sample.status = Sample.Status.TRUNCATED
++                stop_reason = "budget_exhausted"
++                break
++            current_sampling_params["max_new_tokens"] = min(
++                current_sampling_params.get("max_new_tokens", remaining),
++                remaining,
++            )
++
++        text, new_tokens, new_logprobs, finish_type = await _run_inference_step(
++            url,
++            messages,
++            current_sampling_params,
++            encoded_audios,
++            args,
++        )
++        rollout_turns += 1
++        _append_generated(sample, response_tokens, new_tokens, new_logprobs)
++        clean_text = _clean_gen_text(text)
++        response_text_parts.append(clean_text)
++        generated_count += len(new_tokens)
++
++        if finish_type == "abort":
++            sample.status = Sample.Status.ABORTED
++            stop_reason = "abort"
++            break
++        if finish_type == "length":
++            sample.status = Sample.Status.TRUNCATED
++            stop_reason = "length"
++            break
++
++        observation, done, _ = env.step(text)
++        if done:
++            sample.status = Sample.Status.COMPLETED
++            stop_reason = "chunks_exhausted"
++            break
++
++        observation_message = env.format_observation(observation)
++        audio_parts = [
++            part
++            for part in observation_message["content"]
++            if part.get("type") == "audio"
++        ]
++        if len(audio_parts) != 1:
++            raise RuntimeError("SGLang-Omni environment must return one audio chunk")
++        chunk = audio_parts[0]["audio"]
++        expanded_observation, unexpanded_observation, encoded_audio, mm_train = (
++            await loop.run_in_executor(
++                _ENCODE_EXECUTOR,
++                _encode_audio_observation,
++                chunk,
++                processor,
++                tokenizer,
++                args,
++            )
++        )
++        if encoded_audio is None:
++            raise RuntimeError("Failed to encode SGLang-Omni audio observation")
++        _append_observation(
++            sample,
++            response_tokens,
++            expanded_observation,
++            unexpanded_observation,
++        )
++        encoded_audios.append(encoded_audio)
++        if mm_train:
++            mm_train_buffer.append(mm_train)
++        messages.append({"role": "assistant", "content": clean_text})
++        messages.append({"role": "user", "content": [{"type": "audio"}]})
++
++        if turn_idx + 1 >= max_turns:
++            sample.status = Sample.Status.TRUNCATED
++            stop_reason = "max_turns"
++            break
++
++    sample.multimodal_train_inputs = _merge_mm_train(mm_train_buffer)
++    sample.response = "".join(response_text_parts)
++    sample.response_length = len(response_tokens)
++    if sample.status in (None, Sample.Status.PENDING):
++        sample.status = Sample.Status.COMPLETED
++    sample.metadata["simul_stop_reason"] = stop_reason
++    sample.metadata["simul_num_chunks"] = env.num_chunks
++    sample.metadata["rollout_turns"] = rollout_turns
++    print(
++        "[omni-simul-evidence] "
++        f"sample_index={sample.index} "
++        f"rollout_turns={rollout_turns} "
++        f"num_chunks={env.num_chunks} "
++        f"stop_reason={stop_reason} "
++        f"status={sample.status.value}",
++        flush=True,
++    )
++    print(
++        "[omni-simul-output] "
++        f"sample_index={sample.index} "
++        f"response={json.dumps(sample.response[:256], ensure_ascii=True)}",
++        flush=True,
++    )
++    if len(sample.loss_mask) != sample.response_length:
++        raise RuntimeError("SGLang-Omni loss mask and response lengths do not match")
++    if len(sample.rollout_log_probs) != sample.response_length:
++        raise RuntimeError(
++            "SGLang-Omni rollout logprob and response lengths do not match"
++        )
++    if len(sample.tokens) != len(expanded_ids) + sample.response_length:
++        raise RuntimeError("SGLang-Omni training token alignment is inconsistent")
++    return sample
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/examples/simul_s2tt/rollout.py b/examples/simul_s2tt/rollout.py
+new file mode 100644
+index 0000000..181c0af
+--- /dev/null
++++ b/examples/simul_s2tt/rollout.py
+@@ -0,0 +1,789 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: 将整段音频切成多块，执行多轮同传 rollout =====
++
++# 整段音频
++#   ↓ build_env 切块
++# chunk 0 + 初始 prompt
++#   ↓
++# 模型生成第 1 段译文
++#   ↓ 注入 chunk 1
++# 模型生成第 2 段译文
++#   ↓ 注入 chunk 2
++# ……
++#   ↓
++# 拼接所有增量译文
++#   ↓
++# 得到训练 token、loss mask、行为 logprob、多模态特征和 BLEU 文本
++
++# =======================================================
++
++# 数据	| 用途	| 音频占位符
++# sample.rollout_tokens	| 发给 SGLang 推理	| 未展开，每段音频一个 marker
++# sample.tokens	| 交给 Megatron 训练 | processor 已展开，与音频特征对齐
++
++# =======================================================
++
++# 完整逻辑轨迹：audio1 → text1 → audio2 → text2
++#
++# 同一条逻辑轨迹，在 SGLang 推理和 Megatron 训练中使用不同的音频表示。
++#
++# （为简化说明，以上省略了 system、user、assistant 等 chat-template 边界 token。）
++#
++# 一、SGLang 推理流
++#
++# sample.rollout_tokens = [
++#     AUDIO_MARKER_1,       # 表示这里需要插入第1段音频
++#     text1_tokens,
++#     AUDIO_MARKER_2,       # 表示这里需要插入第2段音频
++#     text2_tokens,
++# ]
++#
++# audio_data = [
++#     AUDIO_DATA_1, 
++#     AUDIO_DATA_2,
++# ]
++#
++#
++# 二、Megatron 训练流
++#
++# sample.tokens = [
++#     A1, A2, A3, A4,               # audio1 展开的占位 token
++#     text1_tokens,
++#     B1, B2, B3, B4, B5, B6,       # audio2 展开的占位 token
++#     text2_tokens,
++# ]
++#
++# _merge_mm_train() 将两份特征 pad 并沿 dim=0 合并：
++#
++# audio1 → text1 → audio2 → text2 → audio3
++#   │                 │                 │
++#   ▼                 ▼                 ▼
++# feature1          feature2          feature3
++# [1,128,100]       [1,128,130]       [1,128,80]
++#   │                 │                 │
++#   └────── pad 最后一维到 130 ─────────┘
++#                 │
++#                 ▼
++#       input_features
++#          [3,128,130]
++#
++#
++# 训练轨迹：
++# audio1, text1, audio2, text2, audio3, text3, ...
++#
++# loss mask：
++#    0,     1,      0,     1,      0,     1, ...
++#
++# BLEU 文本：
++# text1 + text2 + text3 + ... + textN
++
++
++"""同传多轮自定义 generate（音频逐块）。
++
++挂载方式（训练脚本）：
++    --custom-generate-function-path examples.simul_s2tt.rollout.generate
++    --custom-config-path examples/simul_s2tt/config.yaml
++
++其中 config.yaml（键会被 setattr 到 args，任意键均可）至少含：
++    max_turns: 64        # 安全上限；实际轮数由音频切块数决定
++    simul_chunk_ms: 960  # 每块时长（可选，默认 960）
++（env 在本文件内直接 import build_env，无需 --rollout-interaction-env-path。）
++
++它只替换 sglang_rollout 里「生成一条样本」这一层：外层批量编排、并发信号量、reward、
++abort 全部仍由核心处理。每轮都打同一个 sglang engine（同一 /generate 端点、同一 LoRA
++adapter），只是把「调一次」变成「循环调 N 次并逐块注入音频」。
++
++结构参考 examples/deepeyes/rollout.py，差异：
++- 观测是音频 chunk 而非图像；
++- 环境脚本化（step 忽略模型输出，直接吐下一块）；
++- 音频必须走「双 token 流」：deepeyes 对图像可直接把 processor 展开后的 sample.tokens 发
++  sglang，但音频在本套 sglang 上不接受「预展开」占位符（会与 audio_data 对不上导致引擎崩，
++  已实测 503/worker died）。故对齐已验证的 s2tt 单轮核心路径：
++    · sample.rollout_tokens（tokenizer 未展开，1 marker/段）+ audio_data → 发 sglang，引擎内部展开；
++    · sample.tokens（processor 展开，含 N 个占位 token）+ multimodal_train_inputs → 训练用。
++
++★ 首次真机仍需确认：LoRA rollout 是否带上 lora_path（见 _run_inference_step 的 NOTE(2)）。
++
++==================================
++
++Qwen3-Omni 同传 S2TT 的自定义多轮 generate。
++
++这个模块把普通的一次 /generate 请求扩展为多次请求：
++
++1. build_env 将整段音频切成若干 chunk；
++2. 首轮输入包含 chunk 0；
++3. 模型每生成一段增量译文后，环境注入下一个音频 chunk；
++4. 重复生成，直到音频块耗尽、达到生成预算、达到 max_turns 或请求被中止；
++5. 将所有轮次的干净译文拼接为 sample.response；
++6. 同时构造供 Megatron 训练使用的 tokens、loss_mask、logprob 和音频特征。
++
++这里只负责单个 Sample 的生成过程。
++批量调度、并发限制、reward 计算和 abort 管理由 Relax 外层负责。
++
++音频必须维护两条 token 流：
++
++- sample.rollout_tokens：
++  tokenizer 编码的未展开音频 marker，连同 audio_data 发给 SGLang；
++  音频占位符由 SGLang 内部展开。
++
++- sample.tokens：
++  Qwen3-Omni processor 展开后的音频占位 token；
++  与 multimodal_train_inputs 对齐，供 Megatron 训练。
++
++不能直接把 processor 预展开后的音频 token 发给当前 SGLang，
++否则预展开 token 数可能与 audio_data 无法对应，导致请求 503 或 worker 崩溃。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import re
++from typing import Any
++
++import numpy as np
++import torch
++
++
++# 匹配 <|im_end|>、<|endoftext|> 等 Qwen 风格特殊 token。
++# sglang 每轮返回的 text 会带结束符（如 <|im_end|>）等特殊 token。拼进 sample.response 会污染
++# BLEU：既凭空多出参考里没有的 token 拉低 precision，更会把「跨块」的 2/3/4-gram 打断（每两块
++# 之间插一个 marker），让高阶 n-gram 几乎全废。实测每样本平均 ~9.5 个 marker，BLEU 被压到真实
++# 值的 ~40%（7.2 vs 17.9）。故拼接 response 前先去掉所有 <|...|> 特殊 token。
++_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|>]*\|>")
++
++
++def _clean_gen_text(text: str) -> str:
++    """去掉模型生成文本里的 <|...|> 特殊 token（喂 BLEU 的干净译文用）。"""
++    # 这个函数只影响 sample.response，也就是最终送去计算 BLEU 的文本；
++    # 不修改训练使用的 token IDs。
++
++    # 如果将每轮末尾的 <|im_end|> 直接拼入译文：
++
++    # 1. BLEU 会把它视为参考译文中不存在的额外 token；
++    # 2. 它会插在相邻音频块的译文之间；
++    # 3. 跨块的 2/3/4-gram 会被特殊 token 截断；
++    # 4. BLEU 会显著低估真实翻译质量。
++    return _SPECIAL_TOKEN_RE.sub("", text or "")
++
++from examples.simul_s2tt.audio_chunk_env import build_env
++from relax.engine.rollout.sglang_rollout import GenerateState
++from relax.utils.data.processing_utils import (
++    _ENCODE_EXECUTOR,
++    encode_audio_for_rollout_engine,
++)
++from relax.utils.http_utils import post
++from relax.utils.types import Sample
++
++
++# 用于计算 observation 轮 chat 模板的「系统前言」长度，之后裁掉，只保留本轮 token。
++DUMMY_MESSAGES = [
++    {"role": "system", "content": "You are a helpful assistant."},
++    {"role": "user", "content": "I am a user."},
++]
++
++
++def _run_processor(processor, tokenizer, text, multimodal_inputs: dict, args):
++    """运行 Qwen3-Omni processor。
++
++    返回：
++        input_ids:
++            processor 展开后的 token IDs，音频 marker 会展开成与音频特征对应的
++            多个占位 token。
++
++        mm_train:
++            除 input_ids 和 attention_mask 以外的多模态训练输入，
++            例如 input_features、feature_attention_mask 等。
++
++    该函数生成的是 Megatron 训练侧需要的数据，
++    不是直接发给 SGLang 的未展开 token 流。
++    """
++    processor_output = processor(
++        # 已经套好 chat template 的文本。
++        text=text,
++        # 当前训练链路不需要 processor 返回 mm_token_type_ids。
++        return_mm_token_type_ids=False,
++        # 是否把视频中的音频一起作为输入。
++        use_audio_in_video=getattr(args, "use_audio_in_video", False),
++        # 传入 images、videos、audio 等完整多模态字段。
++        **multimodal_inputs,
++    )
++    # processor 输出通常带 batch 维；
++    # 当前函数一次只处理一条样本，因此取第 0 条。
++    input_ids = processor_output["input_ids"][0]
++    # 取出训练所需的多模态特征。
++    #
++    # input_ids 已经单独返回；
++    # attention_mask 会由训练数据管线根据 token 序列重新处理，因此不放入这里。
++    mm_train = {
++        k: (torch.from_numpy(v) if isinstance(v, np.ndarray) else v)
++        for k, v in processor_output.items()
++        if k not in ("input_ids", "attention_mask")
++    } or None
++    return input_ids, mm_train
++
++
++# 首轮执行后形成：
++# sample.rollout_tokens = 未展开 prompt + 1 个 chunk0 marker
++# sample.tokens         = 展开 prompt + chunk0 对应的 N 个音频 token
++# audio_data            = [chunk0 的编码音频]
++# mm_train              = chunk0 的训练特征
++def _encode_initial_inputs(sample: Sample, processor, tokenizer, args):
++    """首轮编码，返回 (unexp_ids, exp_ids, audio_data, mm_train)。
++
++    ★ 关键（对齐已验证 s2tt 核心路径 sglang_rollout.generate）：
++    - unexp_ids：tokenizer.encode(prompt)，音频占位符「未展开」（每段 1 个 marker）。
++      → 发给 sglang 的 input_ids 用它 + audio_data，由 sglang 内部展开（音频这条链必须如此，
++        否则 sglang 拿到「预展开」占位符会与 audio_data 对不上而崩）。
++    - exp_ids：processor 展开后的 input_ids（含 N 个音频占位 token）+ mm_train 特征。
++      → 训练侧 sample.tokens 用它（与 multimodal_train_inputs 对齐）。
++    env 已把 sample.multimodal_inputs["audio"] 换成 [chunk0]（images/videos 键保留）。
++    
++    =======================================================
++
++    编码首轮输入，建立训练流和推理流。
++
++    返回：
++        unexp_ids:
++            tokenizer 编码的未展开 token。
++            每段音频仍表现为一个 marker，用于 SGLang input_ids。
++
++        exp_ids:
++            processor 展开后的 token。
++            音频 marker 已展开为多个占位 token，用于 Megatron 训练。
++
++        audio_data:
++            SGLang 接口接收的序列化音频数据列表。
++
++        mm_train:
++            Megatron 训练侧需要的音频特征。
++
++    调用该函数前，build_env 已经：
++        1. 将整段音频切块；
++        2. 将 sample.multimodal_inputs["audio"] 替换为 [chunk0]。
++    """
++    # 取得首轮多模态输入。
++    mm = sample.multimodal_inputs or {}
++    # 取出当前首轮包含的音频列表。
++    # 正常情况下这里是 [chunk0]。
++    audios = list(mm.get("audio") or [])
++    # 推理流：
++    # tokenizer 只处理 prompt 文本中的音频 marker，不展开成音频帧级占位 token。
++    unexp_ids = tokenizer.encode(sample.prompt, add_special_tokens=False)
++    # 如果没有 processor，只能退化为纯文本路径。
++    # 此时训练流与推理流相同，也没有音频特征。
++    if processor is None:
++        return unexp_ids, unexp_ids, [], None
++
++    # 训练流：
++    # processor 根据 chunk0 的真实音频长度展开音频 token，
++    # 并生成对应的音频特征。
++    exp_ids, mm_train = _run_processor(processor, tokenizer, sample.prompt, mm, args)
++    # 默认采样率为 16 kHz。
++    sample_rate = int(getattr(args, "audio_sample_rate", None) or 16000)
++    # 将每段音频编码为 SGLang /generate 接口接受的格式。
++    audio_data = [encode_audio_for_rollout_engine(a, sample_rate) for a in audios]
++    return unexp_ids, exp_ids, audio_data, mm_train
++
++
++def _strip_bos(tokenizer, ids: list[int]) -> list[int]:
++    """删除增量 token 序列开头可能重复出现的 BOS。
++
++    每个后续音频 chunk 都会被独立编码。
++    某些 tokenizer 会在每次独立编码时自动加入 BOS。
++
++    但累计上下文开头已经有 BOS，
++    如果每轮都继续追加 BOS，会在人为拼接的对话中插入多个序列起始符。
++    """
++    bos_id = tokenizer.bos_token_id
++    if bos_id is not None and ids and ids[0] == bos_id:
++        return ids[1:]
++    return ids
++
++
++def _encode_audio_observation(chunk, processor, tokenizer, args):
++    """后续轮：把「一个音频 chunk 的 user turn」编码，返回 (exp_ids, unexp_ids, audio_str, mm_train)。
++
++    仿 deepeyes._encode_observation_for_generation：套 chat 模板 + 裁掉系统前言，只保留本轮
++    新增 token。同样维护两条流：
++    - unexp_ids：tokenizer.encode(本轮 chat 串)，音频「未展开」→ 追加到 rollout_tokens 发 sglang。
++    - exp_ids：processor 展开（含 N 个占位 token）→ 追加到 sample.tokens 供训练。
++    dummy 前言无音频，故 trim_length（tokenizer 计）对两条流都适用。
++
++    =======================================================
++
++    把一个后续音频 chunk 编码为新的 user turn。
++
++    返回：
++        exp_ids:
++            processor 展开的增量 token，追加到 sample.tokens。
++
++        unexp_ids:
++            tokenizer 未展开的增量 token，追加到 sample.rollout_tokens。
++
++        audio_str:
++            SGLang 接口使用的音频编码。
++
++        mm_train:
++            当前 chunk 对应的训练音频特征。
++
++    只返回“本轮新增部分”，不返回重复的 system prompt 或历史前言。
++    """
++
++    # 最终每个后续 chunk 产生四份数据：
++    # chunk
++    # ├─ exp_ids      → sample.tokens
++    # ├─ unexp_ids    → sample.rollout_tokens
++    # ├─ audio_str    → 累计 audio_data
++    # └─ mm_train     → 累计 multimodal_train_inputs
++
++    # 将当前音频块包装成 Qwen chat template 所需的多模态 user message。
++    message = {"role": "user", "content": [{"type": "audio", "audio": chunk}]}
++    sample_rate = int(getattr(args, "audio_sample_rate", None) or 16000)
++    # 当前 chunk 单独编码为 SGLang audio_data 项。
++    audio_str = encode_audio_for_rollout_engine(chunk, sample_rate)
++
++    # 允许调用方传额外的 chat template 参数。
++    apply_kwargs = args.apply_chat_template_kwargs or {}
++    # trim_length 表示固定对话前言占用了多少 tokenizer token。
++    trim_length = 0
++    if args.apply_chat_template:
++        # 只编码固定 dummy 前言，不加入 assistant generation prompt。
++        #
++        # 其 token 长度用于确定 formatted_prompt 中应该裁掉多少前缀。
++        dummy_prompt = tokenizer.apply_chat_template(
++            DUMMY_MESSAGES, tokenize=False, add_generation_prompt=False, **apply_kwargs
++        )
++        formatted_prompt = tokenizer.apply_chat_template(
++            DUMMY_MESSAGES + [message], tokenize=False, add_generation_prompt=True, **apply_kwargs
++        )
++        trim_length = len(tokenizer.encode(dummy_prompt, add_special_tokens=False))
++    else:
++        # 即使配置上不走外层 apply_chat_template，
++        # 这里仍调用 tokenizer.apply_chat_template 来把音频消息变成模型格式。
++        #
++        # 区别是此分支不额外加入 DUMMY_MESSAGES，也不做前缀裁剪。
++        formatted_prompt = tokenizer.apply_chat_template(
++            [message], tokenize=False, add_generation_prompt=True, **apply_kwargs
++        )
++
++    # 推理流：用 tokenizer 编码，音频 marker 保持未展开。
++    unexp_full = tokenizer.encode(formatted_prompt, add_special_tokens=False)
++    # 如果前面使用了 dummy 对话，就裁掉固定前言，
++    # 只保留当前音频 turn 新增的 token。
++    unexp_ids = unexp_full[trim_length:] if trim_length else unexp_full
++    # 防止增量部分开头重复携带 BOS。
++    unexp_ids = _strip_bos(tokenizer, unexp_ids)
++
++    # 没有 processor 时退化为纯 tokenizer 路径。
++    if processor is None:
++        return unexp_ids, unexp_ids, audio_str, None
++
++    # 当前 observation 只有音频，没有图像和视频。
++    #
++    # images/videos 必须传 None，而不能传空列表 []。
++    # 一些 processor 对 [] 仍会进入图像分组逻辑，
++    # 随后在 group_images_by_shape([]) 中发生越界。
++    mm_obs = {"images": None, "videos": None, "audio": [chunk]}
++    
++    # 训练流：processor 展开音频占位 token，并生成当前块的训练特征。
++    exp_ids, mm_train = _run_processor(processor, tokenizer, formatted_prompt, mm_obs, args)
++    # processor 的 token 序列也包含相同的固定文本前言。
++    # dummy 前言本身不含音频，因此其 tokenizer 长度可用于裁剪两条流。
++    if trim_length:
++        exp_ids = exp_ids[trim_length:]
++    # 同样去掉增量部分可能重复出现的 BOS。
++    exp_ids = _strip_bos(tokenizer, exp_ids)
++
++    return exp_ids, unexp_ids, audio_str, mm_train
++
++
++# 音频特征键：各块帧数（最后一维）不同，需先 pad 到 max 再 cat dim0，复现「单次 processor
++# 多音频调用」的规范布局（input_features [N,128,maxT] / feature_attention_mask [N,maxT]）。
++# 与 megatron/data.py 的 PAD_RULES 语义一致（那里跨样本 pad，这里样本内 pad）。
++
++# 不同 chunk 的音频时长可能不同，因此 processor 输出的时间维 T 不同。
++#
++# 合并多个 chunk 前需要将最后一维 pad 到统一长度。
++#
++# 声学特征缺失位置补 0.0。
++# attention mask 缺失位置补 0，表示 padding 帧不可见。
++#
++# 典型形状：
++# chunk 0 input_features: [1, 128, T0]
++# chunk 1 input_features: [1, 128, T1]
++# chunk 2 input_features: [1, 128, T2]
++
++# pad 到 max(T0,T1,T2) 后：
++
++# merged input_features: [3, 128, maxT]
++_AUDIO_PAD_LAST_DIM = {"input_features": 0.0, "feature_attention_mask": 0}
++
++
++def _merge_mm_train(chunks: list[dict | None]) -> dict | None:
++    """把各块 mm_train_inputs 按 key 合并（只合并 torch.Tensor 值）。
++
++    - 音频特征键（帧数变长）：pad 最后一维到 max 后 cat dim0；
++    - 其余键（如定长网格）：直接 cat dim0。
++
++    =======================================================
++
++    将每个音频块的 processor 输出合并成一条样本的多模态训练输入。
++
++    合并规则：
++
++    1. 忽略 None 和空字典；
++    2. 按特征名称收集所有 chunk 的值；
++    3. 只合并 torch.Tensor；
++    4. input_features 和 feature_attention_mask：
++       先在最后一维补齐，再沿第 0 维拼接；
++    5. 其他 Tensor：
++       直接沿第 0 维拼接。
++    """
++
++    # 将：
++    # [
++    #   {"input_features": f0, "mask": m0},
++    #   {"input_features": f1, "mask": m1},
++    # ]
++    #
++    # 变成：
++    # {
++    #   "input_features": [f0, f1],
++    #   "mask": [m0, m1],
++    # }
++    values_by_key: dict[str, list] = {}
++    for chunk in chunks:
++        if not chunk:
++            continue
++        for key, val in chunk.items():
++            if val is None:
++                continue
++            values_by_key.setdefault(key, []).append(val)
++
++    merged: dict[str, Any] = {}
++    for key, values in values_by_key.items():
++        # 非 Tensor 元数据不在这里合并。
++        # 该函数只负责训练 tensor。
++        if not all(isinstance(v, torch.Tensor) for v in values):
++            continue
++        if len(values) == 1:
++            # 只有一块时无需 padding 或复制。
++            merged[key] = values[0]
++        elif key in _AUDIO_PAD_LAST_DIM:
++            # 音频时间维长度不一致，需要补齐最后一维。
++            pad_val = _AUDIO_PAD_LAST_DIM[key]
++            # 找到所有 chunk 的最大时间长度。
++            max_last = max(v.shape[-1] for v in values)
++            padded = [
++                # torch.nn.functional.pad 的 [0, n]
++                # 表示只在最后一维右侧补 n 个值。
++                torch.nn.functional.pad(v, [0, max_last - v.shape[-1]], value=pad_val)
++                if v.shape[-1] < max_last
++                else v
++                for v in values
++            ]
++            # 沿第 0 维合并多个音频段。
++            merged[key] = torch.cat(padded, dim=0)
++        else:
++            # 其他形状兼容的多模态 Tensor 直接拼接。
++            merged[key] = torch.cat(values, dim=0)
++    return merged or None
++
++
++def _append_generated(sample: Sample, response_tokens: list[int], tokens: list[int], logprobs: list[float]):
++    """模型生成 token：两条流里一致（纯文本 token，无音频占位），loss_mask=1 参与训练。
++    
++    =======================================================
++
++    将一轮模型生成的文本 token 加入完整训练轨迹。
++
++    模型生成的是纯文本，不包含需要展开的音频 marker，
++    因此训练流与 SGLang 推理流中的 token 完全相同。
++
++    模型生成 token 属于策略动作：
++        loss_mask = 1
++        rollout_log_probs = SGLang 返回的行为策略 logprob
++    """
++    # 加入 Megatron 训练流。
++    sample.tokens.extend(tokens)
++    # 加入下一轮继续发送给 SGLang 的累计上下文。
++    sample.rollout_tokens.extend(tokens)
++    # response_tokens 记录 prompt 之后的展开流：
++    # 包括模型生成 token 和后来注入的 observation token。
++    #
++    # 它不包括初始 prompt。
++    response_tokens.extend(tokens)
++    # 模型生成 token 参与 GRPO/PPO 策略损失。
++    sample.loss_mask.extend([1] * len(tokens))
++    # 保存 rollout 时旧策略对这些动作 token 给出的 logprob。
++    sample.rollout_log_probs.extend(logprobs)
++    # response_length 按 prompt 之后的展开流长度计算。
++    sample.response_length = len(response_tokens)
++
++
++def _append_observation(sample: Sample, response_tokens: list[int], exp_ids: list[int], unexp_ids: list[int]):
++    """注入的音频观测：训练流(sample.tokens)用展开 ids，sglang 流(rollout_tokens)用未展开 ids；
++    loss_mask=0 不参与训练。response_tokens/loss_mask/logprobs 都跟展开流对齐。
++    
++    =======================================================
++
++    音频 observation 是环境输入，不是模型动作：
++
++        sample.tokens          追加 exp_ids
++        sample.rollout_tokens  追加 unexp_ids
++        loss_mask              填 0
++        rollout_log_probs      填 0.0
++
++    loss_mask/logprob 使用 exp_ids 的长度，
++    因为训练对齐以 sample.tokens 这条展开流为准。
++    """
++    # 最关键的对齐关系是：
++    # len(sample.loss_mask)
++    # = len(sample.rollout_log_probs)
++    # = response_length
++    # 其中这些长度只覆盖“初始 prompt 之后”的部分，不包含初始 prompt token。
++    #
++    # 而：
++    # len(sample.tokens)
++    # = prompt_length + response_length
++    
++    # 训练流追加 processor 展开的音频 token。
++    sample.tokens.extend(exp_ids)
++    # response_tokens 也按展开流记录，
++    # 用于计算训练侧 response_length。
++    response_tokens.extend(exp_ids)
++    # observation 不属于策略输出，不计算策略损失。
++    sample.loss_mask.extend([0] * len(exp_ids))
++    # observation 没有旧策略生成概率。
++    # 为保持数组长度与展开训练流对齐，填充 0.0。
++    sample.rollout_log_probs.extend([0.0] * len(exp_ids))
++    # 推理流追加未展开音频 marker。
++    sample.rollout_tokens.extend(unexp_ids)
++    sample.response_length = len(response_tokens)
++
++
++async def _run_inference_step(url, tokens, sampling_params, audio_data, args):
++    """使用累计 token 和累计音频执行一轮增量生成。"""
++    payload = {
++        # 未展开的累计 token 流。
++        "input_ids": tokens,
++        # 当前轮采样参数；主循环可能会修改 max_new_tokens。
++        "sampling_params": sampling_params,
++        # 训练需要旧策略生成 token 的 logprob。
++        "return_logprob": True,
++    }
++    # NOTE(2): LoRA 训练时 rollout 必须引用刚热推上去的同名 adapter，否则用的是 base。
++    if getattr(args, "lora_enable", False):
++        # 明确选择训练侧刚热推到 SGLang 的 adapter。
++        #
++        # 如果没有该字段，即使 adapter 已加载，
++        # 当前请求仍可能使用纯 base model。
++        payload["lora_path"] = getattr(args, "lora_name", None) or "policy"
++    if audio_data:
++        # audio_data 是到当前轮为止的所有音频块。
++        #
++        # rollout_tokens 中也累计了对应数量的未展开音频 marker。
++        # SGLang 根据 marker 和 audio_data 在内部展开音频输入。
++        payload["audio_data"] = audio_data
++
++    # 异步发送 HTTP 请求。
++    output = await post(url, payload)
++    meta = output["meta_info"]
++    if "output_token_logprobs" in meta:
++        # SGLang 返回的每项通常包含：
++        # item[0] = token logprob
++        # item[1] = token ID
++        new_tokens = [item[1] for item in meta["output_token_logprobs"]]
++        new_logprobs = [item[0] for item in meta["output_token_logprobs"]]
++    else:
++        # 没有 token logprob 时返回空生成轨迹。
++        new_tokens, new_logprobs = [], []
++    # 常见值包括 stop、length、abort。
++    finish_type = meta["finish_reason"]["type"]
++    return output["text"], new_tokens, new_logprobs, finish_type
++
++
++async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
++    """同传多轮 rollout：整段音频切块，每轮喂一块并生成一段增量译文。"""
++
++    # 这里有三种“response”概念：
++    # 1. response_tokens：训练对齐使用，包含生成 token 和后续观测 token。
++    # 2. sample.response_length：等于 len(response_tokens)。
++    # 3. sample.response：BLEU 使用，只包含模型生成的干净译文字符串。
++
++    # GenerateState 负责取得 tokenizer 和多模态 processor。
++    state = GenerateState(args)
++    tokenizer, processor = state.tokenizer, state.processor
++    # 所有轮次都请求同一个 SGLang router。
++    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
++
++    # 检查安全轮数上限
++    max_turns = getattr(args, "max_turns", None)
++    if max_turns is None:
++        raise ValueError("simul_s2tt 需要 --max-turns（作为安全上限；实际轮数由切块数决定）。")
++
++    # build_env 读取 sample 中的完整音频并按 simul_chunk_ms 切块。
++    #
++    # 它还会把 sample.multimodal_inputs["audio"]
++    # 替换成只包含 chunk0 的列表，使首轮只看到第一块音频。
++    env = build_env(sample, args)
++    # 将环境游标复位到开头。
++    env.reset()
++
++    loop = asyncio.get_running_loop()
++
++    # ---- 首轮输入编码（双流：unexp 发 sglang / exp 供训练）----
++    unexp_prompt_ids, exp_prompt_ids, audio_data, init_mm_train = await loop.run_in_executor(
++        _ENCODE_EXECUTOR, _encode_initial_inputs, sample, processor, tokenizer, args
++    )
++
++    # 两条 token 流（对齐已验证 s2tt 核心路径）：
++    # - sample.rollout_tokens（未展开）→ 每轮发 sglang 的 input_ids，配 audio_data 由 sglang 展开。
++    # - sample.tokens（processor 展开，含音频占位 token）→ 训练用，与 multimodal_train_inputs 对齐。
++    
++    # Megatron 训练流：processor 已展开音频 token。
++    sample.tokens = list(exp_prompt_ids)
++    # SGLang 推理流：音频 marker 未展开。
++    sample.rollout_tokens = list(unexp_prompt_ids)
++    # 保留已有列表；若为空或 None，则初始化为空列表。
++    sample.loss_mask = sample.loss_mask or []
++    sample.rollout_log_probs = sample.rollout_log_probs or []
++    # 记录初始 prompt 之后的展开 token。
++    #
++    # 后续会同时加入：
++    # - 模型生成 token；
++    # - 环境注入的展开 observation token。
++    #
++    # 不包含初始 prompt。
++    response_tokens: list[int] = []  # 展开流的 gen+obs，保持与 sample.tokens/loss_mask/response_length 对齐
++    # 只记录模型每轮生成的干净文本。
++    # 不加入音频 observation，也不加入特殊 token。
++    response_text_parts: list[str] = []  # 只收模型各轮生成文本（干净译文，喂 BLEU）
++    sample.response_length = 0
++
++    # 按块暂存 processor 输出，最后统一 pad 和合并。
++    mm_train_buffer: list[dict | None] = []
++    if init_mm_train:
++        mm_train_buffer.append(init_mm_train)
++
++    # 确保 metadata 可以写入终止原因等字段。
++    sample.metadata = sample.metadata or {}
++
++    # 总生成预算（只算模型 token，不含观测音频）：防多轮累积把序列撑爆。simul 脚本没设
++    # --rollout-max-context-len，故这里用 rollout_max_response_len 收口，逐轮扣减。
++    max_resp = getattr(args, "rollout_max_response_len", None)
++    generated_count = 0
++
++    # 开始多轮生成循环：
++    stop_reason = "completed"
++    for turn_idx in range(max_turns):
++        cur_sp = sampling_params.copy()
++        if max_resp is not None:
++            # 计算所有轮次共享预算中尚未使用的部分。
++            remaining = max_resp - generated_count
++            if remaining <= 0:
++                sample.status = Sample.Status.TRUNCATED
++                stop_reason = "budget_exhausted"
++                break
++            # 本轮不能生成超过总剩余预算的 token。
++            #
++            # 如果原 sampling_params 的 max_new_tokens 更小，
++            # 则仍遵循原本更严格的限制。
++            cur_sp["max_new_tokens"] = min(cur_sp.get("max_new_tokens", remaining), remaining)
++
++        # 请求 SGLang
++        # 发给 sglang 的是「未展开」的 rollout_tokens + audio_data（sglang 内部展开音频占位）。
++        _text, new_tokens, new_logprobs, finish_type = await _run_inference_step(
++            url, sample.rollout_tokens, cur_sp, audio_data, args
++        )
++        # 模型生成的 token 参与训练（loss_mask=1），两条流一致。
++        _append_generated(sample, response_tokens, new_tokens, new_logprobs)
++        # 去掉结束符等特殊 token 再收集：拼进 sample.response 的必须是干净译文，否则 BLEU 被
++        # marker 打断跨块 n-gram、并凭空多出参考没有的 token（实测拉低 ~60%）。
++        response_text_parts.append(_clean_gen_text(_text))
++        # 总生成预算只计算模型输出 token。
++        generated_count += len(new_tokens)
++
++        # 处理 SGLang 终止原因
++        if finish_type == "abort":
++            sample.status = Sample.Status.ABORTED
++            stop_reason = "abort"
++            break
++
++        # 某轮把预算打满（length 截断）：本轮译文已被切断，继续下一块无意义，收口。
++        if finish_type == "length":
++            sample.status = Sample.Status.TRUNCATED
++            stop_reason = "length"
++            break
++
++        # 从环境取得下一块音频
++        # 脚本化推进：拿下一块音频（step 忽略模型输出）。
++        observation, done, _info = env.step(_text)
++        if done:
++            # 当前轮生成后已经没有下一块音频。
++            sample.status = Sample.Status.COMPLETED
++            stop_reason = "chunks_exhausted"
++            break
++
++        # 从 observation 中提取音频
++        # 将环境 observation 格式化为多模态 chat message。
++        obs_message = env.format_observation(observation)
++        chunk = None
++        # 在 message content 中找到音频项。
++        for c in obs_message["content"]:
++            if c.get("type") == "audio":
++                chunk = c["audio"]
++                break
++
++        # 编码并注入下一块音频
++
++        # 每次追加后，两条流仍保持各自内部一致：
++        # rollout_tokens 中的音频 marker 数
++        # ↔ audio_data 中的音频段数
++
++        # sample.tokens 中的展开音频 token
++        # ↔ mm_train_buffer 中的音频特征
++
++        obs_exp_ids, obs_unexp_ids, obs_audio_str, obs_mm_train = await loop.run_in_executor(
++            _ENCODE_EXECUTOR, _encode_audio_observation, chunk, processor, tokenizer, args
++        )
++        # 注入的观测 token 不参与训练（loss_mask=0）：exp 进训练流，unexp 进 sglang 流。
++        _append_observation(sample, response_tokens, obs_exp_ids, obs_unexp_ids)
++        if obs_audio_str is not None:
++            # SGLang 每轮收到的是累计音频列表。
++            audio_data = (audio_data or []) + [obs_audio_str]
++        if obs_mm_train:
++            # Megatron 训练特征最后统一合并。
++            mm_train_buffer.append(obs_mm_train)
++
++        # 达到 max_turns
++        if turn_idx + 1 >= max_turns:
++            sample.status = Sample.Status.TRUNCATED
++            stop_reason = "max_turns"
++            break
++
++    # 生成结束后的样本整理
++    # 合并多块音频特征
++    sample.multimodal_train_inputs = _merge_mm_train(mm_train_buffer)
++    # response 用各轮「生成文本」拼接（干净译文）而非 decode(response_tokens)：后者含观测音频
++    # 占位符 token，会污染 BLEU。response_length 仍用 token 数（含 obs），供训练对齐 loss_mask。
++    sample.response = "".join(response_text_parts)
++    # response_length 服务于 token/mask/logprob 对齐，
++    # 不是 sample.response 字符串长度。
++    #
++    # 它包含：
++    # - 模型生成 token；
++    # - 后续注入的展开 observation token。
++    #
++    # 它不包含初始 prompt token。
++    sample.response_length = len(response_tokens)
++    # 状态兜底
++    # status 默认是 PENDING（非 None）；正常结束的分支都已显式置位，这里兜底避免残留 PENDING。
++    if sample.status in (None, Sample.Status.PENDING):
++        sample.status = Sample.Status.COMPLETED
++    sample.metadata["simul_stop_reason"] = stop_reason
++    sample.metadata["simul_num_chunks"] = env.num_chunks
++    return sample
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/relax/backends/megatron/__init__.py b/relax/backends/megatron/__init__.py
+index 03a19d4..66e666c 100644
+--- a/relax/backends/megatron/__init__.py
++++ b/relax/backends/megatron/__init__.py
+@@ -27,8 +27,16 @@ except ImportError:
+ def patch_rotary_embedding(cls):
+     _original_forward = cls.forward
+ 
+-    def _patched_forward(self, *args, packed_seq_params=None, **kwargs):
+-        return _original_forward(self, *args, **kwargs)
++    # 🚨 ===== [YULIN-MOD] START: 忽略不兼容的 rotary embedding 关键字参数 =====
++
++    def _patched_forward(self, *args, **kwargs):
++        # 保留位置参数，但不把 kwargs 转发给旧版原始 forward。
++        #
++        # 用于兼容调用方和当前 Megatron rotary embedding 实现之间的签名差异：
++        # 调用方可能传入新版才支持的关键字参数，而旧版 forward 不认识。
++        return _original_forward(self, *args)
++
++    # 🚨 ===== [YULIN-MOD] END =====
+ 
+     cls.forward = _patched_forward
+ 
+@@ -51,4 +59,60 @@ try:
+ except ImportError:
+     pass
+ 
++
++# 🚨 ===== [YULIN-MOD] START: 修复 Qwen3-Omni 多段音频位置索引的设备不一致 =====
++
++def patch_qwen3_omni_rope_index_device():
++    """修 redai bridge get_rope_index 的「多段音频 device mismatch」bug。
++
++    该函数把 M-RoPE 位置 id 全程在 CPU 上用 torch.arange(...) 构建、最后再 .to(device)。
++    作者在 video 分支已显式 `second_per_grids[i].cpu()` 保持 CPU，却漏了 audio_seqlens
++    （model.py 里 = feature_attention_mask.sum(1)，是 CUDA 张量）。当一条序列含 >=2 段音频时，
++    第 1 段处理后计数器 st 被 audio_len(CUDA) 污染，第 2 段那轮 `st_idx += text_len(CUDA)`
++    触发 'cuda and cpu' 崩溃。单轮/单段音频只跑一轮不暴露（单轮 s2tt 因此一直没事）。
++
++    修法：包一层，调用前把 audio_seqlens / *_grid_thw / second_per_grids 统一 .cpu()，
++    与作者对 video 的处理一致；结果 position_ids 仍在 input_ids.device，数值完全不变。
++    幂等：重复调用不会二次包裹。
++    """
++    import torch
++
++    from megatron.bridge.models.qwen_omni.modelling_qwen3_omni import model as _omni_model
++
++    # 幂等检查：如果已经打过补丁，直接返回。
++    # 防止模块被重复 import 时套上多层 wrapper。
++    if getattr(_omni_model.get_rope_index, "_relax_device_patched", False):
++        return
++
++    # 保存 Bridge 原始实现。
++    _orig_get_rope_index = _omni_model.get_rope_index
++
++    def _patched_get_rope_index(*args, **kwargs):
++        # get_rope_index 内部使用 CPU torch.arange 等操作构造位置索引。
++        # 这些长度/网格参数如果留在 CUDA，会在多段累计过程中污染 CPU 计数器。
++        for _k in ("audio_seqlens", "image_grid_thw", "video_grid_thw", "second_per_grids"):
++            _v = kwargs.get(_k)
++            if isinstance(_v, torch.Tensor):
++                # 统一放到 CPU，仅改变计算设备，不改变长度或网格数值。
++                kwargs[_k] = _v.cpu()
++        # 调用 Bridge 原始实现。
++        # 原实现最后仍会按 input_ids.device 返回 position_ids。
++        return _orig_get_rope_index(*args, **kwargs)
++
++    # 给 wrapper 打标记，供上面的幂等检查识别。
++    _patched_get_rope_index._relax_device_patched = True
++    # 用 wrapper 替换模块级函数。
++    _omni_model.get_rope_index = _patched_get_rope_index
++
++
++try:
++    # import Relax Megatron backend 时自动应用补丁。
++    patch_qwen3_omni_rope_index_device()
++except ImportError:
++    # 如果当前 Bridge 版本没有 Qwen3-Omni 模块，
++    # 不影响其他模型继续使用 Relax。
++    pass
++
++# 🚨 ===== [YULIN-MOD] END =====
++
+ logging.getLogger("megatron").setLevel(logging.WARNING)
+diff --git a/relax/backends/megatron/actor.py b/relax/backends/megatron/actor.py
+index e162244..9e74375 100644
+--- a/relax/backends/megatron/actor.py
++++ b/relax/backends/megatron/actor.py
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++ # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+ 
+ import logging
+ import os
+@@ -58,6 +58,7 @@ from .initialize import init, is_megatron_main_rank
+ from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
+ from .model import forward_only, initialize_model_and_optimizer, save, train
+ from .weight_update.common import named_params_and_buffers
++from .weight_update.update_lora_from_tensor import UpdateLoRAFromTensor
+ from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
+ from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
+ 
+@@ -179,16 +180,72 @@ class MegatronTrainRayActor(TrainRayActor):
+                 if args.update_weights_interval == 1:
+                     self.weights_backuper.backup("rollout_actor")
+ 
+-            update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+-            self.weight_updater = update_weight_cls(
+-                self.args,
+-                self.model,
+-                weights_getter=lambda: self.weights_backuper.get("actor"),
+-                model_name=type(self.hf_config).__name__.lower()
+-                if self.args.model_name is None
+-                else self.args.model_name,
+-                quantization_config=getattr(self.hf_config, "quantization_config", None),
+-            )
++            # 🚨 ===== [YULIN-MOD] START: LoRA 模式只同步 adapter，而不是整个基座模型 =====
++            
++            if getattr(self.args, "lora_enable", False):
++                # LoRA: 只热推 adapter 权重(基座冻结),目前仅支持 colocate(IPC)。
++                if not self.args.colocate:
++                    raise NotImplementedError("LoRA 热更新目前仅支持 colocate 部署(--colocate)。")
++                self.weight_updater = UpdateLoRAFromTensor(
++                    self.args,
++                    self.model,
++                    # LoRA 走 direct 路径,getter 返回只含 .adapter. 的参数,两点都要满足:
++                    #  - convert_to_global_name=True(坑 15):用全局命名,与 HfWeightIteratorDirect
++                    #    的 name_filter 所建 param_info 命名一致(bridge 模式下 weights_backuper
++                    #    用 vanilla 名会 KeyError);
++                    #  - translate_gpu_to_cpu(坑 16):colocate+offload 下 update_weights 时训练模型
++                    #    已被 torch_memory_saver offload,live GPU 显存已释放,直接 all_gather
++                    #    其 .data 会读野指针 → CUDA illegal memory access;改取 offload 时存下的
++                    #    CPU backup。但 get_cpu_backup 依赖 torch_memory_saver 已被 LD_PRELOAD 预载,
++                    #    而 LD_PRELOAD 仅在 offload_train=True 时设置(见 actor_group.py)。因此 2a
++                    #    不 offload 时必须置 False:GPU 张量本就常驻,直接读 live 张量安全,且避免
++                    #    torch_memory_saver 因 LD_PRELOAD 为空而断言失败。
++                    
++                    # 动态取得当前最新的 adapter 权重。
++                    weights_getter=lambda: {
++                        name: param
++                        for name, param in named_params_and_buffers(
++                            self.args,
++                            self.model,
++                            # direct iterator 的参数元数据使用全局 Megatron 参数名。
++                            # getter 也必须返回相同命名体系，否则查找时会出现 KeyError。
++                            convert_to_global_name=True,
++                            # 开启训练 offload 时，模型 live GPU 存储已经被释放，
++                            # 必须读取 offload 阶段保存的 CPU backup。
++                            #
++                            # 未开启训练 offload 时，参数常驻 GPU，直接读取 live Tensor；
++                            # 此时不应依赖 torch_memory_saver 的 CPU backup。
++                            translate_gpu_to_cpu=self.args.offload_train,
++                        )
++
++                        # 只保留 Megatron-Bridge PEFT adapter 参数。
++                        # 基座权重完全不进入 LoRA 同步路径。
++                        if ".adapter." in name
++                    },
++                    # 传入模型类型，用于后面的 Megatron → HF 权重转换。
++                    model_name=type(self.hf_config).__name__.lower()
++                    if self.args.model_name is None
++                    else self.args.model_name,
++                    # LoRA adapter 不做量化。
++                    quantization_config=None,
++                )
++            else:
++                # 非 LoRA 模式维持原来的全量权重同步：
++                # colocate 使用 tensor/IPC 更新器；
++                # 独立 rollout 部署使用分布式更新器。
++                update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
++                self.weight_updater = update_weight_cls(
++                    self.args,
++                    self.model,
++                    weights_getter=lambda: self.weights_backuper.get("actor"),
++                    model_name=type(self.hf_config).__name__.lower()
++                    if self.args.model_name is None
++                    else self.args.model_name,
++                    quantization_config=getattr(self.hf_config, "quantization_config", None),
++                )
++
++            # 🚨 ===== [YULIN-MOD] END =====
++
+         else:
+             is_pp_src_rank = (
+                 mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+@@ -844,7 +901,16 @@ class MegatronTrainRayActor(TrainRayActor):
+             self.weight_updater.update_weights()
+             print_memory("after update_weights")
+ 
+-            if self.args.ci_test and len(rollout_engines) > 0:
++            # 🚨 ===== [YULIN-MOD] START: LoRA CI 测试不比较基座 weight_version =====
++
++            if self.args.ci_test and len(rollout_engines) > 0 and not getattr(self.args, "lora_enable", False):
++                # LoRA 只卸载/加载 adapter，不调用基座的 update_weights 接口，
++                # 因此不会更新 rollout engine 的基座 weight_version。
++                #
++                # 如果仍执行下面的检查，会把正常的 LoRA 更新误判为版本不一致。
++            
++            # 🚨 ===== [YULIN-MOD] END =====
++
+                 engine = random.choice(rollout_engines)
+                 engine_version = ray.get(engine.get_weight_version.remote())
+                 if str(engine_version) != str(self.weight_updater.weight_version):
+diff --git a/relax/backends/megatron/arguments.py b/relax/backends/megatron/arguments.py
+index 25b723b..e5f674f 100644
+--- a/relax/backends/megatron/arguments.py
++++ b/relax/backends/megatron/arguments.py
+@@ -85,7 +85,14 @@ def _hf_validate_args(args, hf_config):
+         ("num_hidden_layers", "num_layers", equal),
+         ("intermediate_size", "ffn_hidden_size", equal),
+         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
+-        ("rms_norm_eps", "norm_epsilon", equal),
++        
++        # 🚨 ===== [YULIN-MOD] START: 正确映射 HF 与 Megatron 的 RMSNorm epsilon 字段 =====
++
++        # Hugging Face config 字段 & Megatron 参数字段
++        ("rms_norm_eps", "layernorm_epsilon", equal),
++
++        # 🚨 ===== [YULIN-MOD] END =====
++
+         ("rope_theta", "rotary_base", equal),
+     ]:
+         if hasattr(hf_config, hf_config_name):
+diff --git a/relax/backends/megatron/model.py b/relax/backends/megatron/model.py
+index 8d745d9..3f01b6b 100644
+--- a/relax/backends/megatron/model.py
++++ b/relax/backends/megatron/model.py
+@@ -32,7 +32,11 @@ from relax.utils.timer import timer
+ from .checkpoint import load_checkpoint, save_checkpoint
+ from .data import DataIterator, get_batch
+ from .loss import loss_function
+-from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
++from .model_provider import (
++    get_model_provider_func,
++    wrap_model_provider_with_freeze,
++    wrap_model_provider_with_lora,
++)
+ 
+ 
+ logger = get_logger(__name__)
+@@ -110,12 +114,33 @@ def setup_model_and_optimizer(
+     assert not args.moe_use_upcycling
+     assert args.load is not None or args.pretrained_checkpoint is not None
+ 
++    # 🚨 ===== [YULIN-MOD] START: 将 LoRA provider 接入 Megatron 模型构建主流程 =====
++
++    # 先取得原始模型构造函数。
++    base_provider = get_model_provider_func(args, role)
++    if getattr(args, "lora_enable", False):
++        # LoRA 模式下，使用 LoRA wrapper。
++        #
++        # Megatron-Bridge PEFT 会负责：
++        # - 冻结全部基座；
++        # - 插入 adapter；
++        # - 只让 adapter 保持可训练。
++        provider = wrap_model_provider_with_lora(base_provider, args)
++    else:
++        # 非 LoRA 模式维持 Relax 原有逻辑，
++        # 按 only_train_params_name_list / freeze_params_name_list 冻结参数。
++        provider = wrap_model_provider_with_freeze(base_provider, args)
++
++    # 将选好的 provider 交给 Megatron。
++    # actor/critic 会在这里进一步被 DDP 包装。
+     model = get_model(
+-        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
++        provider,
+         ModelType.encoder_or_decoder,
+         wrap_with_ddp=role in ["actor", "critic"],
+     )
+ 
++    # 🚨 ===== [YULIN-MOD] END =====
++
+     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
+     # which causes duplicate RoutingReplay registrations. Rebuild the list from
+     # the actual model modules to remove stale (orphaned) entries.
+diff --git a/relax/backends/megatron/model_provider.py b/relax/backends/megatron/model_provider.py
+index f85ada6..f227bce 100644
+--- a/relax/backends/megatron/model_provider.py
++++ b/relax/backends/megatron/model_provider.py
+@@ -2,6 +2,7 @@
+ 
+ # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
+ import argparse
++import functools
+ import inspect
+ import os
+ import pickle
+@@ -92,6 +93,27 @@ def get_model_provider_func(
+     if args.megatron_to_hf_mode == "bridge":
+         from megatron.bridge import AutoBridge
+ 
++        
++        # 🚨 ===== [YULIN-MOD] START: 为旧版 Bridge 注册 Qwen3-Omni 输出层的并行类型 =====
++        
++        # Qwen3-Omni 为了节省显存，可能使用 LinearCrossEntropyModule 作为输出层。
++        # 部分旧版 Megatron-Bridge 的 AutoMapping 注册表不认识该模块，
++        # 加载权重时就无法判断它采用哪种张量并行方式。
++        # （新版 bridge 已默认注册为 "column"），这里幂等补上，兼容老版本。
++        try:
++            from megatron.bridge.models.conversion.param_mapping import AutoMapping
++
++            # LinearCrossEntropyModule 本质上属于列并行输出层。
++            # 将它注册为 column，使 Bridge 能正确切分和加载它的权重。
++            # 对已经内置该映射的新版 Bridge，这个操作应当是幂等或可安全失败的。
++            AutoMapping.register_module_type("LinearCrossEntropyModule", "column")
++        except Exception as exc:  # noqa: BLE001
++            # 不把注册失败直接升级成致命错误：
++            # 一种常见情况是新版 Bridge 已经注册过该类型。
++            logger.warning("注册 LinearCrossEntropyModule 并行类型失败（可能新版已内置）：%s", exc)
++        
++        # 🚨 ===== [YULIN-MOD] END =====
++
+         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+         provider = bridge.to_megatron_provider(load_weights=False)
+         # Override provider attributes with matching args values
+@@ -304,3 +326,171 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
+                 if re.search(pattern, name):
+                     param.requires_grad = False
+                     break
++
++
++# 🚨 ===== [YULIN-MOD] START: 给模型挂 LoRA，并保证只有正确的 adapter 可训练 =====
++
++def apply_lora_to_model(model: GPTModel, args: argparse.Namespace) -> None:
++    """用 Megatron-Bridge 的 LoRA 给单个模型 chunk 挂 adapter。
++
++    要点（已由 verify_lora_attach.py 在真实 Megatron 环境实测）：
++      - 用普通 ``LoRA``（不是 ``VLMLoRA``）：它先冻结全部基座、再让 adapter 可训，
++        不依赖任何 LLaVA 风格属性名，多模态塔自动冻结。
++      - target 必须用通配符限定到 thinker 的 ``language_model``，否则会误挂到
++        audio/vision 塔（产出 sglang 无法加载的张量）。
++      - adapter 权重命名为 ``...linear_qkv.adapter.linear_in/out``，
++        与 sglang 侧 ``qkv_proj.lora_A/B`` 契约一致。
++    """
++    # 不同版本的 Megatron-Bridge 导出 LoRA 类的位置不同。
++    # redai fork 可能只在 megatron.bridge.peft.lora 子模块中提供 LoRA，
++    # 而某些新版本会从 megatron.bridge.peft 顶层重新导出。
++    try:
++        from megatron.bridge.peft.lora import LoRA
++    except ImportError:
++        from megatron.bridge.peft import LoRA
++
++    # 根据命令行参数构造 Megatron-Bridge 的 LoRA 配置。
++    peft = LoRA(
++        # 指定在哪些 Megatron 模块上挂 adapter。
++        # 默认值只匹配 Thinker 文本模型的 linear_qkv 和 linear_proj，
++        # 避免误挂到视觉塔或音频塔。
++        target_modules=list(args.lora_target_modules),
++        # LoRA 的低秩维度 r。
++        dim=args.lora_rank,
++        # LoRA 缩放系数 alpha；实际增量通常按 alpha/r 缩放。
++        alpha=args.lora_alpha,
++        # adapter 分支上的 dropout。
++        dropout=args.lora_dropout,
++    )
++    # 就地修改模型：
++    # 1. 冻结基座参数；
++    # 2. 在匹配模块上插入 adapter；
++    # 3. 让 adapter 参数保持 requires_grad=True；
++    # 4. 切换到训练状态。
++    peft(model, training=True)
++
++    # 在创建优化器之前验证 LoRA 是否真正挂载成功。
++    _assert_lora_attached(model, args)
++
++
++def _assert_lora_attached(model: GPTModel, args: argparse.Namespace) -> None:
++    """挂 LoRA 后的防御性自检——在构建优化器之前把配置错误暴露出来。
++
++    Megatron 的优化器(`_get_param_groups`)和 DDP grad buffer 都以
++    ``requires_grad`` 为准，只收 adapter，因此“只优化 adapter”由 Megatron 原生保证。
++    真正隐蔽的坑是 ``--lora-target-modules`` 通配符没匹配上任何模块：PEFT 会把
++    基座全冻结却一个 adapter 都没挂，导致优化器参数组为空、训练静默 noop。
++    另一个坑是误挂到 vision/audio 塔，产出 sglang 无法加载的张量。
++    """
++    trainable: list[str] = []
++    n_trainable_elems = 0
++    n_frozen = 0
++    # 统计模型中所有可训练和冻结参数。
++    for name, param in model.named_parameters():
++        if param.requires_grad:
++            trainable.append(name)
++            n_trainable_elems += param.numel()
++        else:
++            n_frozen += 1
++
++    # 第 1 重检查：必须至少存在一个可训练参数。
++    #
++    # 如果 target_modules 通配符没有匹配任何模块，
++    # PEFT 可能已经冻结全部基座，但没有成功插入任何 adapter。
++    # 这种情况下优化器参数组为空，训练看似运行，实际上完全没有学习。
++    assert trainable, (
++        "LoRA 已应用但没有任何可训参数：--lora-target-modules "
++        f"{list(args.lora_target_modules)} 很可能没匹配到任何模块。"
++    )
++
++    # 识别 Megatron-Bridge 或 PEFT 风格的 adapter 参数名。
++    def _is_adapter(n: str) -> bool:
++        low = n.lower()
++        return (".adapter." in n) or ("lora_a" in low) or ("lora_b" in low)
++
++    # 第 2 重检查：所有可训练参数都必须属于 adapter。
++    #
++    # 如果出现普通基座参数，说明 PEFT 没有把基座完全冻结，
++    # 此时就不再是“只训练 LoRA”。
++    non_adapter = [n for n in trainable if not _is_adapter(n)]
++    assert not non_adapter, (
++        "LoRA 模式下出现非 adapter 的可训参数（基座没冻干净）：" f"{non_adapter[:5]}"
++    )
++
++    # 第 3 重检查：检测 adapter 是否误挂到视觉塔或音频塔。
++    #
++    # 当前同步和 SGLang 加载链路只支持 Thinker 文本注意力层；
++    # 如果 adapter 挂到 audio/vision 模块，之后会生成 SGLang 无法加载的张量。
++    suspicious = [n for n in trainable if re.search(r"visual|vision|audio", n)]
++    if suspicious:
++        logger.warning(
++            "[LoRA] 检测到 adapter 挂在疑似多模态塔上（应只挂 thinker 文本侧）：%s",
++            suspicious[:5],
++        )
++
++    # 多进程训练时只让 rank 0 输出统计，避免日志重复。
++    if dist.is_initialized() and dist.get_rank() != 0:
++        return
++    logger.info(
++        "[LoRA] adapter 已挂载：可训参数 %d 个 / %.3fM 元素，冻结 %d 个；样例=%s",
++        len(trainable),
++        n_trainable_elems / 1e6,
++        n_frozen,
++        trainable[:3],
++    )
++
++
++# relax/backends/megatron/model.py
++def wrap_model_provider_with_lora(original_provider, args):
++    """在模型 provider 外再包一层：构建出 GPTModel 后立刻挂 LoRA。
++
++    必须在 DDP 包裹之前应用（即在 provider 内部），这样 adapter 会随后被
++    一并 DDP 包裹、移动到设备、转 dtype。
++
++    签名透明性（关键，见 LORA_RL_INTEGRATION.md 坑 9）：
++      Megatron-LM 的 ``build_model`` 会按 provider 的**真实签名**决定传哪些
++      kwarg（如 ``config``/``pg_collection``）。bridge 模式下 ``original_provider``
++      是 ``ModelProvider.provide``，其签名只有 ``(pre_process, post_process,
++      vp_stage)``，并不收 ``config``。若 wrapper 暴露成 ``(*args, **kwargs)``，
++      Megatron 的签名探测会误以为"什么都收"而把 ``config`` 传进来，转发给
++      ``provide`` 就撞 ``unexpected keyword argument 'config'``。
++
++    故这里：
++      1) 用 ``functools.wraps`` 把 ``original_provider`` 的签名透传出去，让
++         Megatron 的探测看到与裸 provider 完全一致的参数；
++      2) 运行期再按原签名过滤一次 kwarg（原 provider 没有 ``**kwargs`` 时丢掉
++         它不认识的键），对"无条件传 config"的 Megatron 版本也安全。
++    """
++    # 读取原 provider 的真实函数签名。
++    # Megatron 会根据 provider 的签名决定向它传哪些关键字参数。
++    try:
++        sig = inspect.signature(original_provider)
++    except (TypeError, ValueError):
++        sig = None
++
++    # 判断原 provider 是否接受任意 **kwargs。
++    accepts_var_kw = sig is not None and any(
++        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
++    )
++    # 得到原 provider 明确声明可以接受的参数名。
++    allowed_keys = set(sig.parameters) if sig is not None else None
++
++    # functools.wraps 不只是复制名字和文档；
++    # 它还通过 __wrapped__ 保留原 provider 的签名信息，
++    # 避免 Megatron 误判 wrapper 可以接受任意参数。
++    @functools.wraps(original_provider)
++    def wrapped_provider(*provider_args, **provider_kwargs):
++        # 某些 Megatron 版本会无条件传 config、pg_collection 等参数。
++        # 如果原 provider 没有 **kwargs，就只保留它真正声明过的参数。
++        if allowed_keys is not None and not accepts_var_kw:
++            provider_kwargs = {k: v for k, v in provider_kwargs.items() if k in allowed_keys}
++        # 先按照原逻辑创建基础模型。
++        model = original_provider(*provider_args, **provider_kwargs)
++        # 必须在 DDP 包装、设备迁移和 dtype 转换之前挂 LoRA。
++        # 这样新插入的 adapter 才会跟随模型一起进入后续 Megatron 流程。
++        apply_lora_to_model(model, args)
++        return model
++
++    return wrapped_provider
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/relax/backends/megatron/weight_conversion/qwen3_omni_moe.py b/relax/backends/megatron/weight_conversion/qwen3_omni_moe.py
+index e28d59a..fe91b5e 100644
+--- a/relax/backends/megatron/weight_conversion/qwen3_omni_moe.py
++++ b/relax/backends/megatron/weight_conversion/qwen3_omni_moe.py
+@@ -33,6 +33,34 @@ def convert_qwen3omni_to_hf(args, name, param):
+     if match:
+         layer_idx, rest = match.groups()
+ 
++        # 🚨 ===== [YULIN-MOD] START: 识别 Qwen3-Omni adapter 参数 =====
++
++        # Megatron 这边说：
++        # “我这里叫 self_attention.linear_qkv.adapter.linear_out.weight，
++        # 而且 Q/K/V 是按 query group 混着放的。”
++        # 
++        # SGLang 那边说：
++        # “我只认 qkv_proj.lora_B.weight，
++        # 而且你得按 [所有 Q; 所有 K; 所有 V] 的顺序给我。”
++        
++        # LoRA adapter 权重(Megatron-Bridge PEFT: ParallelLinearAdapter)
++        # 命名形如 self_attention.linear_qkv.adapter.linear_in/out.weight
++        # 转成 sglang 期望的 base_model.model.thinker.model.layers.N.self_attn.* 命名。
++        
++        # base：普通 base 权重继续执行原有转换；
++        # adapter：只有包含 .adapter. 的 Megatron-Bridge PEFT 参数进入 LoRA 分支。
++        if ".adapter." in rest:
++            return _convert_qwen3omni_lora_adapter(
++                args=args,
++                layer_idx=layer_idx,
++                rest=rest,
++                param=param,
++                head_dim=head_dim,
++                value_num_per_group=value_num_per_group,
++            )
++
++        # 🚨 ===== [YULIN-MOD] END =====
++
+         # experts
+         expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
+         match = re.match(expert_pattern, rest)
+@@ -125,3 +153,89 @@ def convert_qwen3omni_to_hf(args, name, param):
+             return [(f"thinker.model.layers.{layer_idx}.self_attn.k_norm.weight", param)]
+ 
+     raise ValueError(f"Unknown parameter name: {name}")
++
++
++# 🚨 ===== [YULIN-MOD] START: 将 Megatron LoRA 转成 SGLang/PEFT 命名与布局 =====
++
++# 1. 改名字
++# 对应关系大概是：
++# linear_qkv  -> qkv_proj
++# linear_proj -> o_proj
++# linear_in   -> lora_A
++# linear_out  -> lora_B
++#
++# 2. 重新排列 lora_B 的内容
++# Megatron 的存法像这样，按 query group 混着放：
++# group 0: Q Q K V
++# group 1: Q Q K V
++# 连起来就是：
++# Q Q K V  Q Q K V
++#
++# 但 SGLang 想要的是：
++# 所有 Q 放一起，所有 K 放一起，所有 V 放一起
++# 也就是：
++# Q Q Q Q  K K  V V
++
++# sglang 从 PEFT 风格的 adapter 名读取 LoRA,统一带 base_model.model. 前缀。
++_LORA_PREFIX = "base_model.model.thinker.model.layers"
++
++
++def _reorder_qkv_lora_b(param, num_query_groups, value_num_per_group, head_dim):
++    """linear_qkv 的 lora_B(linear_out)输出维按 Megatron 的「分组交错」排布,
++    需重排成 sglang qkv_proj 期望的 [q; k; v] 拼接顺序(与 base 权重转换一致)。
++
++    入参 param 形状 [qkv_out, r],其中
++    qkv_out = num_query_groups * (value_num_per_group + 2) * head_dim。
++    """
++    # lora_B 的形状为 [qkv_out, rank]。
++    rank = param.shape[1]
++    # Megatron 的 qkv_out 按 query group 组织：
++    # [num_query_groups, 每组Q数量+K+V, head_dim, rank]
++    param = param.view(num_query_groups, value_num_per_group + 2, head_dim, rank)
++    # 把每个 group 里的 Q、K、V 拆出来。
++    q_param, k_param, v_param = torch.split(
++        param, split_size_or_sections=[value_num_per_group, 1, 1], dim=1
++    )
++    # 把所有 group 的 Q 汇总到一起，所有 K 汇总到一起，所有 V 汇总到一起。
++    q_param = q_param.reshape(-1, rank)
++    k_param = k_param.reshape(-1, rank)
++    v_param = v_param.reshape(-1, rank)
++    # 按 SGLang 要的顺序重新拼起来 [所有 Q; 所有 K; 所有 V] 。
++    return torch.cat([q_param, k_param, v_param], dim=0)
++
++
++def _convert_qwen3omni_lora_adapter(*, args, layer_idx, rest, param, head_dim, value_num_per_group):
++    """把 Megatron-Bridge 的 ParallelLinearAdapter 权重转成 sglang LoRA 命名。
++
++    映射约定(只支持 thinker 注意力的 qkv / o_proj):
++      - linear_qkv.adapter.linear_in  -> qkv_proj.lora_A  (形状 [r, hidden],sglang 内部自动 repeat 3 份)
++      - linear_qkv.adapter.linear_out -> qkv_proj.lora_B  (形状 [qkv_out, r],需重排成 [q;k;v])
++      - linear_proj.adapter.linear_in -> o_proj.lora_A
++      - linear_proj.adapter.linear_out-> o_proj.lora_B
++    """
++    prefix = f"{_LORA_PREFIX}.{layer_idx}.self_attn"
++
++    # linear_in 是 LoRA A：
++    # hidden_size → rank。
++    if rest == "self_attention.linear_qkv.adapter.linear_in.weight":
++        return [(f"{prefix}.qkv_proj.lora_A.weight", param)]
++    # linear_out 是 LoRA B：
++    # rank → qkv_out。
++    if rest == "self_attention.linear_qkv.adapter.linear_out.weight":
++        param = _reorder_qkv_lora_b(param, args.num_query_groups, value_num_per_group, head_dim)
++        return [(f"{prefix}.qkv_proj.lora_B.weight", param)]
++    # 注意力输出投影的 LoRA A。
++    if rest == "self_attention.linear_proj.adapter.linear_in.weight":
++        return [(f"{prefix}.o_proj.lora_A.weight", param)]
++    # 注意力输出投影的 LoRA B。
++    if rest == "self_attention.linear_proj.adapter.linear_out.weight":
++        return [(f"{prefix}.o_proj.lora_B.weight", param)]
++
++    # 当前同步契约只支持 Thinker 注意力的 QKV 和 O 投影。
++    # 如果 target_modules 扩展到 MLP，这里也必须同步扩展转换逻辑。
++    raise ValueError(
++        f"不支持的 LoRA adapter 参数: layer={layer_idx} rest={rest}. "
++        "当前 Block 3 仅支持 thinker 注意力的 linear_qkv / linear_proj。"
++    )
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/relax/backends/megatron/weight_update/common.py b/relax/backends/megatron/weight_update/common.py
+index b8ee0f8..44d6594 100644
+--- a/relax/backends/megatron/weight_update/common.py
++++ b/relax/backends/megatron/weight_update/common.py
+@@ -96,8 +96,30 @@ def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor
+             full_weights.append(torch.cat(gathered, dim=0))
+         return torch.cat(full_weights, dim=0)
+ 
+-    param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
+-    dist.all_gather(param_partitions, param.data, group=tp_group)
++    # 🚨 ===== [YULIN-MOD] START: 保证 TP all-gather 的输入张量连续 =====
++
++    # 可以把 LoRA 参数想象成一本书的三页，但三页分散在不同抽屉里：
++    # 显存大 buffer：
++    # [A0][A1][B0][C0][B1][C1][B2][D0]
++    #         ↑       ↑       ↑
++    #         LoRA 参数 B 的三个元素
++
++    # PyTorch 手里有一张索引表，所以知道：
++    # B = [B0, B1, B2]
++    
++    # 但 NCCL 更擅长搬运连续存放的数据：
++    # [B0][B1][B2]
++
++    # 坑 16:见 all_gather_params_async —— 非连续视图会让 NCCL all_gather 崩。
++
++    # LoRA adapter 可能是分布式优化器大 buffer 的非连续视图。
++    # NCCL 集合通信不能安全处理这种 stride 布局，因此先复制成连续张量。
++    param_data = param.data.contiguous()
++
++    # 🚨 ===== [YULIN-MOD] END =====
++
++    param_partitions = [torch.empty_like(param_data) for _ in range(tp_size)]
++    dist.all_gather(param_partitions, param_data, group=tp_group)
+     partition_dim = param.partition_dim
+     assert param.partition_stride == 1, "partition_stride != 1 is not supported"
+     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
+@@ -145,8 +167,24 @@ def all_gather_params_async(
+                 tp_size = mpu.get_tensor_model_parallel_world_size()
+                 tp_group = mpu.get_tensor_model_parallel_group()
+ 
+-            param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
+-            handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
++            # 🚨 ===== [YULIN-MOD] START: 修复异步 NCCL all-gather 的非连续 adapter 崩溃 =====
++            
++            # 坑 16:LoRA 下 adapter 是分布式优化器连续 buffer 的「非连续视图」,
++            # 而 torch.empty_like 默认保留 stride → 源/目标都非连续 → NCCL all_gather
++            # 触发 CUDA illegal memory access。这里强制连续(base 已连续→no-op)。
++            
++            # 将输入 adapter 变成标准连续内存。
++            # 对普通、已连续的 base 权重，这一步基本是 no-op。
++            param_data = param.data.contiguous()
++            # torch.empty_like 会继承 param_data 的布局。
++            # 由于 param_data 已连续，所有目标 buffer 也会连续。
++            param_partitions = [torch.empty_like(param_data) for _ in range(tp_size)]
++            # 发起异步 TP all-gather。
++            # 返回的 handle 会在后续统一等待。
++            handle = dist.all_gather(param_partitions, param_data, group=tp_group, async_op=True)
++            
++            # 🚨 ===== [YULIN-MOD] END =====
++            
+             gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
+             handles.append(handle)
+ 
+diff --git a/relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py b/relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py
+index 35a9ad4..bd487de 100644
+--- a/relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py
++++ b/relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py
+@@ -11,6 +11,14 @@ from ..weight_conversion.processors import quantize_params
+ from .hf_weight_iterator_base import HfWeightIteratorBase
+ 
+ 
++# 🚨 ===== [YULIN-MOD] START: 判断参数是否属于 PEFT LoRA =====
++
++def is_lora_weight_name(name: str) -> bool:
++    """判断是否为 LoRA adapter 权重(HF/PEFT 命名:含 .lora_A. / .lora_B.)。"""
++    return ".lora_A." in name or ".lora_B." in name
++
++# 🚨 ===== [YULIN-MOD] END =====
++
+ class HfWeightIteratorBridge(HfWeightIteratorBase):
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -19,17 +27,47 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
+ 
+         self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+ 
+-    def get_hf_weight_chunks(self, megatron_local_weights):
++    def get_hf_weight_chunks(self, megatron_local_weights, weight_type: str = "base"):
+         # TODO support quantization (e.g. modify megatron-bridge to provide megatron param name)
+         renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
+         with megatron_bridge_utils.patch_megatron_model(self.model):
+-            conversion_tasks = self._bridge.get_conversion_tasks(self.model)
+-            conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)
+ 
+-            named_weights = self._bridge.export_hf_weights(self.model, cpu=False, conversion_tasks=conversion_tasks)
++            # 🚨 ===== [YULIN-MOD] START: 为 Bridge iterator 增加 base/lora 两种导出模式 =====
++            
++            if weight_type == "lora":
++                # 让 Bridge 直接从模型读取 adapter，
++                # 并在内部完成 TP/PP/EP gather 和融合 QKV 拆分。
++                #
++                # 不依赖 megatron_local_weights，也不 merge 到 base。
++                named_weights = self._bridge.export_adapter_weights(
++                    self.model,
++                    cpu=False,
++                    show_progress=False,
++                )
++            elif weight_type == "base":
++                # 原有基座导出流程。
++                conversion_tasks = self._bridge.get_conversion_tasks(self.model)
++                conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)
++                # 即使模型已挂 adapter，也明确禁止将 adapter merge 进基座。
++                named_weights = self._bridge.export_hf_weights(
++                    self.model, cpu=False, conversion_tasks=conversion_tasks, merge_adapter_weights=False
++                )
++            else:
++                raise ValueError(f"未知 weight_type={weight_type!r}（应为 'base' 或 'lora'）")
++            
++            # 🚨 ===== [YULIN-MOD] END =====
+ 
+             def iter_quantized_named_weights():
+                 for hf_param_name, weight, megatron_param_name in named_weights:
++                    
++                    # 🚨 ===== [YULIN-MOD] START: 移除 PEFT 包装引入的 base_layer 路径，保持 SGLang 权重命名 =====
++                    
++                    # PEFT 包装原层后，参数路径中可能多出 .base_layer.。
++                    # SGLang 仍按原模块路径匹配，因此需要删除这一层。
++                    hf_param_name = hf_param_name.replace(".base_layer.", ".")
++                    
++                    # 🚨 ===== [YULIN-MOD] END =====
++                    
+                     processed_weight = postprocess_hf_param(
+                         args=self.args,
+                         megatron_param_name=megatron_param_name,
+@@ -39,17 +77,40 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
+ 
+                     converted_named_params = [(hf_param_name, processed_weight)]
+ 
+-                    quantized_batch = quantize_params(
+-                        args=self.args,
+-                        megatron_name=megatron_param_name,
+-                        converted_named_params=converted_named_params,
+-                        quantization_config=self.quantization_config,
+-                    )
++                    # 🚨 ===== [YULIN-MOD] START: adapter 保持原始精度，只有 base 执行量化 =====
++
++                    # LoRA adapter 不量化(权重小且需保精度);base 维持原量化逻辑
++                    if weight_type == "lora":
++                        quantized_batch = converted_named_params
++                    else:
++                        quantized_batch = quantize_params(
++                            args=self.args,
++                            megatron_name=megatron_param_name,
++                            converted_named_params=converted_named_params,
++                            quantization_config=self.quantization_config,
++                        )
++
++                    # 🚨 ===== [YULIN-MOD] END =====
+ 
+                     yield from quantized_batch
+ 
++            # 🚨 ===== [YULIN-MOD] START: 防止 base 和 adapter 在导出结果中混合 =====
++            
++            # 按 weight_type 过滤:base 路径剔除 lora 权重,lora 路径只留 lora_A/lora_B
++            def iter_filtered():
++                for name, tensor in iter_quantized_named_weights():
++                    # LoRA 模式只保留 lora_A/lora_B。
++                    if weight_type == "lora" and not is_lora_weight_name(name):
++                        continue
++                    # base 模式排除所有 adapter。
++                    if weight_type == "base" and is_lora_weight_name(name):
++                        continue
++                    yield name, tensor
++
++            # 🚨 ===== [YULIN-MOD] END =====
++
+             yield from chunk_named_params_by_size(
+-                iter_quantized_named_weights(),
++                iter_filtered(),
+                 chunk_size=self.args.update_weight_buffer_size,
+             )
+ 
+diff --git a/relax/backends/megatron/weight_update/hf_weight_iterator_direct.py b/relax/backends/megatron/weight_update/hf_weight_iterator_direct.py
+index 32a382f..25e3a29 100644
+--- a/relax/backends/megatron/weight_update/hf_weight_iterator_direct.py
++++ b/relax/backends/megatron/weight_update/hf_weight_iterator_direct.py
+@@ -18,9 +18,23 @@ from .hf_weight_iterator_base import HfWeightIteratorBase
+ 
+ 
+ class HfWeightIteratorDirect(HfWeightIteratorBase):
+-    def __init__(self, *args, **kwargs):
++    def __init__(self, *args, name_filter=None, **kwargs):
++        # ``name_filter`` (可选): 形如 ``Callable[[str], bool]``,只保留返回 True 的
++        # 全局参数名。LoRA 同步用它把范围缩到 adapter 权重,避免 gather/转换整座基座。
+         super().__init__(*args, **kwargs)
+-        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(self.args, self.model)
++
++        # 🚨 ===== [YULIN-MOD] START: 让 direct iterator 只建立 LoRA 参数桶 =====
++        
++        # 保存过滤函数，便于记录当前 iterator 的同步范围。
++        self.name_filter = name_filter
++        # 构造参数桶时立刻过滤。
++        # LoRA 场景只会为 .adapter. 参数创建 ParamInfo，
++        # 基座权重不会进入后续 gather/转换阶段。
++        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(
++            self.args, self.model, name_filter=name_filter
++        )
++
++        # 🚨 ===== [YULIN-MOD] END =====
+ 
+     def get_hf_weight_chunks(self, megatron_local_weights):
+         rank = dist.get_rank()
+@@ -56,9 +70,19 @@ def _get_megatron_full_params(
+         if dist.get_rank() == info.src_rank:
+             params.append(
+                 torch.nn.Parameter(
+-                    megatron_local_weights[info.name].to(
+-                        device=device_utils.make_current_torch_device(), non_blocking=True
+-                    ),
++                    megatron_local_weights[info.name]
++                    .to(device=device_utils.make_current_torch_device(), non_blocking=True)
++                    
++                    # 🚨 ===== [YULIN-MOD] START: 在 PP/EP/TP 通信前连续化 LoRA 张量 =====
++                    
++                    # 坑 16:LoRA adapter 是分布式优化器连续 buffer 的非连续视图,
++                    # broadcast/all_gather 前强制连续(全量 base 已连续→no-op)。
++
++                    # adapter 可能是优化器 buffer 的非连续视图。
++                    # 在 broadcast/all-gather 前强制转换成连续布局。
++                    .contiguous(),
++
++                    # 🚨 ===== [YULIN-MOD] END =====
+                     requires_grad=False,
+                 )
+             )
+@@ -108,10 +132,18 @@ def _get_megatron_full_params(
+     return gathered_params
+ 
+ 
+-def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torch.nn.Module]) -> list[list[ParamInfo]]:
++def _get_megatron_local_param_info_buckets(
++    args: Namespace, model: Sequence[torch.nn.Module], name_filter=None
++) -> list[list[ParamInfo]]:
+     """Partition params into buckets ≤ update_weight_buffer_size (with TP
+     replication)."""
+-    param_infos = _get_megatron_local_param_infos(args, model)
++
++    # 🚨 ===== [YULIN-MOD] START: 参数分桶沿用相同的 name_filter =====
++
++    param_infos = _get_megatron_local_param_infos(args, model, name_filter=name_filter)
++    
++    # 🚨 ===== [YULIN-MOD] END =====
++
+     param_info_buckets = [[]]  # Start with one empty bucket
+     buffer_size = 0  # Track current bucket size in bytes
+ 
+@@ -137,11 +169,16 @@ def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torc
+     return param_info_buckets
+ 
+ 
+-def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Module]) -> list[ParamInfo]:
++def _get_megatron_local_param_infos(
++    args: Namespace, model: Sequence[torch.nn.Module], name_filter=None
++) -> list[ParamInfo]:
+     """Build global param metadata: collect → exchange PP/EP → resolve
+     duplicates (MTP virtual PP) by min src_rank → validate.
+ 
+     Returns sorted ParamInfo identical across all ranks.
++
++    ``name_filter`` (可选): 只保留满足谓词的全局参数名(基于名字的确定性过滤,
++    各 rank 一致),用于把同步范围缩到 LoRA adapter 权重。
+     """
+     pp_size = mpu.get_pipeline_model_parallel_world_size()
+     ep_size = mpu.get_expert_model_parallel_world_size()
+@@ -149,6 +186,14 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
+     param_infos = {}
+     rank = dist.get_rank()
+     for name, param in named_params_and_buffers(args, model):
++
++        # 🚨 ===== [YULIN-MOD] START: 跳过所有非目标参数 =====
++
++        if name_filter is not None and not name_filter(name):
++            continue
++
++        # 🚨 ===== [YULIN-MOD] END =====
++
+         param_infos[name] = ParamInfo(
+             name=name,
+             dtype=param.dtype,
+@@ -212,4 +257,18 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
+                 f"Parameter dtype mismatch: {infos[i].dtype} != {param_info.dtype}"
+             )
+ 
++            # 🚨 ===== [YULIN-MOD] START: 提前发现跨 rank 集合通信条件不一致 =====
++
++            # 坑 16:attrs(tensor_model_parallel/partition_dim)若各 rank 不一致,会让
++            # all_gather_params_async 里部分 rank 进 gather 分支、部分跳过 → 集合通信错配 →
++            # CUDA illegal memory access(且 NCCL watchdog 异步报,极难定位)。这里提前断言。
++            
++            for _k in ("tensor_model_parallel", "partition_dim", "parallel_mode"):
++                assert infos[i].attrs.get(_k) == param_info.attrs.get(_k), (
++                    f"Parameter attr '{_k}' mismatch for {param_info.name}: "
++                    f"{infos[i].attrs.get(_k)} != {param_info.attrs.get(_k)}"
++                )
++
++            # 🚨 ===== [YULIN-MOD] END =====
++
+     return param_infos
+diff --git a/relax/backends/megatron/weight_update/update_lora_from_tensor.py b/relax/backends/megatron/weight_update/update_lora_from_tensor.py
+new file mode 100644
+index 0000000..9dfbffa
+--- /dev/null
++++ b/relax/backends/megatron/weight_update/update_lora_from_tensor.py
+@@ -0,0 +1,273 @@
++# 🚨 ===== [YULIN-MOD] START: 从 Megatron 收集最新 adapter，并通过 IPC 热推给 SGLang =====
++
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++"""Block 3: 把 Megatron 训练侧的 LoRA adapter 权重热推到 colocate 的 sglang rollout 引擎。
++
++与全量权重同步(``UpdateWeightFromTensor``)的区别:
++  * 只同步 adapter 权重(基座冻结、无需重传):``HfWeightIteratorDirect`` 用
++    ``name_filter`` 把范围缩到 ``.adapter.`` 参数,只 gather/转换 adapter;
++  * 转换走 ``convert_to_hf``→``convert_qwen3omni_to_hf`` 的 raw 路径,把 Megatron
++    adapter 命名(``...linear_qkv.adapter.linear_in/out``)转成 HF/PEFT 命名
++    (``...self_attn.{q,k,v,o}_proj.lora_{A,B}``),且 **不 merge 进 base**
++    —— 满足「只 lora、无 base、无 merge」;sglang 侧 ``normalize_qkv_proj`` 会自动
++    把 q/k/v_proj stack 成 ``qkv_proj``;
++  * 发送时打一个 ``FlattenedTensorBucket``,经 IPC 调
++    ``load_lora_adapter_from_tensors``(而非 ``update_weights_from_tensor``)。
++
++历史(坑 16/17):曾尝试改走 Megatron-Bridge ``export_adapter_weights()``,但镜像 pin
++的 redai-fork(f13bec09,带 Qwen3-Omni)早于该 API,``AutoBridge`` 无此方法;升级
++bridge 又会丢 Qwen3-Omni。故回退 direct 路径,并修复坑 16:adapter 是分布式优化器
++连续 buffer 的非连续视图,NCCL all_gather 前需 ``.contiguous()``(见 common.py)。
++
++当前仅支持 colocate(IPC)路径;分布式(NCCL)LoRA 推送尚未实现。
++"""
++
++# 总体数据流：
++#
++# Megatron adapter
++# → PP/EP broadcast
++# → TP all-gather
++# → Megatron 名称转换
++# → HF/PEFT LoRA 名称
++# → FlattenedTensorBucket
++# → pickle/base64
++# → Ray IPC
++# → SGLang unload old adapter
++# → SGLang load new adapter
++
++from argparse import Namespace
++from collections.abc import Callable, Mapping, Sequence
++
++import pickle
++
++import pybase64
++import ray
++import torch
++import torch.distributed as dist
++from megatron.core import mpu
++from ray.actor import ActorHandle
++
++from relax.utils.distributed_utils import get_gloo_group
++
++from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
++from .hf_weight_iterator_direct import HfWeightIteratorDirect
++
++
++def _is_lora_adapter_name(name: str) -> bool:
++    """判断是否为 Megatron PEFT adapter 参数(命名含 ``.adapter.``)。"""
++    # Megatron-Bridge PEFT 的参数名包含 .adapter.。
++    return ".adapter." in name
++
++
++class UpdateLoRAFromTensor:
++    """把 LoRA adapter 权重从训练侧热推到 colocate 的 rollout 引擎。
++
++    load(adapter→GPU) → broadcast PP/EP → gather TP → 转 sglang 命名 → 打 bucket
++    → IPC ``load_lora_adapter_from_tensors``。
++    """
++
++    def __init__(
++        self,
++        args: Namespace,
++        model: Sequence[torch.nn.Module],
++        weights_getter: Callable[[], Mapping[str, torch.Tensor]],
++        *,
++        model_name: str,
++        quantization_config: dict | None = None,
++    ) -> None:
++        self.args = args
++        self.model = model
++        self.weights_getter = weights_getter
++        self.model_name = model_name
++        self.weight_version = 0
++
++        # LoRA 不做量化:adapter 权重小且需保持精度,强制 None。
++        # 用 direct iterator + name_filter,把范围缩到 .adapter. 参数:只 gather/转换 adapter。
++        self._hf_weight_iterator = HfWeightIteratorDirect(
++            args=args,
++            model=model,
++            model_name=model_name,
++            # LoRA 不量化。
++            quantization_config=None,
++            # 在参数元数据构建阶段就过滤，只处理 adapter。
++            name_filter=_is_lora_adapter_name,
++        )
++
++        # rollout 引擎侧用这个名字注册/更新 adapter(Block 5 的 rollout 请求据此引用)。
++        self.lora_name = getattr(args, "lora_name", None) or "policy"
++
++        # adapter 的 PEFT 配置(sglang LoRAConfig.from_dict 需要 r / lora_alpha / target_modules)。
++        self._config_dict = {
++            "peft_type": "LORA",
++            "r": int(args.lora_rank),
++            "lora_alpha": float(args.lora_alpha),
++            "lora_dropout": float(getattr(args, "lora_dropout", 0.0)),
++            # SGLang 会把 q/k/v 归一到融合的 qkv_proj。
++            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
++            "bias": "none",
++        }
++
++        self._ipc_gather_group = None
++        self._ipc_gather_src = None
++        self._ipc_engine = None
++        self._loaded_once = False
++
++    def connect_rollout_engines(
++        self,
++        rollout_engines: Sequence[ActorHandle],
++        rollout_engine_lock: ActorHandle,
++        engine_gpu_counts: Sequence[int] | None = None,
++        engine_gpu_offsets: Sequence[int] | None = None,
++    ) -> None:
++        """建立 colocate IPC gather group,并把训练 rank 映射到各 colocate 引擎。
++
++        逻辑与 ``UpdateWeightFromTensor`` 的 colocate 部分一致;若检测到分布式
++        (非 colocate)引擎则直接报错,因为 LoRA 的 NCCL 推送路径尚未实现。
++        """
++        # 计算每个 rollout engine 占用的训练 GPU 范围。
++        # 每组 GPU 创建一个 Gloo group，用于决定哪个训练 rank 是发送源。
++
++        self.rollout_engines = rollout_engines
++
++        if engine_gpu_counts is None:
++            engine_gpu_counts = [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)
++        if engine_gpu_offsets is None:
++            engine_gpu_offsets = []
++            offset = 0
++            for c in engine_gpu_counts:
++                engine_gpu_offsets.append(offset)
++                offset += c
++
++        total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
++        colocate_engine_nums = 0
++        for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
++            if gpu_offset + gpu_count > total_actor_gpus:
++                break
++            colocate_engine_nums += 1
++
++        # 如果有 rollout engine 位于 actor GPU 范围之外，
++        # 说明不是完整 colocate 部署。
++        if colocate_engine_nums < len(rollout_engines):
++            raise NotImplementedError(
++                "LoRA 热更新目前只支持 colocate(IPC)引擎;检测到分布式 rollout 引擎。"
++                "请使用 colocate 部署,或扩展 UpdateLoRAFromTensor 的 NCCL 路径。"
++            )
++        
++        # 每个训练 rank 记录自己对应的 rollout engine；
++        # 每个 engine 只由其 group 的首 rank 真正发送 adapter。
++
++        colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
++        colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
++
++        if self._ipc_gather_group is None:
++            for i in range(colocate_engine_nums):
++                group_ranks = list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))
++                new_group = dist.new_group(ranks=group_ranks, backend="gloo")
++                if dist.get_rank() in group_ranks:
++                    self._ipc_gather_group = new_group
++                    self._ipc_gather_src = colocate_gpu_offsets[i]
++
++        for i, engine in enumerate(self.rollout_engines):
++            start = colocate_gpu_offsets[i]
++            end = start + colocate_gpu_counts[i]
++            if start <= dist.get_rank() < end:
++                self._ipc_engine = engine
++
++    @torch.no_grad()
++    def update_weights(self) -> None:
++        """version++ → 暂停/flush → gather adapter → 打 bucket → IPC 推送 → 恢复。
++
++        注意:迭代器内部含 TP/PP 集合通信,所有 rank 都必须完整跑完循环;
++        但只有每个 colocate 引擎对应的 gather 源 rank 真正打包并发送。
++        """
++        # 记录 LoRA updater 自己的更新次数。
++        self.weight_version += 1
++        rank = dist.get_rank()
++
++        # 只有对应 engine 的 gather 源 rank 才负责最终序列化和发送。
++        is_sender = self._ipc_engine is not None and rank == self._ipc_gather_src
++
++        if rank == 0:
++            # 暂停生成，防止加载 adapter 时仍有请求使用旧权重。
++            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
++            # 清理前一轮 generation cache。
++            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
++        # 确保所有训练 rank 同步进入集合通信阶段。
++        dist.barrier(group=get_gloo_group())
++
++        # 根据 actor.py 提供的 getter 获取最新 adapter。
++        # offload 模式下可能来自 CPU backup；
++        # no-offload 模式下来自 GPU live tensor。
++        megatron_local_weights = self.weights_getter()
++
++        # 坑 16 诊断:确认取到的 adapter 张量来源/状态(device/contiguous),便于定位 all_gather 崩因。
++        if rank == 0 and megatron_local_weights:
++            _names = list(megatron_local_weights)
++            _samp = megatron_local_weights[_names[0]]
++            print(
++                f"[LoRA-sync][rank0] 取到 adapter 张量 {len(_names)} 个; "
++                f"样例 name={_names[0]} device={_samp.device} contiguous={_samp.is_contiguous()} "
++                f"shape={tuple(_samp.shape)} dtype={_samp.dtype}",
++                flush=True,
++            )
++
++        # 把所有 chunk 的完整 adapter 张量累积到一个 dict(仅发送 rank 需要保留)。
++        full_named_tensors: list[tuple[str, torch.Tensor]] = []
++        # 所有 rank 必须完整执行 iterator，
++        # 因为 iterator 内部包含 PP/EP/TP 集合通信。
++        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
++            if is_sender:
++                # 发送 rank 只保存最终转换出的 lora_A/lora_B。
++                full_named_tensors.extend(
++                    (n, t) for n, t in hf_named_tensors if ".lora_A." in n or ".lora_B." in n
++                )
++
++        if is_sender:
++            self._push_lora_to_engine(full_named_tensors)
++        del full_named_tensors
++
++        # 等待所有 engine 完成 adapter 更新。
++        dist.barrier(group=get_gloo_group())
++        if rank == 0:
++            # 恢复 rollout 生成。
++            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
++
++    def _push_lora_to_engine(self, named_tensors: list[tuple[str, torch.Tensor]]) -> None:
++        # 如果没有任何 LoRA 参数，说明挂载或 target_modules 配置有问题。
++        assert len(named_tensors) > 0, "未收集到任何 LoRA adapter 权重,检查 target_modules / 是否已挂 LoRA。"
++
++        # FlattenedTensorBucket 只保存一份统一 dtype 的扁平张量。
++        dtypes = {t.dtype for _, t in named_tensors}
++        assert len(dtypes) == 1, f"LoRA adapter 权重存在混合 dtype {dtypes},无法打进单个 bucket。"
++
++        # 将所有 adapter 张量展平为一个 bucket，并保留恢复名字/形状所需的 metadata。
++        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
++        flattened_tensor_data = {
++            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor().cpu(),
++            "metadata": flattened_tensor_bucket.get_metadata(),
++        }
++        # 不使用 MultiprocessingSerializer：
++        # 它可能通过 fd sharing 传 CPU Tensor，
++        # 跨 Ray actor 进程树时可能因 authkey 不同触发 AuthenticationError。
++        #
++        # 普通 pickle 会把数据直接内联到 bytes，再用 base64 放入 RPC payload。
++        serialized = pybase64.b64encode(pickle.dumps(flattened_tensor_data)).decode("utf-8")
++
++        # SGLang 不允许重复加载同名 adapter。
++        # RL 第二次及之后更新时，先卸载旧 policy。
++        if self._loaded_once:
++            ray.get(self._ipc_engine.unload_lora_adapter.remote(self.lora_name))
++
++        # 从内存张量加载新的 adapter，不经过磁盘。
++        ray.get(
++            self._ipc_engine.load_lora_adapter_from_tensors.remote(
++                lora_name=self.lora_name,
++                serialized_tensors=serialized,
++                config_dict=self._config_dict,
++                load_format="flattened_bucket",
++            )
++        )
++        self._loaded_once = True
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/relax/backends/sglang/sglang_engine.py b/relax/backends/sglang/sglang_engine.py
+index f9da370..b48a235 100644
+--- a/relax/backends/sglang/sglang_engine.py
++++ b/relax/backends/sglang/sglang_engine.py
+@@ -474,6 +474,80 @@ class SGLangEngine(RayActor):
+             payload,
+         )
+ 
++    # 🚨 ===== [YULIN-MOD] START: 向 Relax 暴露 SGLang LoRA 加载和卸载接口 =====
++
++    # 前面几层已经把 LoRA 训练出来、收集起来、转换成 SGLang 能懂的格式了。到了 sglang_engine.py 这里，问题主要变成：
++    # - “Relax 怎么把 LoRA 交给 SGLang？”
++    # - “Relax 怎么让 SGLang 加载、卸载这个 LoRA？”
++    # - “如果 rollout offload 把显存里的 base 权重暂时挪走，SGLang 醒来时怎么恢复 base？”
++    # 
++    # 所以这像是在 Relax 和 SGLang 之间加了一组“控制接口”：
++    # - 把 LoRA 从内存交给 SGLang
++    # - 把 LoRA 从磁盘交给 SGLang
++    # - 让 SGLang 卸载某个 LoRA
++    # - 让 SGLang 在 offload 时保留 base 权重的 CPU 备份
++    # 
++    # 它解决的是“LoRA 怎么送进去、怎么管理、base 怎么别丢”的问题。
++
++    # “内存加载 LoRA”。
++    # 可以想成 Relax 刚训练完 LoRA，手里有一包新鲜出炉的 adapter 张量。
++    # 它不想先落盘成文件，再让 SGLang 从硬盘读，太绕了。
++    def load_lora_adapter_from_tensors(
++        self,
++        lora_name: str,
++        serialized_tensors: str,
++        config_dict: dict,
++        load_format: str | None = None,
++        pinned: bool = False,
++    ):
++        """Push a LoRA adapter to the rollout engine from in-memory tensors
++        (the RL weight-sync path -- no disk round-trip).
++
++        ``serialized_tensors`` must already be serialized by the caller, e.g.
++        via ``MultiprocessingSerializer.serialize`` of a ``FlattenedTensorBucket``
++        dict (with ``load_format="flattened_bucket"``). ``config_dict`` is the
++        PEFT-style adapter config (``r``, ``lora_alpha``, ``target_modules`` ...).
++        """
++        # 从内存中的序列化张量加载 adapter，
++        # 用于 RL 训练后的实时权重同步，不需要写磁盘。
++        payload = {
++            "lora_name": lora_name,
++            "serialized_tensors": serialized_tensors,
++            "config_dict": config_dict,
++            "pinned": pinned,
++        }
++        if load_format is not None:
++            payload["load_format"] = load_format
++        # 然后发给 SGLang
++        return self._make_request(
++            "load_lora_adapter_from_tensors",
++            payload,
++        )
++
++    # “磁盘加载 LoRA”。
++    # 它适合传统方式：LoRA 已经存在某个目录里。
++    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
++        """Load a LoRA adapter from a filesystem path (adapter_config.json +
++        adapter_model.safetensors), without relaunching the engine."""
++        # 从 adapter_config.json 和 adapter_model.safetensors
++        # 所在的磁盘目录加载 adapter。
++        return self._make_request(
++            "load_lora_adapter",
++            {"lora_name": lora_name, "lora_path": lora_path, "pinned": pinned},
++        )
++
++    # “卸载 LoRA”。
++    # SGLang 可能已经注册了一个叫 policy 的 adapter。如果之后要换新的、清理旧的
++    def unload_lora_adapter(self, lora_name: str):
++        """Unload a previously loaded LoRA adapter by name."""
++        # 按逻辑名称卸载已经注册的 adapter。
++        return self._make_request(
++            "unload_lora_adapter",
++            {"lora_name": lora_name},
++        )
++
++    # 🚨 ===== [YULIN-MOD] END =====
++
+     def flush_cache(self):
+         """Flush the cache of the server."""
+         if self.node_rank != 0:
+@@ -917,6 +991,21 @@ def _compute_server_args(
+         "random_seed": args.seed + rank,
+         # memory
+         "enable_memory_saver": args.offload_rollout,
++
++        # 🚨 ===== [YULIN-MOD] START: LoRA rollout offload 时由 SGLang 自行备份基座 =====
++        
++        # 如果开启 rollout offload，并且当前是 LoRA 模式，
++        # 那就让 SGLang 自己保存 base 权重的 CPU 备份。
++
++        # LoRA colocate: only adapter weights are synced after training, so
++        # base model weights must survive the pause/resume cycle via CPU backup.
++        # Without this, resume_memory_occupation restores garbage for base weights.
++        "enable_weights_cpu_backup": (
++            args.offload_rollout and getattr(args, "lora_enable", False)
++        ),
++
++        # 🚨 ===== [YULIN-MOD] END =====
++
+         # distributed
+         "host": host,
+         "port": port,
+diff --git a/relax/backends/sglang_omni/__init__.py b/relax/backends/sglang_omni/__init__.py
+new file mode 100644
+index 0000000..83c71b4
+--- /dev/null
++++ b/relax/backends/sglang_omni/__init__.py
+@@ -0,0 +1,7 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: (omni) 注册独立的 SGLang-Omni rollout backend =====
++
++"""SGLang-Omni rollout backend."""
++
++# 🚨 ===== [YULIN-MOD] END =====
+diff --git a/relax/backends/sglang_omni/omni_engine.py b/relax/backends/sglang_omni/omni_engine.py
+new file mode 100644
+index 0000000..848475f
+--- /dev/null
++++ b/relax/backends/sglang_omni/omni_engine.py
+@@ -0,0 +1,153 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: (omni) 新增外部 Omni engine proxy，并保留原有 SGLang backend =====
++
++# Relax 原来的 Ray rollout 管理器认识的是 SGLangEngine。
++# 如果直接把 SGLangEngine 改成 Omni，就会破坏已经能工作的标准 SGLang 路径。
++#
++# 因此这里新增一个独立的 SGLangOmniEngine，可以把它理解成：
++#
++# Relax 期待的 SGLangEngine 插座
++#            ↓ 转接头
++# 外部 SGLang-Omni Router
++#
++# 它保持 Relax 已经熟悉的 engine 方法名，
++# 但实际请求发给已经在外部启动好的 Omni router。
++#
++# 普通 SGLang rollout：
++#   仍然使用原来的 SGLangEngine，行为不变。
++#
++# Omni rollout：
++#   只有 rollout 模块显式声明 SGLangOmniEngine 时才走这里。
++#
++# 当前 Omni engine 只支持 external 模式：
++# - 不由 Relax 启动模型；
++# - 不注册到标准 SGLang router；
++# - 不支持 Relax 的 elastic scale-out；
++# - 不支持 rollout offload 的 release/resume。
++#
++# 对暂时不支持的能力显式报错，避免表面继续运行、实际状态已经错误。
++
++from __future__ import annotations
++
++import time
++from typing import Optional
++
++import requests
++
++from relax.backends.sglang.sglang_engine import SGLangEngine
++from relax.utils.logging_utils import get_logger
++
++
++logger = get_logger(__name__)
++
++
++class SGLangOmniEngine(SGLangEngine):
++    """External HTTP proxy for one SGLang-Omni router."""
++
++    supports_elastic_scale = False
++
++    def init(
++        self,
++        dist_init_addr: str,
++        port: int,
++        nccl_port: int | None,
++        host: str | None = None,
++        disaggregation_bootstrap_port: int | None = None,
++        router_ip: str | None = None,
++        router_port: int | None = None,
++        init_external_kwargs: Optional[dict] = None,
++        skip_dcs_registration: bool = False,
++        skip_router_registration: bool = False,
++    ) -> None:
++        del nccl_port
++        del disaggregation_bootstrap_port
++        del init_external_kwargs
++        del skip_dcs_registration
++        del skip_router_registration
++        self._validate_mode()
++        if self.worker_type != "regular":
++            raise ValueError("SGLang-Omni only supports regular (non-PD) rollout workers")
++
++        self.node_rank = 0
++        self.server_host = host or str(dist_init_addr).rsplit(":", 1)[0]
++        self.server_port = int(port)
++        self.router_ip = router_ip
++        self.router_port = router_port
++        self._skip_router_registration = True
++        self.checkpoint_engine_client = None
++        self._wait_healthy()
++        self._validate_server()
++
++    def _validate_mode(self) -> None:
++        if not getattr(self.args, "rollout_external", False):
++            raise ValueError("SGLang-Omni rollout requires --rollout-external")
++        if getattr(self.args, "fully_async", False):
++            raise ValueError("SGLang-Omni rollout does not support --fully-async")
++        if getattr(self.args, "offload_rollout", False):
++            raise ValueError("SGLang-Omni rollout does not support rollout offload")
++        external_addrs = getattr(self.args, "rollout_external_engine_addrs", None)
++        if not external_addrs or len(external_addrs) != 1:
++            raise ValueError(
++                "SGLang-Omni rollout requires exactly one external Omni router address"
++            )
++
++    def _wait_healthy(self, timeout: float = 300.0) -> None:
++        url = f"http://{self.server_host}:{self.server_port}/health"
++        deadline = time.monotonic() + timeout
++        last_error: Exception | None = None
++        while time.monotonic() < deadline:
++            try:
++                response = requests.get(url, timeout=10)
++                response.raise_for_status()
++                return
++            except requests.RequestException as exc:
++                last_error = exc
++                time.sleep(1)
++        raise TimeoutError(f"Timed out waiting for SGLang-Omni at {url}") from last_error
++
++    def _validate_server(self) -> None:
++        response = requests.get(
++            f"http://{self.server_host}:{self.server_port}/model_info",
++            timeout=10,
++        )
++        response.raise_for_status()
++
++    def health_generate(self, timeout: float = 5.0) -> bool:
++        response = requests.get(
++            f"http://{self.server_host}:{self.server_port}/health",
++            timeout=timeout,
++        )
++        response.raise_for_status()
++        return True
++
++    def flush_cache(self) -> dict | None:
++        return self._make_request("flush_cache")
++
++    def register_to_router(
++        self,
++        bootstrap_port: int | None = None,
++        strict: bool = True,
++    ) -> bool:
++        del bootstrap_port
++        del strict
++        return True
++
++    def unregister_from_router(self) -> bool:
++        return True
++
++    def shutdown(self) -> None:
++        logger.info(
++            "Detach external SGLang-Omni proxy at %s:%s",
++            self.server_host,
++            self.server_port,
++        )
++
++    def release_memory_occupation(self) -> None:
++        raise NotImplementedError("SGLang-Omni rollout offload is not supported")
++
++    def resume_memory_occupation(self, tags: list[str] | None = None) -> None:
++        del tags
++        raise NotImplementedError("SGLang-Omni rollout offload is not supported")
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/relax/distributed/ray/rollout.py b/relax/distributed/ray/rollout.py
+index dc3d99e..a14bb04 100644
+--- a/relax/distributed/ray/rollout.py
++++ b/relax/distributed/ray/rollout.py
+@@ -5,6 +5,7 @@
+ import asyncio
+ import dataclasses
+ import enum
++import importlib
+ import logging
+ import multiprocessing
+ import os
+@@ -12,6 +13,7 @@ import random
+ import threading
+ import time
+ import uuid
++from collections.abc import Callable
+ from typing import Any, Optional
+ 
+ import numpy as np
+@@ -54,6 +56,68 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
+ 
+ logger = get_logger(__name__)
+ 
++# 🚨 ===== [YULIN-MOD] START: (omni) 按 rollout 模块动态选择 engine 类型和 abort hook，默认仍使用标准 SGLang =====
++
++# Relax 原来把 rollout engine 写死成 SGLangEngine。
++#
++# 现在需要同时支持两条路径：
++#
++# 普通 rollout 模块
++# → 没有声明 ROLLOUT_ENGINE_CLASS
++# → 回退到原来的 SGLangEngine
++#
++# Omni rollout 模块
++# → 声明 ROLLOUT_ENGINE_CLASS=SGLangOmniEngine
++# → 使用独立的 Omni engine proxy
++#
++# abort 也是同样的设计：
++# - 普通 SGLang 没有声明 hook，继续走原来的 /workers + /abort_request；
++# - Omni 声明自己的 hook，走 pause_generation(mode="abort")，
++#   然后调用 continue_generation 恢复服务。
++#
++# 这相当于给 rollout 模块留了两个“可选插槽”：
++# 一个决定使用哪种 engine proxy，一个决定怎么终止请求。
++# rollout 模块不声明这些插槽时，完全保持 Relax 原来的 SGLang 行为。
++
++def _resolve_rollout_engine_class(args: Any) -> type:
++    """Resolve the engine proxy declared by the rollout function's module."""
++    rollout_function_path = getattr(args, "rollout_function_path", "") or ""
++    module_path, separator, _ = rollout_function_path.rpartition(".")
++    if not separator:
++        return SGLangEngine
++    module = importlib.import_module(module_path)
++    engine_class_path = getattr(module, "ROLLOUT_ENGINE_CLASS", None)
++    if engine_class_path is None:
++        return SGLangEngine
++    if not isinstance(engine_class_path, str) or "." not in engine_class_path:
++        raise ValueError(
++            f"{module_path}.ROLLOUT_ENGINE_CLASS must be a fully qualified class path"
++        )
++    engine_class = load_function(engine_class_path)
++    if not isinstance(engine_class, type):
++        raise TypeError(f"{engine_class_path} does not resolve to a class")
++    return engine_class
++
++
++def _resolve_rollout_abort_function(args: Any) -> Callable | None:
++    """Resolve an optional abort hook declared by the rollout module."""
++    rollout_function_path = getattr(args, "rollout_function_path", "") or ""
++    module_path, separator, _ = rollout_function_path.rpartition(".")
++    if not separator:
++        return None
++    module = importlib.import_module(module_path)
++    abort_function_path = getattr(module, "ROLLOUT_ABORT_FUNCTION", None)
++    if abort_function_path is None:
++        return None
++    if not isinstance(abort_function_path, str) or "." not in abort_function_path:
++        raise ValueError(
++            f"{module_path}.ROLLOUT_ABORT_FUNCTION must be a fully qualified function path"
++        )
++    abort_function = load_function(abort_function_path)
++    if not callable(abort_function):
++        raise TypeError(f"{abort_function_path} does not resolve to a callable")
++    return abort_function
++# 🚨 ===== [YULIN-MOD] END =====
+ 
+ @dataclasses.dataclass
+ class EngineGroupConfig:
+@@ -435,7 +499,23 @@ class EngineGroup:
+ 
+         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
+ 
+-        RolloutRayActor = ray.remote(SGLangEngine)
++        # 🚨 ===== [YULIN-MOD] START: (omni) 创建 rollout actor 时使用模块声明的 engine 类型 =====
++
++        # 前面的 resolver 只负责找出应该使用哪个 engine class。
++        # 到这里才真正通过 ray.remote 把选中的 backend 包装成 Ray actor：
++        #
++        # 普通 rollout 模块
++        # → _resolve_rollout_engine_class() 返回 SGLangEngine
++        #
++        # Omni rollout 模块
++        # → _resolve_rollout_engine_class() 返回 SGLangOmniEngine
++        #
++        # 因此这里只改变 actor 使用的具体 backend，
++        # 后面的 placement group、GPU 分配和启动流程仍然复用 Relax 原来的逻辑。
++
++        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
++
++        # 🚨 ===== [YULIN-MOD] END =====
+ 
+         rollout_engines = []
+         for i in range(len(self.all_engines)):
+@@ -1217,6 +1297,43 @@ class RolloutManager(ReloadableMixin):
+         Returns:
+             Dict with request_id and initial status (or NOOP if idempotent no-op)
+         """
++        # 🚨 ===== [YULIN-MOD] START: (omni) 阻止不支持弹性扩容的 Omni engine 执行 scale-out =====
++
++        # 标准 SGLang 在 Ray-native 模式下，不只是创建一个 Ray proxy。
++        #
++        # Relax 会先为新副本申请 Placement Group 和 GPU，
++        # 然后创建新的 SGLangEngine Ray actor。
++        # SGLangEngine.init() 会继续调用 launch_server_process()，
++        # 在新分配的 GPU 上真正启动一套新的：
++        #
++        # SGLang scheduler
++        # → model runner
++        # → HTTP server
++        #
++        # 新服务启动后，Relax 还会从已有的 seed engine 同步权重，
++        # 最后把新服务注册到 router。
++        # 因此标准 SGLang 的 Ray-native scale-out 会真正增加推理容量。
++        #
++        # 当前 SGLangOmniEngine 不具备这套启动能力。
++        # 它只支持 external 模式，init() 只是连接并检查已经启动好的
++        # SGLang-Omni router，不会启动新的 Thinker、Talker 或 Code2Wav。
++        #
++        # 因此多创建一个 SGLangOmniEngine Ray actor，
++        # 只会多出一个指向同一 Omni router 的 proxy，
++        # 不会增加真正的 Omni worker，也不会增加实际推理容量。
++        #
++        # Omni 通过 supports_elastic_scale=False 显式声明不支持扩容。
++        # getattr(..., True) 则保证没有这个新字段的标准 SGLangEngine
++        # 继续执行 Relax 原来的 scale-out 流程。
++
++        engine_class = _resolve_rollout_engine_class(self.args)
++        if not getattr(engine_class, "supports_elastic_scale", True):
++            raise ValueError(
++                f"{engine_class.__name__} does not support elastic rollout scale-out"
++            )
++
++        # 🚨 ===== [YULIN-MOD] END =====
++
+         # Auto-detect mode: if num_replicas > 0, use ray_native; otherwise use external
+         if num_replicas > 0:
+             scale_mode = ScaleOutMode.RAY_NATIVE
+@@ -1738,7 +1855,33 @@ class RolloutManager(ReloadableMixin):
+                 # Create SGLangEngine actor (connecting mode).
+                 # No GPU needed: this actor is an RPC proxy to the external engine;
+                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
+-                RolloutRayActor = ray.remote(SGLangEngine)
++
++                # 🚨 ===== [YULIN-MOD] START: (omni) 外部 engine 重连时恢复模块声明的 engine 类型 =====
++
++                # external engine 路径也会重新创建一个 Ray proxy，
++                # 因此这里不能继续把 actor 类型写死成 SGLangEngine。
++                #
++                # 必须再次根据 rollout 模块解析 backend：
++                #
++                # 普通 rollout 模块
++                # → 创建 SGLangEngine proxy
++                #
++                # 声明了自定义 engine 的 rollout 模块
++                # → 创建对应的自定义 engine proxy
++                #
++                # 否则初始连接可能使用的是自定义 backend，
++                # 但 external engine 再次建立连接时却会悄悄退回 SGLangEngine，
++                # 导致同一组 rollout engine 前后使用不同的通信协议。
++                #
++                # 当前 Omni 已通过 supports_elastic_scale=False 禁止 scale-out，
++                # 所以正常情况下 Omni 不会进入这里；
++                # 这里仍然动态解析，是为了保证整条 external engine 路径
++                # 不再依赖写死的 SGLangEngine。
++
++                RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
++
++                # 🚨 ===== [YULIN-MOD] END =====
++
+                 engine = RolloutRayActor.options(
+                     num_cpus=0.2,
+                     num_gpus=0.2,
+diff --git a/relax/engine/rewards/__init__.py b/relax/engine/rewards/__init__.py
+index 017c6f7..531be76 100644
+--- a/relax/engine/rewards/__init__.py
++++ b/relax/engine/rewards/__init__.py
+@@ -10,6 +10,7 @@ from relax.utils.logging_utils import get_logger
+ from relax.utils.misc import load_function
+ from relax.utils.types import Sample
+ 
++from .bleu import get_bleu_reward
+ from .dapo_genrm import async_compute_score_genrm
+ from .deepscaler import get_deepscaler_rule_based_reward
+ from .f1 import f1_score
+@@ -75,6 +76,14 @@ class RewardWorker:
+             return 1 if grade_answer_verl(response, label) else 0
+         elif rm_type == "f1":
+             return f1_score(response, label)[0]
++
++        # 🚨 ===== [YULIN-MOD] START: 执行 BLEU reward =====
++
++        elif rm_type == "bleu":
++            return get_bleu_reward(response, label, metadata=metadata)
++        
++        # 🚨 ===== [YULIN-MOD] END =====
++        
+         elif rm_type == "gpqa":
+             return compute_gpqa_reward(response, label, metadata=metadata)
+         elif rm_type == "ifbench":
+@@ -156,6 +165,13 @@ class RewardExecutor:
+             "dapo",
+             "math",
+             "f1",
++
++            # 🚨 ===== [YULIN-MOD] START: （加入合法类型白名单）允许命令行选择 bleu 奖励 =====
++
++            "bleu",
++
++            # 🚨 ===== [YULIN-MOD] END =====
++
+             "gpqa",
+             "ifbench",
+             "random",
+diff --git a/relax/engine/rewards/bleu.py b/relax/engine/rewards/bleu.py
+new file mode 100644
+index 0000000..d6450c9
+--- /dev/null
++++ b/relax/engine/rewards/bleu.py
+@@ -0,0 +1,120 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: 为翻译任务提供平滑的句级 BLEU 奖励 =====
++
++"""自包含的句级 BLEU 奖励（翻译任务）。
++
++- 返回 [0, 1] 的连续分数：天然有方差，避免 0/1 二值奖励的「全对/全错」零方差。
++- 带平滑（对缺失的高阶 n-gram 用 1/(2*total) 兜底），使部分匹配也得正分，梯度更平滑。
++- 面向英文 reference（按空白+标点切词、小写）。中文 reference 走字符级兜底。
++- response/label 均优先从 <answer></answer> 取，取不到则用整串 strip()。
++"""
++
++import math
++import re
++from collections import Counter
++
++
++try:
++    import sacrebleu  # 与 my_omni quality_reward 一致：中文用 zh tokenizer
++    _HAS_SACREBLEU = True
++except ImportError:
++    _HAS_SACREBLEU = False
++
++
++ANS_TAG = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.S)
++_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
++
++
++def _extract(text: str) -> str:
++    m = ANS_TAG.search(text or "")
++    return (m.group(1).strip() if m else (text or "").strip())
++
++
++def _ref_text(label) -> str:
++    """从 label 取参考译文：支持 str / {'ground_truth': ...} / list。"""
++    if isinstance(label, dict):
++        ref = label.get("ground_truth") or label.get("label") or ""
++    elif isinstance(label, (list, tuple)):
++        ref = label[0] if label else ""
++    else:
++        ref = label
++    return _extract(str(ref or ""))
++
++
++def _sacre_tokenize(tgt_lang, ref: str) -> str:
++    lang = (tgt_lang or "").lower()
++    if lang in ("zh", "zh-cn") or _CJK.search(ref):
++        return "zh"
++    if lang == "ja":
++        return "ja-mecab"
++    if lang == "ko":
++        return "ko-mecab"
++    return "13a"
++
++
++def _tokenize(s: str) -> list[str]:
++    s = s.strip()
++    if _CJK.search(s):
++        # 中文无空格：按字符切（去空白）。
++        return [ch for ch in s if not ch.isspace()]
++    s = s.lower()
++    s = re.sub(r"([.,!?;:\"()\[\]])", r" \1 ", s)
++    return s.split()
++
++
++def _ngram_counts(tokens: list[str], n: int) -> Counter:
++    return Counter(tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1))
++
++
++def sentence_bleu(hyp: list[str], ref: list[str], max_n: int = 4) -> float:
++    if not hyp or not ref:
++        return 0.0
++    log_p = []
++    for n in range(1, max_n + 1):
++        hyp_ng = _ngram_counts(hyp, n)
++        ref_ng = _ngram_counts(ref, n)
++        total = sum(hyp_ng.values())
++        if total == 0:
++            # hyp 比 n 还短：用平滑兜底，避免直接 0。
++            log_p.append(math.log(1.0 / (2.0 * max_n)))
++            continue
++        overlap = sum(min(c, ref_ng[g]) for g, c in hyp_ng.items())
++        p = overlap / total
++        if p == 0.0:
++            p = 1.0 / (2.0 * total)  # 平滑：避免 log(0)
++        log_p.append(math.log(p))
++    geo_mean = math.exp(sum(log_p) / max_n)
++    hl, rl = len(hyp), len(ref)
++    bp = 1.0 if hl > rl else math.exp(1.0 - rl / max(1, hl))
++    return bp * geo_mean
++
++
++# 奖励入口
++def get_bleu_reward(response, label, metadata=None) -> float:
++    """句级 BLEU 奖励 ∈ [0,1]。
++
++    - label 支持裸串 / {'ground_truth': ...} / list（S2TT 用 dict 形态）。
++    - 装了 sacrebleu 时用它（中文走 zh tokenizer），对齐 my_omni quality_reward；
++      否则回退自带的字符级/空白级平滑 BLEU。
++    - metadata['tgt_lang'] 用于选 tokenizer；缺失则按 ref 是否含 CJK 自动判定。
++    """
++    hyp_str = _extract(response)
++    ref_str = _ref_text(label)
++    if not hyp_str or not ref_str:
++        return 0.0
++
++    if _HAS_SACREBLEU:
++        tgt_lang = (metadata or {}).get("tgt_lang") if isinstance(metadata, dict) else None
++        tok = _sacre_tokenize(tgt_lang, ref_str)
++        try:
++            return max(0.0, min(1.0, sacrebleu.sentence_bleu(hyp_str, [ref_str], tokenize=tok).score / 100.0))
++        except Exception:
++            try:
++                return max(0.0, min(1.0, sacrebleu.sentence_bleu(hyp_str, [ref_str]).score / 100.0))
++            except Exception:
++                pass
++
++    return float(sentence_bleu(_tokenize(hyp_str), _tokenize(ref_str)))
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/relax/engine/rewards/multiple_choice.py b/relax/engine/rewards/multiple_choice.py
+index 17037f9..2a1194e 100644
+--- a/relax/engine/rewards/multiple_choice.py
++++ b/relax/engine/rewards/multiple_choice.py
+@@ -7,8 +7,12 @@ ANS_TAG = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.S)
+ 
+ 
+ def extract_answer(text: str) -> str:
++    # 有 <answer> 标签就取标签内容；没有则退回裸串 strip()
++    # （label 常是裸字母如 "C"，response 才带标签——和 openr1mm 的契约一致）
+     m = ANS_TAG.search(text)
+-    return m.group(1).strip() if m else ""
++    # 🚨 ===== [YULIN-MOD] START =====
++    return m.group(1).strip() if m else text.strip()
++    # 🚨 ===== [YULIN-MOD] END =====
+ 
+ 
+ def get_multiple_choice_reward(response, label):
+diff --git a/relax/engine/rollout/sglang_omni_rollout.py b/relax/engine/rollout/sglang_omni_rollout.py
+new file mode 100644
+index 0000000..331f92d
+--- /dev/null
++++ b/relax/engine/rollout/sglang_omni_rollout.py
+@@ -0,0 +1,78 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: (omni) 声明 Omni engine 和 abort hook，同时复用标准 rollout 编排 =====
++
++# 这个文件可以理解成 Omni rollout 的“身份证”。
++#
++# Relax 会根据 --rollout-function-path 找到当前 rollout 模块，
++# 然后读取模块声明的两个可选配置：
++#
++# ROLLOUT_ENGINE_CLASS
++# → 告诉 Relax 这次 rollout 应使用 SGLangOmniEngine，
++#   而不是默认的标准 SGLangEngine。
++#
++# ROLLOUT_ABORT_FUNCTION
++# → 告诉 Relax 终止本轮请求时应调用 Omni 自己的 abort hook，
++#   而不是标准 SGLang router 的 /workers + /abort_request。
++#
++# 这里只声明 Omni 与标准 SGLang 不同的部分。
++#
++# 真正的批量调度、并发限制、Sample 管理、reward 计算和数据传输，
++# 仍然复用：
++#
++# relax.engine.rollout.sglang_rollout.generate_rollout
++#
++# 因此这里没有复制一整套 rollout 编排，也没有替换标准 SGLang 路径。
++# 普通 rollout 模块不声明这两个配置时，仍然使用原来的 SGLangEngine
++# 和原来的 /abort_request 终止逻辑。
++#
++# Omni router 没有标准 SGLang 的：
++#
++# Router /workers
++# → 找到所有 worker
++# → 对每个 worker 调 /abort_request
++#
++# 这是因为一个 Omni 请求可能同时跨过 Thinker、Talker、Code2Wav
++# 等多个 stage，不能只终止某个普通 SGLang worker。
++#
++# 所以 Omni 的 abort hook 会：
++#
++# pause_generation(mode="abort")
++# → 统一终止并清理尚未完成的 Omni 请求
++# → continue_generation
++# → 恢复服务，让下一轮 rollout 继续复用同一个外部 Omni router
++
++"""Standard Relax rollout orchestration backed by an external SGLang-Omni router."""
++
++from typing import Any
++
++from relax.engine.rollout.sglang_rollout import generate_rollout
++from relax.utils.http_utils import post
++
++
++ROLLOUT_ENGINE_CLASS = "relax.backends.sglang_omni.omni_engine.SGLangOmniEngine"
++ROLLOUT_ABORT_FUNCTION = (
++    "relax.engine.rollout.sglang_omni_rollout.abort_rollout"
++)
++
++
++async def abort_rollout(args: Any) -> None:
++    """Abort outstanding Omni generations without a standard SGLang router."""
++    base_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
++    pause_result = await post(
++        f"{base_url}/pause_generation",
++        {"mode": "abort"},
++    )
++    if not pause_result.get("success"):
++        raise RuntimeError(f"SGLang-Omni abort failed: {pause_result}")
++    continue_result = await post(
++        f"{base_url}/continue_generation",
++        {},
++    )
++    if not continue_result.get("success"):
++        raise RuntimeError(f"SGLang-Omni resume failed: {continue_result}")
++
++
++__all__ = ["abort_rollout", "generate_rollout"]
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/relax/engine/rollout/sglang_rollout.py b/relax/engine/rollout/sglang_rollout.py
+index 567ef9b..9130a1b 100644
+--- a/relax/engine/rollout/sglang_rollout.py
++++ b/relax/engine/rollout/sglang_rollout.py
+@@ -18,7 +18,10 @@ import torch
+ from packaging.version import parse
+ from tqdm import tqdm
+ 
+-from relax.distributed.ray.rollout import _log_rollout_data
++from relax.distributed.ray.rollout import (
++    _log_rollout_data,
++    _resolve_rollout_abort_function,
++)
+ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
+ from relax.engine.rewards import async_rm, batched_async_rm
+ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+@@ -260,6 +263,25 @@ async def generate(
+         "return_logprob": not evaluation,
+     }
+ 
++    # 🚨 ===== [YULIN-MOD] START: 让普通 rollout 请求使用最新 LoRA adapter =====
++
++    # 到了 sglang_rollout.py 这里，LoRA 可能已经被 SGLang 成功加载了，但还有一个关键问题：
++    # - “生成的时候，SGLang 怎么知道要用这个 LoRA，而不是只用原始 base model？”
++    # 
++    # 所以这像是在每次 rollout 生成请求上贴一张小纸条：
++    # - 这次生成请使用名叫 policy 的 LoRA adapter
++    #
++    # 如果没有这张纸条，SGLang 可能已经收到了 LoRA，但生成时仍然按纯 base model 来跑。
++    # 它解决的是“生成请求到底有没有点名使用 LoRA”的问题。
++
++    # Block 5: LoRA 训练时让 rollout 用刚热推上去的 adapter(Block 3 推送的同名 adapter)。
++    # Relax 在训练前必定先同步一次权重(=首次推 adapter),故首轮 rollout 时 adapter 已就绪。
++    if getattr(args, "lora_enable", False):
++        # 该名称必须与 UpdateLoRAFromTensor 注册 adapter 时使用的名称相同。
++        payload["lora_path"] = getattr(args, "lora_name", None) or "policy"
++    
++    # 🚨 ===== [YULIN-MOD] END =====
++
+     if args.use_rollout_routing_replay:
+         payload["return_routed_experts"] = True
+ 
+@@ -500,12 +522,62 @@ async def generate_and_rm_group(
+         if sample.session_id is None:
+             sample.session_id = str(uuid.uuid4())
+ 
+-    # Group-level multimodal encoding de-duplication: when samples in the same
+-    # group share the same multimodal_inputs object (e.g. after shallow-copy in
+-    # data_source), encode once and attach the result to every sample so that
+-    # generate() picks up the pre-encoded data instead of re-encoding per sample.
++    # Group-level multimodal encoding de-duplication is only consumed by the
++    # default generate(). Custom generators own their encoding contract and
++    # must not inherit a large, unused base64 payload on every sample.
++
++    # 🚨 ===== [YULIN-MOD] START: (omni) 自定义 Omni generate 跳过标准 SGLang 的多模态预编码 =====
++
++        # 标准 generate() 会读取 Sample 上的 _pre_encoded_mm。
++    #
++    # 同一个 group 中的多个 Sample 经常共享同一份多模态输入，
++    # 所以标准 SGLang 路径会：
++    #
++    # 共享的 multimodal_inputs
++    # → 提前编码一次
++    # → 把结果保存到每个 Sample 的 _pre_encoded_mm
++    # → 各个默认 generate() 直接复用
++    #
++    # 这样可以避免同一张图片或同一段音频被重复编码。
++    #
++    # 但 Omni 自定义 generate 使用的是另一套请求和训练数据契约：
++    #
++    # structured messages
++    # + metadata.audios
++    # + stage_params.thinker.lora_name
++    # + Megatron 所需的 multimodal_train_inputs
++    #
++    # Omni generate 还要按照同传轮次逐块追加音频，
++    # 因此它必须自己负责每一轮音频的编码和 token 对齐。
++    #
++    # 如果这里仍然替 Omni 做标准 SGLang 预编码：
++    #
++    # 1. 每个 Sample 都会额外携带一份没有被 Omni 使用的 base64 payload；
++    # 2. 标准 SGLang 的预编码结果会和 Omni messages 契约同时存在；
++    # 3. 多轮音频 chunk 可能被重复编码；
++    # 4. 展开的训练 token、音频特征和 loss mask 可能无法一一对齐。
++    #
++    # 所以这里先判断当前 group 是否全部使用默认 generate()。
++    # 只有默认 generate() 才继续执行 Relax 原来的共享预编码；
++    # 自定义 Omni generate 则完全跳过这里，由它自己处理音频。
++
++    uses_default_generate = all(
++        (
++            getattr(sample, "generate_function_path", None)
++            or args.custom_generate_function_path
++        )
++        is None
++        for sample in group
++    )
+     first_mm = getattr(group[0], "multimodal_inputs", None)
+-    if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
++    if (
++        uses_default_generate
++
++        # 🚨 ===== [YULIN-MOD] END =====
++
++        and first_mm is not None
++        and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:])
++    ):
+         encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
+         for sample in group:
+             sample._pre_encoded_mm = encoded_mm
+@@ -579,19 +651,67 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
+     # Step 2: Now abort the remaining (non-protected) pending tasks.
+     state.aborted = True
+ 
+-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
+-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+-        urls = response["urls"]
++    # 🚨 ===== [YULIN-MOD] START: (omni) 优先调用 backend 自定义 abort，并保留标准 SGLang fallback =====
++
++    # 标准 SGLang 和 SGLang-Omni 的“停止生成”按钮不一样。
++    #
++    # 标准 SGLang 的终止流程是：
++    #
++    # Router /workers 或 /list_workers
++    # → 找到 router 后面的所有 SGLang worker
++    # → 对每个 worker 调用 /abort_request
++    #
++    # 但 SGLang-Omni 的一个请求可能同时跨过：
++    #
++    # Thinker
++    # → Talker
++    # → Code2Wav
++    #
++    # 因此不能只找到某个普通 SGLang worker 并调用 /abort_request。
++    # Omni 必须通过自己的控制面统一终止跨 stage 的请求。
++    #
++    # _resolve_rollout_abort_function() 会检查当前 rollout 模块是否声明了
++    # ROLLOUT_ABORT_FUNCTION：
++    #
++    # Omni rollout 声明了 hook
++    # → 调用 pause_generation(mode="abort")
++    # → 清理尚未完成的跨 stage 请求
++    # → 调用 continue_generation 恢复服务
++    #
++    # 普通 SGLang rollout 没有声明 hook
++    # → abort_function 为 None
++    # → 进入下面的 else
++    # → 完整执行 Relax 原来的 /workers + /abort_request 逻辑
++    #
++    # 因此新增 Omni abort 不会改变标准 SGLang 的终止行为。
++
++    # Omni 使用 pause_generation/continue_generation；
++    # 普通 SGLang 仍走原来的 /workers 和 /abort_request。
++    abort_function = _resolve_rollout_abort_function(args)
++    if abort_function is not None:
++        await abort_function(args)
+     else:
+-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+-        urls = [worker["url"] for worker in response["workers"]]
+-
+-    logger.info(f"Abort request for {urls}")
+-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+-    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+-    for url, result in zip(urls, abort_results, strict=False):
+-        if isinstance(result, BaseException):
+-            logger.warning(f"Failed to abort worker at {url}: {result}")
++
++    # 🚨 ===== [YULIN-MOD] END =====
++
++        if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
++            response = await get(
++                f"http://{args.sglang_router_ip}:"
++                f"{args.sglang_router_port}/list_workers"
++            )
++            urls = response["urls"]
++        else:
++            response = await get(
++                f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers"
++            )
++            urls = [worker["url"] for worker in response["workers"]]
++
++        logger.info(f"Abort request for {urls}")
++        abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
++        abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
++        for url, result in zip(urls, abort_results, strict=False):
++            if isinstance(result, BaseException):
++                logger.warning(f"Failed to abort worker at {url}: {result}")
+ 
+     # make sure all the pending tasks are finished
+     count = 0
+diff --git a/relax/utils/arguments.py b/relax/utils/arguments.py
+index 6dfc425..f5f9f05 100644
+--- a/relax/utils/arguments.py
++++ b/relax/utils/arguments.py
+@@ -319,6 +319,63 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                 default=False,
+             )
+ 
++            # 🚨 ===== [YULIN-MOD] START: 暴露 LoRA 训练和热推所需的命令行参数 =====
++            
++            # 总开关：是否启用 Megatron-Bridge LoRA。
++            parser.add_argument(
++                "--lora-enable",
++                action="store_true",
++                default=False,
++                help="启用 Megatron-Bridge 的 LoRA，对 thinker 的注意力做参数高效微调。",
++            )
++            # LoRA 低秩维度 r。
++            parser.add_argument(
++                "--lora-rank",
++                type=int,
++                default=32,
++                help="LoRA 低秩维度（Megatron-Bridge LoRA 的 dim）。",
++            )
++            # LoRA 缩放系数 alpha。
++            parser.add_argument(
++                "--lora-alpha",
++                type=float,
++                default=32.0,
++                help="LoRA 缩放系数 alpha。",
++            )
++            # adapter 分支 dropout。
++            parser.add_argument(
++                "--lora-dropout",
++                type=float,
++                default=0.0,
++                help="LoRA dropout。",
++            )
++            # 指定哪些 Megatron 模块挂 LoRA。
++            parser.add_argument(
++                "--lora-target-modules",
++                type=str,
++                nargs="*",
++                # 默认只匹配 Thinker language_model 的注意力投影。
++                # linear_qkv 是融合的 Q/K/V 投影；
++                # linear_proj 对应注意力输出投影。
++                default=["*language_model*linear_qkv", "*language_model*linear_proj"],
++                help=(
++                    "LoRA 目标模块（Megatron 命名）。默认用通配符限定到 thinker 的 language_model，"
++                    "避免误挂到 audio/vision 塔。如需扩到 MLP 可加 *language_model*linear_fc1/2。"
++                ),
++            )
++            # adapter 在 SGLang 中注册的逻辑名称。
++            parser.add_argument(
++                "--lora-name",
++                type=str,
++                default="policy",
++                help=(
++                    "热推到 sglang 的 adapter 名（Block 3 推送 + Block 5 rollout 引用同一个名字）。"
++                    "rollout 的 generate 请求会带 lora_path=该名字。"
++                ),
++            )
++
++            # 🚨 ===== [YULIN-MOD] END =====
++
+             return parser
+ 
+         # rollout
+diff --git a/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-noffload.sh b/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-noffload.sh
+new file mode 100644
+index 0000000..3fde09f
+--- /dev/null
++++ b/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-noffload.sh
+@@ -0,0 +1,215 @@
++#!/bin/bash
++
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: 在训练和 rollout 权重常驻 GPU 时验证 LoRA 链路 =====
++
++# Qwen3-Omni-30B-A3B thinker-LoRA「启动冒烟」脚本(colocate,4 卡)。
++#
++# 目的:只验证 Block 3/4/5 这条 LoRA 链路在真实 Relax 运行时能不能跑通,
++#       不看训练效果。跑 2 个 rollout step 就停。
++#
++#   - Block 4:--lora-enable -> Megatron-Bridge PEFT 给 thinker 挂 LoRA,
++#              并由 _assert_lora_attached 在建优化器前自检 adapter 挂没挂对。
++#   - Block 3:每次 update_weights 用 UpdateLoRAFromTensor 只把 adapter
++#              热推给 sglang(看 sglang 日志 "load Lora adapter from tensors")。
++#   - Block 5:rollout 的 generate 请求带 lora_path=policy(看首轮 rollout 不报 503)。
++#
++# 确前提:4×A100-80GB 或 4×H100。30B-A3B bf16≈60GB,colocate TP4 后每卡基座≈15GB。
++#
++# 用法(在 Relax 仓库根目录):
++#   MODEL_DIR=/path/to/models DATA=/path/to/toy.jsonl \
++#   bash scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-smoke.sh
++
++set -ex
++set -o pipefail
++
++now=$(date "+%Y-%m-%d-%H:%M:%S")
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
++if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
++    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
++fi
++source "${MODEL_CONFIG_DIR}/qwen3-omni-30B-A3B.sh"
++
++PROJECT_NAME="${PROJECT_NAME:=Relax/dev/omni-lora-smoke}"
++EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
++
++# 冒烟:只跑 2 个 rollout step 就停。
++NUM_ROLLOUT="${NUM_ROLLOUT:=2}"
++
++# HF_CKPT 可由外部(如 Modal)覆盖,直接指向已缓存的权重目录。
++HF_CKPT="${HF_CKPT:-${EXP_DIR}/Qwen3-Omni-30B-A3B-Instruct}"
++CKPT_ARGS=(
++   --hf-checkpoint ${HF_CKPT}
++   --ref-load ${HF_CKPT}
++   --megatron-to-hf-mode bridge
++)
++
++# 存档/续跑（正式实验用，抗 Modal 抢占）：SAVE_DIR 设了就开。
++# --save 与 --load 指向同一目录：首跑空目录→从 hf-checkpoint 全新；
++# 被抢重试→该目录已有 Megatron ckpt→自动从上次 rollout_id 续跑（含 optimizer）。
++if [ -n "${SAVE_DIR:-}" ]; then
++   CKPT_ARGS+=(
++      --save "${SAVE_DIR}"
++      --load "${SAVE_DIR}"
++      --save-interval "${SAVE_INTERVAL:-5}"
++      --max-actor-ckpt-to-keep "${MAX_CKPT_KEEP:-1}"
++      # 续训时若改了总步数（如 40→100），checkpoint 里 LR 调度器的
++      # total-iters 与新配置不符会触发 Megatron 断言。此 flag 让调度器
++      # 用命令行新值覆盖 checkpoint 值；lr-decay-style=constant 下对 LR 无影响。
++      --override-opt_param-scheduler
++   )
++fi
++
++SYSTEM_PROMPT="You are a helpful assistant."
++
++# 冒烟用一份很小的 toy 数据即可(几十条就够触发 rollout/train/sync)。
++PROMPT_SET=${DATA:-${EXP_DIR}/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl}
++
++ROLLOUT_ARGS=(
++   --prompt-data ${PROMPT_SET}
++   --input-key prompt
++   --label-key label
++   --apply-chat-template
++   --rollout-shuffle
++
++   --rm-type ${RM_TYPE:-multiple_choice}
++   --num-rollout ${NUM_ROLLOUT}
++   --rollout-batch-size ${ROLLOUT_BATCH:-8}
++   --n-samples-per-prompt ${N_SAMPLES:-4}
++   --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN:-256}
++   ${ROLLOUT_MAX_PROMPT_LEN:+--rollout-max-prompt-len ${ROLLOUT_MAX_PROMPT_LEN}}
++   --rollout-temperature ${ROLLOUT_TEMPERATURE:-0.8}
++   --global-batch-size ${GLOBAL_BATCH:-32}
++   --balance-data
++   --use-fault-tolerance
++   --system-prompt "${SYSTEM_PROMPT}"
++)
++
++# Qwen3-Omni 的 chat_template 在 processor(chat_template.json)里，裸 AutoTokenizer
++# 在 transformers 5.x 下加载不到 -> tokenizer.chat_template 为空。冒烟时由外部
++# (Modal) 把模板 JSON 注入 CHAT_TEMPLATE_KWARGS，显式喂给 apply_chat_template。
++if [ -n "${CHAT_TEMPLATE_KWARGS:-}" ]; then
++   ROLLOUT_ARGS+=(--apply-chat-template-kwargs "${CHAT_TEMPLATE_KWARGS}")
++fi
++
++# multimodal-keys 可由外部覆盖;若为空串则走纯文本(Modal 冒烟最快路径)。
++# ${VAR-default}(无冒号):仅当 VAR 未设置时填默认;显式空串会被保留。
++MULTIMODAL_KEYS="${MULTIMODAL_KEYS-'{"image":"image","audio":"audio"}'}"
++if [ -n "${MULTIMODAL_KEYS}" ]; then
++   ROLLOUT_ARGS+=(--multimodal-keys "${MULTIMODAL_KEYS}")
++fi
++
++# 端到端验证(坑23 cpu_backup):设 DUMP_DETAILS 把每个 rollout step 的样本
++# (含 tokens + 解码文本)dump 成 .pt,跑后解码判断 base 在 offload/resume 后是否存活。
++if [ -n "${DUMP_DETAILS:-}" ]; then
++   ROLLOUT_ARGS+=(--dump-details "${DUMP_DETAILS}")
++fi
++
++# ---- LoRA(Block 4:训练侧挂 adapter;Block 5:rollout 引用同名 adapter)----
++# lora-target-modules 用默认值(*language_model*linear_qkv / linear_proj),
++# 已由代码三方证据确认能命中 thinker 且不误挂 audio/vision,故此处不显式写。
++LORA_ARGS=(
++   --lora-enable
++   --lora-rank 16
++   --lora-alpha 32
++   --lora-dropout 0.0
++   --lora-name policy
++)
++
++# ---- GRPO:冒烟关掉 KL,省掉独立 reference,4 卡更宽裕 ----
++GRPO_ARGS=(
++   --advantage-estimator grpo
++   --kl-loss-coef 0.0
++   --entropy-coef 0.00
++   --eps-clip 0.2
++   --eps-clip-high 0.28
++)
++
++OPTIMIZER_ARGS=(
++   --optimizer adam
++   --lr ${LR:-1e-5}
++   --lr-decay-style constant
++   --weight-decay 0.0
++   --adam-beta1 0.9
++   --adam-beta2 0.95
++   --optimizer-cpu-offload
++   --use-precision-aware-optimizer
++)
++
++# ---- sglang:开 LoRA(这些 flag 由 ServerArgs.add_cli_args 自动透传)----
++# sglang 侧 target 用 Block 3 转换器产出的融合命名:qkv_proj / o_proj。
++# max-lora-rank 必须 >= 训练侧 lora-rank。
++SGLANG_ARGS=(
++   --rollout-num-gpus-per-engine 4
++   # 2a(不 offload)：Megatron base 常驻，需给它腾显存，故调低 sglang 静态占比。
++   # 可由 SGLANG_MEM_FRACTION 覆盖以便调参；默认 0.55。
++   --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION:-0.55}
++   --sglang-enable-lora
++   --sglang-max-lora-rank 16
++   --sglang-max-loras-per-batch 1
++   --sglang-lora-target-modules qkv_proj o_proj
++   # 本地注入的 sglang 较新，要求 flashinfer>=0.6.11，但 slime 镜像只有 0.6.3。
++   # 冒烟只验 LoRA 链路，不依赖 flashinfer attention 性能 -> 切 triton backend 绕开
++   # 版本断言（配合 SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 跳过 sgl-kernel 断言）。
++   --sglang-attention-backend triton
++   # 本地 sglang 的 custom all-reduce v2 内核（tvm_ffi/jit_kernel）与镜像 sgl-kernel
++   # 二进制不匹配，TP=4 在 cuda graph 捕获时崩 "CUDA error: invalid argument"。
++   # 冒烟禁掉 cuda graph + custom all-reduce（退回 NCCL），不影响 LoRA 链路验证。
++   --sglang-disable-cuda-graph
++   --sglang-disable-custom-all-reduce
++)
++
++# ---- 并行度:colocate 4 卡,TP4 / EMP4(128%4=0) / PP1 ----
++# PEFT 安全默认:关 sequence-parallel 和 recompute(曾出现 recompute+SP+LoRA
++# 导致 lora_B backward NaN 的兼容性问题,NVIDIA Megatron-Bridge VLM PEFT
++# recipe 也显式关闭这两项)。
++PERF_ARGS=(
++   --train-backend megatron
++   --tensor-model-parallel-size 4
++   --pipeline-model-parallel-size 1
++   --context-parallel-size 1
++   --expert-model-parallel-size 4
++   --expert-tensor-parallel-size 1
++   --micro-batch-size 1
++)
++
++WANDB_ARGS=(
++   --tb-project-name ${PROJECT_NAME}
++   --tb-experiment-name qwen3-omni-lora-smoke-${now}
++)
++
++MISC_ARGS=(
++   --attention-dropout 0.0
++   --hidden-dropout 0.0
++   --accumulate-allreduce-grads-in-fp32
++   --attention-softmax-in-fp32
++   --attention-backend flash
++   --no-rope-fusion
++)
++
++mkdir -p log
++ray job submit ${RAY_NO_WAIT:+--no-wait} --address=${RAY_ADDRESS:-"http://127.0.0.1:8265"} \
++   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
++   ${RUNTIME_ENV_JSON:+--runtime-env-json="${RUNTIME_ENV_JSON}"} \
++   -- python3 -m relax.entrypoints.train \
++   --resource '{"actor": [1, 4], "rollout": [1, 4]}' \
++   --max-staleness 0 \
++   --num-data-storage-units 1 \
++   --colocate \
++   --no-offload-train \
++   --no-offload-rollout \
++   --use-health-check \
++   "${MODEL_ARGS[@]}" \
++   "${CKPT_ARGS[@]}" \
++   "${ROLLOUT_ARGS[@]}" \
++   "${LORA_ARGS[@]}" \
++   "${OPTIMIZER_ARGS[@]}" \
++   "${GRPO_ARGS[@]}" \
++   "${WANDB_ARGS[@]}" \
++   "${PERF_ARGS[@]}" \
++   "${SGLANG_ARGS[@]}" \
++   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-omni-lora-smoke-${now}.log
++
++# 🚨 ===== [YULIN-MOD] END =====
+diff --git a/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-omni-simul.sh b/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-omni-simul.sh
+new file mode 100644
+index 0000000..579aae9
+--- /dev/null
++++ b/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-omni-simul.sh
+@@ -0,0 +1,206 @@
++#!/bin/bash
++
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: (omni) 启动 Thinker LoRA、GRPO 和外部 SGLang-Omni 多轮同传训练 =====
++
++# 这份脚本是独立的 SGLang-Omni 训练入口，
++# 不会替换或删除 Relax 原有的标准 SGLang 同传训练脚本。
++#
++# 它验证的主要链路是：
++#
++# Megatron TP4/EP4
++# → 在 4 张 GPU 上训练 Qwen3-Omni Thinker LoRA
++# → 导出当前 LoRA tensor
++# → 通过 HTTP 热更新到外部 SGLang-Omni Thinker TP4
++# → 使用 messages + metadata.audios 执行多轮音频 rollout
++# → 取回 Thinker 文本 token 和 token logprob
++# → 使用 --rm-type 指定的 reward 计算每条 Sample 的奖励
++# → GRPO 根据 reward 更新 Thinker LoRA
++#
++# Actor 和 rollout 使用：
++#
++# --resource '{"actor": [1, 4], "rollout": [1, 4]}'
++# --colocate
++#
++# 因此 Megatron TP4 和 SGLang-Omni Thinker TP4
++# 会复用同一组 4 张 GPU，而不是各自申请 4 张卡。
++#
++# Relax 通过下面这些参数连接已经启动好的 Omni router：
++#
++# --rollout-external
++# --rollout-external-engine-addrs
++# --sglang-router-ip
++# --sglang-router-port
++#
++# Relax 这里只创建一个 SGLangOmniEngine Ray proxy，
++# 不会在 Ray actor 内重新启动一整套 Omni pipeline。
++# 外部 Omni router、Thinker、Talker 和 Code2Wav 必须由 launcher
++# 或测试脚本提前启动。
++#
++# 当前训练目标仍然是 Thinker 文本：
++#
++# - LoRA 只训练并热更新到 thinker；
++# - rollout 请求使用 output_modalities=["text"]；
++# - reward 根据 Thinker 文本输出计算；
++# - Talker 和 Code2Wav 可以用于训练后的语音生成验证，
++#   但尚未进入 reward 或反向训练链路。
++#
++# --rollout-function-path 使用 sglang_omni_rollout.generate_rollout，
++# 负责选择 SGLangOmniEngine 和 Omni abort hook。
++#
++# --custom-generate-function-path 使用 omni_rollout.generate，
++# 负责把 Relax Sample 转换成 messages、metadata.audios
++# 和 stage_params.thinker.lora_name，再把 Omni 返回的文本 token、
++# logprob 和多模态训练特征重新写回 Sample。
++
++set -ex
++set -o pipefail
++
++: "${OMNI_ROUTER_HOST:?Set OMNI_ROUTER_HOST to the external SGLang-Omni router host}"
++: "${OMNI_ROUTER_PORT:?Set OMNI_ROUTER_PORT to the external SGLang-Omni router port}"
++
++now=$(date "+%Y-%m-%d-%H:%M:%S")
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
++if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
++    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
++fi
++source "${MODEL_CONFIG_DIR}/qwen3-omni-30B-A3B.sh"
++
++PROJECT_NAME="${PROJECT_NAME:=Relax/dev/omni-lora-omni-simul}"
++EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
++NUM_ROLLOUT="${NUM_ROLLOUT:=2}"
++HF_CKPT="${HF_CKPT:-${EXP_DIR}/Qwen3-Omni-30B-A3B-Instruct}"
++PROMPT_SET=${DATA:-${EXP_DIR}/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl}
++OMNI_ROUTER_ADDR="${OMNI_ROUTER_HOST}:${OMNI_ROUTER_PORT}"
++
++CKPT_ARGS=(
++   --hf-checkpoint "${HF_CKPT}"
++   --ref-load "${HF_CKPT}"
++   --megatron-to-hf-mode bridge
++)
++
++if [ -n "${SAVE_DIR:-}" ]; then
++   CKPT_ARGS+=(
++      --save "${SAVE_DIR}"
++      --load "${SAVE_DIR}"
++      --save-interval "${SAVE_INTERVAL:-5}"
++      --max-actor-ckpt-to-keep "${MAX_CKPT_KEEP:-1}"
++      --override-opt_param-scheduler
++   )
++fi
++
++ROLLOUT_ARGS=(
++   --prompt-data "${PROMPT_SET}"
++   --input-key prompt
++   --label-key label
++   --rollout-shuffle
++   --rm-type "${RM_TYPE:-multiple_choice}"
++   --num-rollout "${NUM_ROLLOUT}"
++   --rollout-batch-size "${ROLLOUT_BATCH:-8}"
++   --n-samples-per-prompt "${N_SAMPLES:-4}"
++   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-256}"
++   --rollout-temperature "${ROLLOUT_TEMPERATURE:-0.8}"
++   --global-batch-size "${GLOBAL_BATCH:-32}"
++   --balance-data
++   --system-prompt "You are a helpful assistant."
++   --multimodal-keys '{"audio":"audio"}'
++   --rollout-function-path relax.engine.rollout.sglang_omni_rollout.generate_rollout
++   --custom-generate-function-path examples.simul_s2tt.omni_rollout.generate
++   --custom-config-path "${CUSTOM_CONFIG_PATH:-${SCRIPT_DIR}/../../../examples/simul_s2tt/config.yaml}"
++)
++
++if [ -n "${ROLLOUT_MAX_PROMPT_LEN:-}" ]; then
++   ROLLOUT_ARGS+=(--rollout-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}")
++fi
++
++LORA_ARGS=(
++   --lora-enable
++   --lora-rank 16
++   --lora-alpha 32
++   --lora-dropout 0.0
++   --lora-name policy
++)
++
++GRPO_ARGS=(
++   --advantage-estimator grpo
++   --kl-loss-coef 0.0
++   --entropy-coef 0.00
++   --eps-clip 0.2
++   --eps-clip-high 0.28
++)
++
++OPTIMIZER_ARGS=(
++   --optimizer adam
++   --lr "${LR:-1e-5}"
++   --lr-decay-style constant
++   --weight-decay 0.0
++   --adam-beta1 0.9
++   --adam-beta2 0.95
++   --optimizer-cpu-offload
++   --use-precision-aware-optimizer
++)
++
++OMNI_ARGS=(
++   --rollout-external
++   --rollout-external-engine-addrs "${OMNI_ROUTER_ADDR}"
++   --sglang-router-ip "${OMNI_ROUTER_HOST}"
++   --sglang-router-port "${OMNI_ROUTER_PORT}"
++   --rollout-num-gpus-per-engine 4
++)
++
++PERF_ARGS=(
++   --train-backend megatron
++   --tensor-model-parallel-size 4
++   --pipeline-model-parallel-size 1
++   --context-parallel-size 1
++   --expert-model-parallel-size 4
++   --expert-tensor-parallel-size 1
++   --micro-batch-size 1
++)
++
++WANDB_ARGS=(
++   --tb-project-name "${PROJECT_NAME}"
++   --tb-experiment-name "qwen3-omni-lora-omni-simul-${now}"
++)
++
++MISC_ARGS=(
++   --attention-dropout 0.0
++   --hidden-dropout 0.0
++   --accumulate-allreduce-grads-in-fp32
++   --attention-softmax-in-fp32
++   --attention-backend flash
++   --no-rope-fusion
++)
++
++HEALTH_ARGS=(
++   --use-health-check
++)
++if [ -n "${MAX_GLOBAL_RESTART:-}" ]; then
++   HEALTH_ARGS+=(--max-global-restart "${MAX_GLOBAL_RESTART}")
++fi
++
++mkdir -p log
++ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" \
++   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
++   ${RUNTIME_ENV_JSON:+--runtime-env-json="${RUNTIME_ENV_JSON}"} \
++   -- python3 -m relax.entrypoints.train \
++   --resource '{"actor": [1, 4], "rollout": [1, 4]}' \
++   --max-staleness 0 \
++   --num-data-storage-units 1 \
++   --colocate \
++   --no-offload-train \
++   --no-offload-rollout \
++   "${HEALTH_ARGS[@]}" \
++   "${MODEL_ARGS[@]}" \
++   "${CKPT_ARGS[@]}" \
++   "${ROLLOUT_ARGS[@]}" \
++   "${LORA_ARGS[@]}" \
++   "${OPTIMIZER_ARGS[@]}" \
++   "${GRPO_ARGS[@]}" \
++   "${PERF_ARGS[@]}" \
++   "${WANDB_ARGS[@]}" \
++   "${OMNI_ARGS[@]}" \
++   "${MISC_ARGS[@]}" 2>&1 | tee "log/qwen3-omni-lora-omni-simul-${now}.log"
++
++# 🚨 ===== [YULIN-MOD] END =====
+\ No newline at end of file
+diff --git a/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-simul.sh b/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-simul.sh
+new file mode 100644
+index 0000000..3ee63fc
+--- /dev/null
++++ b/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-simul.sh
+@@ -0,0 +1,176 @@
++#!/bin/bash
++
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: 启动 LoRA + GRPO + 多轮同传 rollout =====
++
++# Qwen3-Omni-30B-A3B thinker-LoRA 同传（simultaneous S2TT）多轮 rollout 脚本。
++#
++# 与 run-...-omni-lora-smoke.sh 的唯一区别：挂上自定义多轮 generate + 其配置。
++#   - --custom-generate-function-path examples.simul_s2tt.rollout.generate
++#   - --custom-config-path examples/simul_s2tt/config.yaml（max_turns / simul_chunk_ms）
++# 其余（LoRA / GRPO / colocate TP4 / sglang / bleu reward）与 smoke 完全一致：
++# 数据仍是整段音频（切块在 env 里做），reward 仍是整段拼接译文的 BLEU。
++
++set -ex
++set -o pipefail
++
++now=$(date "+%Y-%m-%d-%H:%M:%S")
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
++if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
++    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
++fi
++source "${MODEL_CONFIG_DIR}/qwen3-omni-30B-A3B.sh"
++
++PROJECT_NAME="${PROJECT_NAME:=Relax/dev/omni-lora-simul}"
++EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
++
++NUM_ROLLOUT="${NUM_ROLLOUT:=2}"
++
++HF_CKPT="${HF_CKPT:-${EXP_DIR}/Qwen3-Omni-30B-A3B-Instruct}"
++CKPT_ARGS=(
++   --hf-checkpoint ${HF_CKPT}
++   --ref-load ${HF_CKPT}
++   --megatron-to-hf-mode bridge
++)
++
++if [ -n "${SAVE_DIR:-}" ]; then
++   CKPT_ARGS+=(
++      --save "${SAVE_DIR}"
++      --load "${SAVE_DIR}"
++      --save-interval "${SAVE_INTERVAL:-5}"
++      --max-actor-ckpt-to-keep "${MAX_CKPT_KEEP:-1}"
++      --override-opt_param-scheduler
++   )
++fi
++
++SYSTEM_PROMPT="You are a helpful assistant."
++
++PROMPT_SET=${DATA:-${EXP_DIR}/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl}
++
++ROLLOUT_ARGS=(
++   --prompt-data ${PROMPT_SET}
++   --input-key prompt
++   --label-key label
++   --apply-chat-template
++   --rollout-shuffle
++
++   --rm-type ${RM_TYPE:-multiple_choice}
++   --num-rollout ${NUM_ROLLOUT}
++   --rollout-batch-size ${ROLLOUT_BATCH:-8}
++   --n-samples-per-prompt ${N_SAMPLES:-4}
++   --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN:-256}
++   ${ROLLOUT_MAX_PROMPT_LEN:+--rollout-max-prompt-len ${ROLLOUT_MAX_PROMPT_LEN}}
++   --rollout-temperature ${ROLLOUT_TEMPERATURE:-0.8}
++   --global-batch-size ${GLOBAL_BATCH:-32}
++   --balance-data
++   --use-fault-tolerance
++   --system-prompt "${SYSTEM_PROMPT}"
++)
++
++if [ -n "${CHAT_TEMPLATE_KWARGS:-}" ]; then
++   ROLLOUT_ARGS+=(--apply-chat-template-kwargs "${CHAT_TEMPLATE_KWARGS}")
++fi
++
++MULTIMODAL_KEYS="${MULTIMODAL_KEYS-'{"image":"image","audio":"audio"}'}"
++if [ -n "${MULTIMODAL_KEYS}" ]; then
++   ROLLOUT_ARGS+=(--multimodal-keys "${MULTIMODAL_KEYS}")
++fi
++
++# ---- 同传专属：自定义多轮 generate + 其配置（唯一相对 smoke 新增的部分）----
++SIMUL_ARGS=(
++   --custom-generate-function-path examples.simul_s2tt.rollout.generate
++   --custom-config-path "${SCRIPT_DIR}/../../../examples/simul_s2tt/config.yaml"
++)
++
++LORA_ARGS=(
++   --lora-enable
++   --lora-rank 16
++   --lora-alpha 32
++   --lora-dropout 0.0
++   --lora-name policy
++)
++
++GRPO_ARGS=(
++   --advantage-estimator grpo
++   --kl-loss-coef 0.0
++   --entropy-coef 0.00
++   --eps-clip 0.2
++   --eps-clip-high 0.28
++)
++
++OPTIMIZER_ARGS=(
++   --optimizer adam
++   --lr ${LR:-1e-5}
++   --lr-decay-style constant
++   --weight-decay 0.0
++   --adam-beta1 0.9
++   --adam-beta2 0.95
++   --optimizer-cpu-offload
++   --use-precision-aware-optimizer
++)
++
++SGLANG_ARGS=(
++   --rollout-num-gpus-per-engine 4
++     # 2a(不 offload)：Megatron base 常驻，需给它腾显存，故调低 sglang 静态占比。
++   # 可由 SGLANG_MEM_FRACTION 覆盖以便调参；默认 0.55（与 noffload 脚本一致）。
++   --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION:-0.55}
++   --sglang-enable-lora
++   --sglang-max-lora-rank 16
++   --sglang-max-loras-per-batch 1
++   --sglang-lora-target-modules qkv_proj o_proj
++   --sglang-attention-backend triton
++   --sglang-disable-cuda-graph
++   --sglang-disable-custom-all-reduce
++) 
++
++PERF_ARGS=(
++   --train-backend megatron
++   --tensor-model-parallel-size 4
++   --pipeline-model-parallel-size 1
++   --context-parallel-size 1
++   --expert-model-parallel-size 4
++   --expert-tensor-parallel-size 1
++   --micro-batch-size 1
++)
++
++WANDB_ARGS=(
++   --tb-project-name ${PROJECT_NAME}
++   --tb-experiment-name qwen3-omni-lora-simul-${now}
++)
++
++MISC_ARGS=(
++   --attention-dropout 0.0
++   --hidden-dropout 0.0
++   --accumulate-allreduce-grads-in-fp32
++   --attention-softmax-in-fp32
++   --attention-backend flash
++   --no-rope-fusion
++)
++
++mkdir -p log
++ray job submit ${RAY_NO_WAIT:+--no-wait} --address=${RAY_ADDRESS:-"http://127.0.0.1:8265"} \
++   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
++   ${RUNTIME_ENV_JSON:+--runtime-env-json="${RUNTIME_ENV_JSON}"} \
++   -- python3 -m relax.entrypoints.train \
++   --resource '{"actor": [1, 4], "rollout": [1, 4]}' \
++   --max-staleness 0 \
++   --num-data-storage-units 1 \
++   --colocate \
++   --no-offload-train \
++   --no-offload-rollout \
++   --use-health-check \
++   "${MODEL_ARGS[@]}" \
++   "${CKPT_ARGS[@]}" \
++   "${ROLLOUT_ARGS[@]}" \
++   "${SIMUL_ARGS[@]}" \
++   "${LORA_ARGS[@]}" \
++   "${OPTIMIZER_ARGS[@]}" \
++   "${GRPO_ARGS[@]}" \
++   "${WANDB_ARGS[@]}" \
++   "${PERF_ARGS[@]}" \
++   "${SGLANG_ARGS[@]}" \
++   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-omni-lora-simul-${now}.log
++
++# 🚨 ===== [YULIN-MOD] END =====
+diff --git a/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-smoke.sh b/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-smoke.sh
+new file mode 100644
+index 0000000..609f700
+--- /dev/null
++++ b/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-smoke.sh
+@@ -0,0 +1,211 @@
++#!/bin/bash
++
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++# 🚨 ===== [YULIN-MOD] START: 验证 LoRA 挂载、训练、热推和 rollout 的完整链路 =====
++
++# Qwen3-Omni-30B-A3B thinker-LoRA「启动冒烟」脚本(colocate,4 卡)。
++#
++# 目的:只验证 Block 3/4/5 这条 LoRA 链路在真实 Relax 运行时能不能跑通,
++#       不看训练效果。跑 2 个 rollout step 就停。
++#
++#   - Block 4:--lora-enable -> Megatron-Bridge PEFT 给 thinker 挂 LoRA,
++#              并由 _assert_lora_attached 在建优化器前自检 adapter 挂没挂对。
++#   - Block 3:每次 update_weights 用 UpdateLoRAFromTensor 只把 adapter
++#              热推给 sglang(看 sglang 日志 "load Lora adapter from tensors")。
++#   - Block 5:rollout 的 generate 请求带 lora_path=policy(看首轮 rollout 不报 503)。
++#
++# 确前提:4×A100-80GB 或 4×H100。30B-A3B bf16≈60GB,colocate TP4 后每卡基座≈15GB。
++#
++# 用法(在 Relax 仓库根目录):
++#   MODEL_DIR=/path/to/models DATA=/path/to/toy.jsonl \
++#   bash scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-smoke.sh
++
++set -ex
++set -o pipefail
++
++now=$(date "+%Y-%m-%d-%H:%M:%S")
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
++if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
++    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
++fi
++source "${MODEL_CONFIG_DIR}/qwen3-omni-30B-A3B.sh"
++
++PROJECT_NAME="${PROJECT_NAME:=Relax/dev/omni-lora-smoke}"
++EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
++
++# 冒烟:只跑 2 个 rollout step 就停。
++NUM_ROLLOUT="${NUM_ROLLOUT:=2}"
++
++# HF_CKPT 可由外部(如 Modal)覆盖,直接指向已缓存的权重目录。
++HF_CKPT="${HF_CKPT:-${EXP_DIR}/Qwen3-Omni-30B-A3B-Instruct}"
++CKPT_ARGS=(
++   --hf-checkpoint ${HF_CKPT}
++   --ref-load ${HF_CKPT}
++   --megatron-to-hf-mode bridge
++)
++
++# 存档/续跑（正式实验用，抗 Modal 抢占）：SAVE_DIR 设了就开。
++# --save 与 --load 指向同一目录：首跑空目录→从 hf-checkpoint 全新；
++# 被抢重试→该目录已有 Megatron ckpt→自动从上次 rollout_id 续跑（含 optimizer）。
++if [ -n "${SAVE_DIR:-}" ]; then
++   CKPT_ARGS+=(
++      --save "${SAVE_DIR}"
++      --load "${SAVE_DIR}"
++      --save-interval "${SAVE_INTERVAL:-5}"
++      --max-actor-ckpt-to-keep "${MAX_CKPT_KEEP:-1}"
++      # 续训时若改了总步数（如 40→100），checkpoint 里 LR 调度器的
++      # total-iters 与新配置不符会触发 Megatron 断言。此 flag 让调度器
++      # 用命令行新值覆盖 checkpoint 值；lr-decay-style=constant 下对 LR 无影响。
++      --override-opt_param-scheduler
++   )
++fi
++
++SYSTEM_PROMPT="You are a helpful assistant."
++
++# 冒烟用一份很小的 toy 数据即可(几十条就够触发 rollout/train/sync)。
++PROMPT_SET=${DATA:-${EXP_DIR}/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl}
++
++ROLLOUT_ARGS=(
++   --prompt-data ${PROMPT_SET}
++   --input-key prompt
++   --label-key label
++   --apply-chat-template
++   --rollout-shuffle
++
++   --rm-type ${RM_TYPE:-multiple_choice}
++   --num-rollout ${NUM_ROLLOUT}
++   --rollout-batch-size ${ROLLOUT_BATCH:-8}
++   --n-samples-per-prompt ${N_SAMPLES:-4}
++   --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN:-256}
++   ${ROLLOUT_MAX_PROMPT_LEN:+--rollout-max-prompt-len ${ROLLOUT_MAX_PROMPT_LEN}}
++   --rollout-temperature ${ROLLOUT_TEMPERATURE:-0.8}
++   --global-batch-size ${GLOBAL_BATCH:-32}
++   --balance-data
++   --use-fault-tolerance
++   --system-prompt "${SYSTEM_PROMPT}"
++)
++
++# Qwen3-Omni 的 chat_template 在 processor(chat_template.json)里，裸 AutoTokenizer
++# 在 transformers 5.x 下加载不到 -> tokenizer.chat_template 为空。冒烟时由外部
++# (Modal) 把模板 JSON 注入 CHAT_TEMPLATE_KWARGS，显式喂给 apply_chat_template。
++if [ -n "${CHAT_TEMPLATE_KWARGS:-}" ]; then
++   ROLLOUT_ARGS+=(--apply-chat-template-kwargs "${CHAT_TEMPLATE_KWARGS}")
++fi
++
++# multimodal-keys 可由外部覆盖;若为空串则走纯文本(Modal 冒烟最快路径)。
++# ${VAR-default}(无冒号):仅当 VAR 未设置时填默认;显式空串会被保留。
++MULTIMODAL_KEYS="${MULTIMODAL_KEYS-'{"image":"image","audio":"audio"}'}"
++if [ -n "${MULTIMODAL_KEYS}" ]; then
++   ROLLOUT_ARGS+=(--multimodal-keys "${MULTIMODAL_KEYS}")
++fi
++
++# 端到端验证(坑23 cpu_backup):设 DUMP_DETAILS 把每个 rollout step 的样本
++# (含 tokens + 解码文本)dump 成 .pt,跑后解码判断 base 在 offload/resume 后是否存活。
++if [ -n "${DUMP_DETAILS:-}" ]; then
++   ROLLOUT_ARGS+=(--dump-details "${DUMP_DETAILS}")
++fi
++
++# ---- LoRA(Block 4:训练侧挂 adapter;Block 5:rollout 引用同名 adapter)----
++# lora-target-modules 用默认值(*language_model*linear_qkv / linear_proj),
++# 已由代码三方证据确认能命中 thinker 且不误挂 audio/vision,故此处不显式写。
++LORA_ARGS=(
++   --lora-enable
++   --lora-rank 16
++   --lora-alpha 32
++   --lora-dropout 0.0
++   --lora-name policy
++)
++
++# ---- GRPO:冒烟关掉 KL,省掉独立 reference,4 卡更宽裕 ----
++GRPO_ARGS=(
++   --advantage-estimator grpo
++   --kl-loss-coef 0.0
++   --entropy-coef 0.00
++   --eps-clip 0.2
++   --eps-clip-high 0.28
++)
++
++OPTIMIZER_ARGS=(
++   --optimizer adam
++   --lr ${LR:-1e-5}
++   --lr-decay-style constant
++   --weight-decay 0.0
++   --adam-beta1 0.9
++   --adam-beta2 0.95
++   --optimizer-cpu-offload
++   --use-precision-aware-optimizer
++)
++
++# ---- sglang:开 LoRA(这些 flag 由 ServerArgs.add_cli_args 自动透传)----
++# sglang 侧 target 用 Block 3 转换器产出的融合命名:qkv_proj / o_proj。
++# max-lora-rank 必须 >= 训练侧 lora-rank。
++SGLANG_ARGS=(
++   --rollout-num-gpus-per-engine 4
++   --sglang-mem-fraction-static 0.7
++   --sglang-enable-lora
++   --sglang-max-lora-rank 16
++   --sglang-max-loras-per-batch 1
++   --sglang-lora-target-modules qkv_proj o_proj
++   # 本地注入的 sglang 较新，要求 flashinfer>=0.6.11，但 slime 镜像只有 0.6.3。
++   # 冒烟只验 LoRA 链路，不依赖 flashinfer attention 性能 -> 切 triton backend 绕开
++   # 版本断言（配合 SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 跳过 sgl-kernel 断言）。
++   --sglang-attention-backend triton
++   # 本地 sglang 的 custom all-reduce v2 内核（tvm_ffi/jit_kernel）与镜像 sgl-kernel
++   # 二进制不匹配，TP=4 在 cuda graph 捕获时崩 "CUDA error: invalid argument"。
++   # 冒烟禁掉 cuda graph + custom all-reduce（退回 NCCL），不影响 LoRA 链路验证。
++   --sglang-disable-cuda-graph
++   --sglang-disable-custom-all-reduce
++)
++
++# ---- 并行度:colocate 4 卡,TP4 / EMP4(128%4=0) / PP1 ----
++# PEFT 安全默认:关 sequence-parallel 和 recompute(曾出现 recompute+SP+LoRA
++# 导致 lora_B backward NaN 的兼容性问题,NVIDIA Megatron-Bridge VLM PEFT
++# recipe 也显式关闭这两项)。
++PERF_ARGS=(
++   --train-backend megatron
++   --tensor-model-parallel-size 4
++   --pipeline-model-parallel-size 1
++   --context-parallel-size 1
++   --expert-model-parallel-size 4
++   --expert-tensor-parallel-size 1
++   --micro-batch-size 1
++)
++
++WANDB_ARGS=(
++   --tb-project-name ${PROJECT_NAME}
++   --tb-experiment-name qwen3-omni-lora-smoke-${now}
++)
++
++MISC_ARGS=(
++   --attention-dropout 0.0
++   --hidden-dropout 0.0
++   --accumulate-allreduce-grads-in-fp32
++   --attention-softmax-in-fp32
++   --attention-backend flash
++   --no-rope-fusion
++)
++
++mkdir -p log
++ray job submit ${RAY_NO_WAIT:+--no-wait} --address=${RAY_ADDRESS:-"http://127.0.0.1:8265"} \
++   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
++   ${RUNTIME_ENV_JSON:+--runtime-env-json="${RUNTIME_ENV_JSON}"} \
++   -- python3 -m relax.entrypoints.train \
++   --resource '{"actor": [1, 4], "rollout": [1, 4]}' \
++   --max-staleness 0 \
++   --num-data-storage-units 1 \
++   --colocate \
++   --use-health-check \
++   "${MODEL_ARGS[@]}" \
++   "${CKPT_ARGS[@]}" \
++   "${ROLLOUT_ARGS[@]}" \
++   "${LORA_ARGS[@]}" \
++   "${OPTIMIZER_ARGS[@]}" \
++   "${GRPO_ARGS[@]}" \
++   "${WANDB_ARGS[@]}" \
++   "${PERF_ARGS[@]}" \
++   "${SGLANG_ARGS[@]}" \
++   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-omni-lora-smoke-${now}.log
++
++# 🚨 ===== [YULIN-MOD] END =====
+diff --git a/tests/backends/sglang_omni/test_omni_engine.py b/tests/backends/sglang_omni/test_omni_engine.py
+new file mode 100644
+index 0000000..1a38d6b
+--- /dev/null
++++ b/tests/backends/sglang_omni/test_omni_engine.py
+@@ -0,0 +1,111 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++from types import SimpleNamespace
++
++import pytest
++
++from relax.backends.sglang_omni.omni_engine import SGLangOmniEngine
++
++
++def _args(**overrides) -> SimpleNamespace:
++    values = {
++        "rollout_external": True,
++        "rollout_external_engine_addrs": ["omni.example:30000"],
++        "fully_async": False,
++        "offload_rollout": False,
++    }
++    values.update(overrides)
++    return SimpleNamespace(**values)
++
++
++def test_omni_engine_init_uses_health_without_router_registration(monkeypatch) -> None:
++    calls: list[tuple[str, float]] = []
++
++    class Response:
++        def raise_for_status(self):
++            return None
++
++    monkeypatch.setattr(
++        "relax.backends.sglang_omni.omni_engine.requests.get",
++        lambda url, timeout: calls.append((url, timeout)) or Response(),
++    )
++    engine = SGLangOmniEngine(_args(), rank=0)
++
++    engine.init(
++        dist_init_addr="omni.example:30000",
++        port=30000,
++        nccl_port=None,
++        host="omni.example",
++        router_ip="omni.example",
++        router_port=30000,
++    )
++
++    assert engine.get_url() == "http://omni.example:30000"
++    assert calls == [
++        ("http://omni.example:30000/health", 10),
++        ("http://omni.example:30000/model_info", 10),
++    ]
++
++
++@pytest.mark.parametrize(
++    ("overrides", "message"),
++    [
++        ({"rollout_external": False}, "--rollout-external"),
++        ({"fully_async": True}, "--fully-async"),
++        ({"offload_rollout": True}, "offload"),
++        ({"rollout_external_engine_addrs": []}, "exactly one"),
++        (
++            {"rollout_external_engine_addrs": ["one:1", "two:2"]},
++            "exactly one",
++        ),
++    ],
++)
++def test_omni_engine_rejects_unsupported_modes(overrides, message) -> None:
++    engine = SGLangOmniEngine(_args(**overrides), rank=0)
++
++    with pytest.raises(ValueError, match=message):
++        engine._validate_mode()
++
++
++def test_omni_engine_flush_and_tensor_load_use_admin_post(monkeypatch) -> None:
++    calls: list[tuple[str, dict]] = []
++
++    class Response:
++        def raise_for_status(self):
++            return None
++
++        def json(self):
++            return {"success": True}
++
++    monkeypatch.setattr(
++        "relax.backends.sglang.sglang_engine.requests.post",
++        lambda url, json: calls.append((url, json)) or Response(),
++    )
++    engine = SGLangOmniEngine(_args(), rank=0)
++    engine.node_rank = 0
++    engine.server_host = "omni.example"
++    engine.server_port = 30000
++    payload = {
++        "lora_name": "policy",
++        "serialized_tensors": "encoded",
++        "config_dict": {"peft_type": "LORA"},
++        "load_format": "flattened_bucket",
++    }
++
++    assert engine.flush_cache() == {"success": True}
++    assert (
++        engine.load_lora_adapter_from_tensors(
++            lora_name=payload["lora_name"],
++            serialized_tensors=payload["serialized_tensors"],
++            config_dict=payload["config_dict"],
++            load_format=payload["load_format"],
++        )
++        == {"success": True}
++    )
++    assert calls == [
++        ("http://omni.example:30000/flush_cache", {}),
++        (
++            "http://omni.example:30000/load_lora_adapter_from_tensors",
++            payload | {"pinned": False},
++        ),
++    ]
+diff --git a/tests/distributed/ray/test_rollout_engine_selection.py b/tests/distributed/ray/test_rollout_engine_selection.py
+new file mode 100644
+index 0000000..1f3fab0
+--- /dev/null
++++ b/tests/distributed/ray/test_rollout_engine_selection.py
+@@ -0,0 +1,48 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++from types import SimpleNamespace
++
++import pytest
++
++from relax.backends.sglang.sglang_engine import SGLangEngine
++from relax.backends.sglang_omni.omni_engine import SGLangOmniEngine
++from relax.distributed.ray.rollout import (
++    _resolve_rollout_abort_function,
++    _resolve_rollout_engine_class,
++)
++from relax.engine.rollout import sglang_omni_rollout
++
++
++def test_standard_rollout_keeps_standard_sglang_engine() -> None:
++    args = SimpleNamespace(
++        rollout_function_path="relax.engine.rollout.sglang_rollout.generate_rollout"
++    )
++
++    assert _resolve_rollout_engine_class(args) is SGLangEngine
++    assert _resolve_rollout_abort_function(args) is None
++
++
++def test_omni_rollout_selects_independent_omni_engine() -> None:
++    args = SimpleNamespace(
++        rollout_function_path=(
++            "relax.engine.rollout.sglang_omni_rollout.generate_rollout"
++        )
++    )
++
++    assert _resolve_rollout_engine_class(args) is SGLangOmniEngine
++    assert (
++        _resolve_rollout_abort_function(args)
++        is sglang_omni_rollout.abort_rollout
++    )
++
++
++def test_invalid_engine_marker_fails_clearly(monkeypatch) -> None:
++    module = SimpleNamespace(ROLLOUT_ENGINE_CLASS="not-a-class")
++    monkeypatch.setattr(
++        "relax.distributed.ray.rollout.importlib.import_module",
++        lambda _: module,
++    )
++    args = SimpleNamespace(rollout_function_path="custom.rollout.generate")
++
++    with pytest.raises(ValueError, match="fully qualified class path"):
++        _resolve_rollout_engine_class(args)
+diff --git a/tests/engine/rollout/test_sglang_omni_rollout.py b/tests/engine/rollout/test_sglang_omni_rollout.py
+new file mode 100644
+index 0000000..00438be
+--- /dev/null
++++ b/tests/engine/rollout/test_sglang_omni_rollout.py
+@@ -0,0 +1,586 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++import asyncio
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from examples.simul_s2tt import omni_rollout
++from examples.simul_s2tt.rollout import _run_inference_step as standard_inference_step
++from relax.engine.rollout import sglang_rollout
++from relax.utils.types import Sample
++
++
++def test_omni_audio_data_url_adapts_legacy_relax_encoding() -> None:
++    payload = "UklGRg=="
++
++    assert (
++        omni_rollout._as_omni_audio_data_url(f"data:,{payload}")
++        == f"data:audio/wav;base64,{payload}"
++    )
++    assert (
++        omni_rollout._as_omni_audio_data_url(f"data:audio/wav;base64,{payload}")
++        == f"data:audio/wav;base64,{payload}"
++    )
++
++
++def test_omni_initial_encoding_uses_processor_owned_chat_template(monkeypatch) -> None:
++    class FakeTokenizer:
++        chat_template = None
++
++        def apply_chat_template(self, messages, **kwargs):
++            assert messages == [
++                {"role": "user", "content": [{"type": "audio"}]}
++            ]
++            assert self.chat_template == "official-omni-template"
++            assert kwargs == {
++                "tokenize": False,
++                "add_generation_prompt": True,
++            }
++            return "rendered prompt"
++
++        def encode(self, text, *, add_special_tokens):
++            assert text == "rendered prompt"
++            assert add_special_tokens is False
++            return [1, 2]
++
++    tokenizer = FakeTokenizer()
++    processor = SimpleNamespace(chat_template="official-omni-template")
++    monkeypatch.setattr(
++        omni_rollout,
++        "_run_processor",
++        lambda *args: ([3, 4, 5], {"input_features": "features"}),
++    )
++    monkeypatch.setattr(
++        omni_rollout,
++        "encode_audio_for_rollout_engine",
++        lambda audio, sample_rate: f"audio:{audio[0]}:{sample_rate}",
++    )
++    sample = Sample(
++        prompt=[],
++        multimodal_inputs={"audio": [np.asarray([0.25], dtype=np.float32)]},
++    )
++
++    result = omni_rollout._encode_initial_inputs(
++        sample,
++        [{"role": "user", "content": [{"type": "audio"}]}],
++        processor,
++        tokenizer,
++        SimpleNamespace(
++            apply_chat_template_kwargs=None,
++            audio_sample_rate=16000,
++        ),
++    )
++
++    assert tokenizer.chat_template == "official-omni-template"
++    assert result == (
++        [1, 2],
++        [3, 4, 5],
++        ["audio:0.25:16000"],
++        {"input_features": "features"},
++    )
++
++
++@pytest.mark.parametrize("marker", ["<image>", "<video>"])
++def test_omni_messages_reject_unsupported_media_markers(marker) -> None:
++    with pytest.raises(NotImplementedError, match="supports audio and text only"):
++        omni_rollout._sanitize_messages(
++            [
++                {
++                    "role": "user",
++                    "content": [
++                        {"type": "text", "text": marker},
++                        {"type": "audio"},
++                    ],
++                }
++            ]
++        )
++
++
++def test_omni_abort_uses_pause_then_continue(monkeypatch) -> None:
++    calls: list[tuple[str, dict]] = []
++
++    async def fake_post(url, payload):
++        calls.append((url, payload))
++        return {"success": True}
++
++    monkeypatch.setattr(
++        "relax.engine.rollout.sglang_omni_rollout.post",
++        fake_post,
++    )
++    from relax.engine.rollout.sglang_omni_rollout import abort_rollout
++
++    asyncio.run(
++        abort_rollout(
++            SimpleNamespace(
++                sglang_router_ip="omni",
++                sglang_router_port=30000,
++            )
++        )
++    )
++
++    assert calls == [
++        ("http://omni:30000/pause_generation", {"mode": "abort"}),
++        ("http://omni:30000/continue_generation", {}),
++    ]
++
++
++def test_omni_inference_payload_uses_messages_audio_metadata_and_thinker_lora(
++    monkeypatch,
++) -> None:
++    captured: list[dict] = []
++
++    async def fake_post(url, payload):
++        captured.append({"url": url, "payload": payload})
++        return {
++            "text": "hello",
++            "meta_info": {
++                "output_token_logprobs": [[-0.1, 7]],
++                "finish_reason": {"type": "stop"},
++            },
++        }
++
++    monkeypatch.setattr(omni_rollout, "post", fake_post)
++    messages = [{"role": "user", "content": [{"type": "audio"}]}]
++    result = asyncio.run(
++        omni_rollout._run_inference_step(
++            "http://omni/generate",
++            messages,
++            {"max_new_tokens": 8},
++            ["audio0"],
++            SimpleNamespace(lora_enable=True, lora_name="policy"),
++        )
++    )
++
++    assert result == ("hello", [7], [-0.1], "stop")
++    assert captured == [
++        {
++            "url": "http://omni/generate",
++            "payload": {
++                "messages": messages,
++                "sampling_params": {"max_new_tokens": 8},
++                "metadata": {"audios": ["audio0"]},
++                "return_logprob": True,
++                "output_modalities": ["text"],
++                "stage_params": {"thinker": {"lora_name": "policy"}},
++            },
++        }
++    ]
++
++
++def test_omni_inference_translates_real_relax_sampling_params(monkeypatch) -> None:
++    captured: list[dict] = []
++
++    async def fake_post(url, payload):
++        captured.append(payload)
++        return {
++            "text": "hello",
++            "meta_info": {
++                "output_token_logprobs": [[-0.1, 7]],
++                "finish_reason": {"type": "stop"},
++            },
++        }
++
++    monkeypatch.setattr(omni_rollout, "post", fake_post)
++    asyncio.run(
++        omni_rollout._run_inference_step(
++            "http://omni/generate",
++            [{"role": "user", "content": [{"type": "audio"}]}],
++            {
++                "temperature": 1.0,
++                "top_p": 1.0,
++                "top_k": -1,
++                "max_new_tokens": 8,
++                "stop": None,
++                "stop_token_ids": None,
++                "skip_special_tokens": False,
++                "no_stop_trim": True,
++                "spaces_between_special_tokens": False,
++                "sampling_seed": 42,
++            },
++            ["audio0"],
++            SimpleNamespace(lora_enable=False),
++        )
++    )
++
++    assert captured[0]["sampling_params"] == {
++        "temperature": 1.0,
++        "top_p": 1.0,
++        "top_k": -1,
++        "max_new_tokens": 8,
++        "stop": None,
++        "stop_token_ids": None,
++        "seed": 42,
++    }
++
++
++def test_standard_sglang_inference_payload_is_unchanged(monkeypatch) -> None:
++    captured: list[dict] = []
++
++    async def fake_post(url, payload):
++        captured.append(payload)
++        return {
++            "text": "hello",
++            "meta_info": {
++                "output_token_logprobs": [[-0.1, 7]],
++                "finish_reason": {"type": "stop"},
++            },
++        }
++
++    monkeypatch.setattr("examples.simul_s2tt.rollout.post", fake_post)
++    asyncio.run(
++        standard_inference_step(
++            "http://sglang/generate",
++            [1, 2],
++            {"max_new_tokens": 8},
++            ["audio0"],
++            SimpleNamespace(lora_enable=True, lora_name="policy"),
++        )
++    )
++
++    assert captured == [
++        {
++            "input_ids": [1, 2],
++            "sampling_params": {"max_new_tokens": 8},
++            "return_logprob": True,
++            "lora_path": "policy",
++            "audio_data": ["audio0"],
++        }
++    ]
++
++
++def test_custom_omni_generate_skips_standard_group_multimodal_preencoding(
++    monkeypatch,
++) -> None:
++    encode_calls: list[dict] = []
++
++    async def fake_encode(multimodal_inputs):
++        encode_calls.append(multimodal_inputs)
++        return {"audio_data": ["unused"]}, 0.1
++
++    async def fake_generate_and_rm(args, sample, sampling_params, evaluation=False):
++        return sample
++
++    monkeypatch.setattr(
++        sglang_rollout,
++        "GenerateState",
++        lambda _: SimpleNamespace(aborted=False),
++    )
++    monkeypatch.setattr(
++        sglang_rollout,
++        "_encode_multimodal_inputs",
++        fake_encode,
++    )
++    monkeypatch.setattr(
++        sglang_rollout,
++        "generate_and_rm",
++        fake_generate_and_rm,
++    )
++    shared_multimodal_inputs = {"audio": [np.asarray([0.0], dtype=np.float32)]}
++    group = [
++        Sample(prompt=[], multimodal_inputs=shared_multimodal_inputs),
++        Sample(prompt=[], multimodal_inputs=shared_multimodal_inputs),
++    ]
++    args = SimpleNamespace(
++        custom_generate_function_path="examples.simul_s2tt.omni_rollout.generate",
++        sglang_enable_deterministic_inference=False,
++        group_rm=False,
++    )
++
++    result = asyncio.run(
++        sglang_rollout.generate_and_rm_group(
++            args,
++            group,
++            {"max_new_tokens": 8},
++        )
++    )
++
++    assert result == group
++    assert encode_calls == []
++    assert not any(hasattr(sample, "_pre_encoded_mm") for sample in group)
++
++
++def test_omni_inference_requires_output_token_logprobs(monkeypatch) -> None:
++    async def fake_post(url, payload):
++        return {
++            "text": "hello",
++            "meta_info": {"finish_reason": {"type": "stop"}},
++        }
++
++    monkeypatch.setattr(omni_rollout, "post", fake_post)
++
++    with pytest.raises(RuntimeError, match="missing output_token_logprobs"):
++        asyncio.run(
++            omni_rollout._run_inference_step(
++                "http://omni/generate",
++                [{"role": "user", "content": [{"type": "audio"}]}],
++                {"max_new_tokens": 8},
++                ["audio0"],
++                SimpleNamespace(lora_enable=False),
++            )
++        )
++
++
++def test_omni_multiturn_accumulates_messages_audios_and_training_alignment(
++    monkeypatch,
++) -> None:
++    class FakeEnv:
++        num_chunks = 3
++
++        def __init__(self):
++            self.index = 1
++
++        def reset(self):
++            self.index = 1
++
++        def step(self, _):
++            if self.index >= self.num_chunks:
++                return {}, True, {}
++            chunk = np.asarray([self.index], dtype=np.float32)
++            self.index += 1
++            return {"role": "user", "audio": chunk, "obs_str": ""}, False, {}
++
++        def format_observation(self, observation):
++            return {
++                "role": "user",
++                "content": [{"type": "audio", "audio": observation["audio"]}],
++            }
++
++    request_snapshots: list[dict] = []
++
++    async def fake_inference(_, messages, __, encoded_audios, ___):
++        turn = len(request_snapshots)
++        request_snapshots.append(
++            {
++                "messages": [dict(message) for message in messages],
++                "audios": list(encoded_audios),
++            }
++        )
++        return f"text{turn}", [20 + turn], [-0.1 - turn], "stop"
++
++    monkeypatch.setattr(
++        omni_rollout,
++        "GenerateState",
++        lambda _: SimpleNamespace(tokenizer=object(), processor=object()),
++    )
++    monkeypatch.setattr(omni_rollout, "build_env", lambda sample, args: FakeEnv())
++    monkeypatch.setattr(
++        omni_rollout,
++        "_encode_initial_inputs",
++        lambda *args: ([1], [10, 11], ["audio0"], None),
++    )
++    monkeypatch.setattr(
++        omni_rollout,
++        "_encode_audio_observation",
++        lambda chunk, *args: ([30, 31], [3], f"audio{int(chunk[0])}", None),
++    )
++    monkeypatch.setattr(omni_rollout, "_run_inference_step", fake_inference)
++    sample = Sample(
++        prompt=[{"role": "user", "content": [{"type": "audio"}]}],
++        multimodal_inputs={"audio": [np.asarray([0.0], dtype=np.float32)]},
++    )
++    args = SimpleNamespace(
++        max_turns=3,
++        partial_rollout=False,
++        optimize_routing_replay=False,
++        rollout_max_response_len=8,
++        sglang_router_ip="omni",
++        sglang_router_port=30000,
++    )
++
++    result = asyncio.run(omni_rollout.generate(args, sample, {"max_new_tokens": 8}))
++
++    assert [len(request["audios"]) for request in request_snapshots] == [1, 2, 3]
++    assert [
++        [message["role"] for message in request["messages"]]
++        for request in request_snapshots
++    ] == [
++        ["user"],
++        ["user", "assistant", "user"],
++        ["user", "assistant", "user", "assistant", "user"],
++    ]
++    assert result.tokens == [10, 11, 20, 30, 31, 21, 30, 31, 22]
++    assert result.loss_mask == [1, 0, 0, 1, 0, 0, 1]
++    assert result.rollout_log_probs == [-0.1, 0.0, 0.0, -1.1, 0.0, 0.0, -2.1]
++    assert result.response_length == 7
++    assert result.metadata["rollout_turns"] == 3
++    assert result.status == Sample.Status.COMPLETED
++
++
++def test_omni_real_audio_chunk_env_tracks_seven_960ms_turns(
++    monkeypatch,
++    capsys,
++) -> None:
++    sample_rate = 16_000
++    chunk_samples = 960 * sample_rate // 1000
++    waveform = np.arange(
++        int(6.54 * sample_rate),
++        dtype=np.float32,
++    )
++    encoded_chunk_sizes: list[int] = []
++    request_marker_counts: list[int] = []
++    request_audio_counts: list[int] = []
++
++    def fake_initial_encoding(sample, *args):
++        initial_audio = sample.multimodal_inputs["audio"]
++        assert len(initial_audio) == 1
++        assert len(initial_audio[0]) == chunk_samples
++        return [1], [10, 11], ["audio0"], None
++
++    def fake_observation_encoding(chunk, *args):
++        turn = len(encoded_chunk_sizes) + 1
++        encoded_chunk_sizes.append(len(chunk))
++        return [30 + turn, 40 + turn], [3], f"audio{turn}", None
++
++    async def fake_post(_, payload):
++        messages = payload["messages"]
++        encoded_audios = payload["metadata"]["audios"]
++        marker_count = sum(
++            part.get("type") == "audio"
++            for message in messages
++            for part in message.get("content", [])
++            if isinstance(part, dict)
++        )
++        request_marker_counts.append(marker_count)
++        request_audio_counts.append(len(encoded_audios))
++        turn = len(request_audio_counts) - 1
++        assert payload["stage_params"] == {
++            "thinker": {"lora_name": "policy"}
++        }
++        return {
++            "text": f"text{turn}",
++            "meta_info": {
++                "output_token_logprobs": [[-0.1 - turn, 20 + turn]],
++                "finish_reason": {"type": "stop"},
++            },
++        }
++
++    monkeypatch.setattr(
++        omni_rollout,
++        "GenerateState",
++        lambda _: SimpleNamespace(tokenizer=object(), processor=object()),
++    )
++    monkeypatch.setattr(
++        omni_rollout,
++        "_encode_initial_inputs",
++        fake_initial_encoding,
++    )
++    monkeypatch.setattr(
++        omni_rollout,
++        "_encode_audio_observation",
++        fake_observation_encoding,
++    )
++    monkeypatch.setattr(omni_rollout, "post", fake_post)
++    sample = Sample(
++        index=17,
++        prompt=[{"role": "user", "content": [{"type": "audio"}]}],
++        multimodal_inputs={"audio": [waveform]},
++    )
++    args = SimpleNamespace(
++        max_turns=64,
++        simul_chunk_ms=960,
++        audio_sample_rate=sample_rate,
++        partial_rollout=False,
++        optimize_routing_replay=False,
++        rollout_max_response_len=64,
++        sglang_router_ip="omni",
++        sglang_router_port=30000,
++        lora_enable=True,
++        lora_name="policy",
++    )
++
++    result = asyncio.run(omni_rollout.generate(args, sample, {"max_new_tokens": 8}))
++
++    assert request_marker_counts == list(range(1, 8))
++    assert request_audio_counts == list(range(1, 8))
++    assert encoded_chunk_sizes == [chunk_samples] * 5 + [
++        len(waveform) - 6 * chunk_samples
++    ]
++    assert result.metadata["simul_num_chunks"] == 7
++    assert result.metadata["simul_stop_reason"] == "chunks_exhausted"
++    assert result.metadata["rollout_turns"] == 7
++    assert result.loss_mask == ([1, 0, 0] * 6) + [1]
++    assert result.rollout_log_probs == pytest.approx([
++        -0.1,
++        0.0,
++        0.0,
++        -1.1,
++        0.0,
++        0.0,
++        -2.1,
++        0.0,
++        0.0,
++        -3.1,
++        0.0,
++        0.0,
++        -4.1,
++        0.0,
++        0.0,
++        -5.1,
++        0.0,
++        0.0,
++        -6.1,
++    ])
++    assert result.rollout_tokens == [
++        1,
++        20,
++        3,
++        21,
++        3,
++        22,
++        3,
++        23,
++        3,
++        24,
++        3,
++        25,
++        3,
++        26,
++    ]
++    assert result.response_length == 19
++    assert len(result.tokens) == 21
++    assert result.status == Sample.Status.COMPLETED
++    captured = capsys.readouterr().out
++    assert (
++        "[omni-simul-evidence] sample_index=17 rollout_turns=7 "
++        "num_chunks=7 stop_reason=chunks_exhausted status=completed"
++        in captured
++    )
++    assert (
++        '[omni-simul-output] sample_index=17 '
++        'response="text0text1text2text3text4text5text6"'
++        in captured
++    )
++
++
++def test_omni_multiturn_audio_training_features_pad_and_merge() -> None:
++    frame_lengths = [8, 8, 8, 8, 8, 8, 5]
++    chunks = [
++        {
++            "input_features": torch.full(
++                (1, 128, frames),
++                float(index + 1),
++            ),
++            "feature_attention_mask": torch.ones(
++                (1, frames),
++                dtype=torch.long,
++            ),
++            "audio_feature_lengths": torch.tensor([frames]),
++        }
++        for index, frames in enumerate(frame_lengths)
++    ]
++
++    merged = omni_rollout._merge_mm_train(chunks)
++
++    assert merged is not None
++    assert merged["input_features"].shape == (7, 128, 8)
++    assert merged["feature_attention_mask"].shape == (7, 8)
++    assert torch.all(merged["input_features"][-1, :, :5] == 7.0)
++    assert torch.all(merged["input_features"][-1, :, 5:] == 0.0)
++    assert torch.equal(
++        merged["feature_attention_mask"][-1],
++        torch.tensor([1, 1, 1, 1, 1, 0, 0, 0]),
++    )
++    assert merged["audio_feature_lengths"].tolist() == frame_lengths

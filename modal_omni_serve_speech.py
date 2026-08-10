@@ -34,7 +34,11 @@ COLOCATED_CONFIG = (
     f"{SGLANG_OMNI_REMOTE}/examples/configs/qwen3_omni_colocated_h100_bf16.yaml"
 )
 
-BASE_IMAGE = os.environ.get("RELAX_BASE_IMAGE", "slimerl/slime:latest")
+# v1 冻结镜像 = slime nightly-dev-20260428a（:latest 会漂移，认定过程见 README_v1.md）
+BASE_IMAGE = os.environ.get(
+    "RELAX_BASE_IMAGE",
+    "slimerl/slime@sha256:bd219aba21be6e404ff09e385f34f40993b60773b928e13f341e8d77590da6aa",
+)
 OMNI_DEPS = (
     "pip install --no-cache-dir "
     "typer pyzmq msgpack pydantic pyyaml xxhash httpx fastapi uvicorn pybase64 "

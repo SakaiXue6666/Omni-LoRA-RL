@@ -32,7 +32,11 @@ PYTHONPATH = f"{SGLANG_REMOTE}:{SGLANG_OMNI_REMOTE}"
 MODEL_VOLUME_NAME = "qwen3-omni-weights"
 MODEL_DIR = "/models/qwen3-omni"
 
-BASE_IMAGE = os.environ.get("RELAX_BASE_IMAGE", "slimerl/slime:latest")
+# v1 冻结镜像 = slime nightly-dev-20260428a（:latest 会漂移，认定过程见 README_v1.md）
+BASE_IMAGE = os.environ.get(
+    "RELAX_BASE_IMAGE",
+    "slimerl/slime@sha256:bd219aba21be6e404ff09e385f34f40993b60773b928e13f341e8d77590da6aa",
+)
 
 # sglang-omni 启动链需要的第三方依赖（尽量一次装齐，避免反复试错）。
 # 用本地 sglang fork 覆盖，故不装 sglang；torch 用 slime 镜像自带（勿动）。

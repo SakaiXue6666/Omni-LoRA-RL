@@ -1,0 +1,2 @@
+# patch 必须逐字节保留：本机 git 会做 LF/CRLF 转换，转换后 git apply 会失败
+*.patch -text

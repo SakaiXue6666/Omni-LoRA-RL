@@ -1,0 +1,757 @@
+diff --git a/make_toy_lora.py b/make_toy_lora.py
+new file mode 100644
+index 0000000000..726c727c52
+--- /dev/null
++++ b/make_toy_lora.py
+@@ -0,0 +1,122 @@
++"""Create a toy PEFT-style LoRA adapter for Qwen3-Omni thinker.
++
++Targets the thinker's attention (q/k/v/o) for the first few decoder layers.
++Weights are zero-initialized so the adapter is mathematically a no-op,
++which lets us verify the load/forward plumbing end-to-end without changing
++generation outputs.
++
++After running, the directory layout is:
++  <output_dir>/
++    adapter_config.json
++    adapter_model.safetensors
++"""
++
++import argparse
++import json
++import os
++
++import torch
++from safetensors.torch import save_file
++
++
++HIDDEN = 2048
++NUM_HEADS = 32
++KV_HEADS = 4
++HEAD_DIM = 128
++Q_OUT = NUM_HEADS * HEAD_DIM        # 4096
++KV_OUT = KV_HEADS * HEAD_DIM        # 512
++
++
++def build_state_dict(num_layers: int, rank: int, dtype: torch.dtype):
++    # PEFT-standard init: lora_A = Kaiming-uniform-ish small noise, lora_B = 0.
++    # With lora_B = 0, the product B @ A is exactly 0, so the adapter is a
++    # mathematical no-op even though both matrices live in the safetensors.
++    sd = {}
++    prefix = "base_model.model.thinker.model.layers"
++    gen = torch.Generator().manual_seed(0)
++
++    def small_random(shape):
++        std = 1.0 / (shape[1] ** 0.5)
++        return (torch.randn(*shape, generator=gen) * std).to(dtype)
++
++    for i in range(num_layers):
++        layer_prefix = f"{prefix}.{i}.self_attn"
++
++        for name, out_dim in [
++            ("q_proj", Q_OUT),
++            ("k_proj", KV_OUT),
++            ("v_proj", KV_OUT),
++        ]:
++            sd[f"{layer_prefix}.{name}.lora_A.weight"] = small_random((rank, HIDDEN))
++            sd[f"{layer_prefix}.{name}.lora_B.weight"] = torch.zeros(out_dim, rank, dtype=dtype)
++
++        sd[f"{layer_prefix}.o_proj.lora_A.weight"] = small_random((rank, Q_OUT))
++        sd[f"{layer_prefix}.o_proj.lora_B.weight"] = torch.zeros(HIDDEN, rank, dtype=dtype)
++
++    return sd
++
++
++def build_config(num_layers: int, rank: int, alpha: float):
++    target_layers = list(range(num_layers))
++    target_modules = []
++    for i in target_layers:
++        for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
++            target_modules.append(f"thinker.model.layers.{i}.self_attn.{name}")
++
++    return {
++        "alpha_pattern": {},
++        "auto_mapping": None,
++        "base_model_name_or_path": "/models/Qwen/Qwen3-Omni-30B-A3B-Instruct",
++        "bias": "none",
++        "fan_in_fan_out": False,
++        "inference_mode": True,
++        "init_lora_weights": True,
++        "layers_pattern": None,
++        "layers_to_transform": None,
++        "lora_alpha": alpha,
++        "lora_dropout": 0.0,
++        "modules_to_save": None,
++        "peft_type": "LORA",
++        "r": rank,
++        "rank_pattern": {},
++        "revision": None,
++        "target_modules": target_modules,
++        "task_type": "CAUSAL_LM",
++    }
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--output", default="/data/xueyulin/models/toy-lora-thinker")
++    ap.add_argument("--num-layers", type=int, default=4,
++                    help="how many of the thinker's first decoder layers to attach LoRA to")
++    ap.add_argument("--rank", type=int, default=32)
++    ap.add_argument("--alpha", type=float, default=None,
++                    help="LoRA alpha (default: equal to rank, scaling=1.0)")
++    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
++    args = ap.parse_args()
++    alpha = args.alpha if args.alpha is not None else float(args.rank)
++
++    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
++
++    os.makedirs(args.output, exist_ok=True)
++
++    sd = build_state_dict(args.num_layers, args.rank, dtype)
++    cfg = build_config(args.num_layers, args.rank, alpha)
++
++    safetensors_path = os.path.join(args.output, "adapter_model.safetensors")
++    config_path = os.path.join(args.output, "adapter_config.json")
++
++    save_file(sd, safetensors_path)
++    with open(config_path, "w") as f:
++        json.dump(cfg, f, indent=2)
++
++    total_params = sum(t.numel() for t in sd.values())
++    print(f"Wrote {len(sd)} tensors ({total_params:,} params, dtype={args.dtype}) to:")
++    print(f"  {safetensors_path}")
++    print(f"  {config_path}")
++    print(f"Target layers: 0..{args.num_layers - 1} of thinker; rank={args.rank}, alpha={alpha}, scaling={alpha / args.rank:.6f}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 3d6655a85b..d01e830f87 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -78,15 +78,37 @@ class LoRAManager:
+         self.tp_size: int = tp_size
+         self.tp_rank: int = tp_rank
+         self.lora_added_tokens_size: Optional[int] = None
+-        self.enable_lora_overlap_loading: Optional[bool] = (
+-            server_args.enable_lora_overlap_loading
+-        )
+ 
+-        self.eviction_policy = server_args.lora_eviction_policy
+-        self._experts_shared_outer_override: Optional[bool] = (
+-            server_args.experts_shared_outer_loras
++        # 🚨 ===== [YULIN-MOD] START: 兼容缺少新版 LoRA 参数的旧版 SGLang =====
++
++        # sglang-omni 使用的 SGLang 版本不一定和当前标准 SGLang HEAD 完全一致。
++        #
++        # 新版 ServerArgs 增加了 overlap loading、eviction policy、
++        # shared outer LoRA 和 virtual experts 等字段；旧版没有这些属性。
++        # 如果这里直接访问 server_args.xxx，Omni 启动时会在创建 LoRAManager
++        # 的阶段直接 AttributeError，甚至还没有机会加载 adapter。
++        #
++        # 因此使用 getattr 并采用与新版 ServerArgs 相同的默认值：
++        # - 新版 SGLang 行为不变；
++        # - 旧版 SGLang 缺少字段时仍可继续运行；
++        # - 不影响原有标准 SGLang LoRA backend。
++
++        # Use getattr so this patch keeps working on slightly older sglang
++        # releases (e.g. v0.5.9) that haven't introduced every LoRA-related
++        # ServerArgs field yet. Same defaults as ServerArgs in sglang HEAD.
++        self.enable_lora_overlap_loading: Optional[bool] = getattr(
++            server_args, "enable_lora_overlap_loading", None
++        )
++        self.eviction_policy = getattr(server_args, "lora_eviction_policy", "lru")
++        self._experts_shared_outer_override: Optional[bool] = getattr(
++            server_args, "experts_shared_outer_loras", None
+         )
+-        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
++        self.lora_use_virtual_experts: bool = getattr(
++            server_args, "lora_use_virtual_experts", False
++        )
++
++        # 🚨 ===== [YULIN-MOD] END: 兼容缺少新版 LoRA 参数的旧版 SGLang =====
++
+         self.lora_strict_loading: bool = getattr(
+             server_args, "lora_strict_loading", False
+         )
+@@ -801,6 +823,31 @@ class LoRAManager:
+                 self.lora_modules[layer_id][module_name] = lora_module
+                 continue
+ 
++            # 🚨 ===== [YULIN-MOD] START: 允许多模态模型拒绝给非文本模块挂载 LoRA =====
++
++            # 标准 LoRAManager 主要按模块名后缀匹配 target_modules。
++            #
++            # 对普通纯文本模型，这通常没有问题；但 Qwen3-Omni 的 Thinker、
++            # audio tower 和 visual tower 内可能同时存在 qkv_proj、o_proj 等名字。
++            # 只看后缀会把本来只训练 Thinker 文本主干的 LoRA，也错误地挂到
++            # 音频编码器或视觉编码器上。
++            #
++            # 因此为模型提供一个可选的 should_apply_lora(module_name) 开关：
++            # - 模型实现了 hook，就允许它拒绝某个模块；
++            # - 普通 SGLang 模型没有 hook，完整保留原来的后缀匹配行为。
++
++            # Opt-in per-model gate: if the base model declares
++            # `should_apply_lora`, let it veto modules that share a suffix
++            # with `target_modules` but live outside the LLM body (e.g.
++            # multimodal towers such as Qwen3-Omni's `audio_tower`/`visual`,
++            # whose layers also use `layers.<id>.self_attn.qkv_proj`).
++            # Models without this hook keep the legacy suffix-match behavior.
++            should_apply = getattr(self.base_model, "should_apply_lora", None)
++            if callable(should_apply) and not should_apply(module_name):
++                continue
++
++            # 🚨 ===== [YULIN-MOD] END: 允许多模态模型拒绝给非文本模块挂载 LoRA =====
++
+             # The module should be converted if it is included in target_names
+             if module_name.split(".")[-1] in self.target_modules:
+                 layer_id = get_layer_id(module_name)
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index f552102b86..1e1707d09b 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -190,6 +190,23 @@ class BaseTpWorker(ABC):
+     ):
+         # The LoRA code handles TP sharding internally using slice_lora_a_weights
+         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
++
++        # 🚨 ===== [YULIN-MOD] START: 在反序列化 tensor LoRA 前安装兼容的 Torch reducer =====
++
++        # Relax 发来的 serialized_tensors 由 PyTorch tensor pickle 得到。
++        #
++        # SGLang 的 MultiprocessingSerializer 会安全地限制可反序列化类型，
++        # 但 PyTorch tensor 本身仍需要配套的 reducer/rebuild 函数。
++        # 这里先安装标准 SGLang 已有的 monkey patch，再反序列化
++        # flattened bucket 或普通 tensor dict。
++        #
++        # 这个 patch 是幂等的；标准 SGLang 原有的全量 tensor 权重更新路径
++        # 也使用同一套机制，不需要为 Omni 另造 tensor 通信协议。
++
++        monkey_patch_torch_reductions()
++
++        # 🚨 ===== [YULIN-MOD] END: 在反序列化 tensor LoRA 前安装兼容的 Torch reducer =====
++
+         if recv_req.load_format == "flattened_bucket":
+             flattened_data = MultiprocessingSerializer.deserialize(
+                 recv_req.serialized_tensors
+diff --git a/python/sglang/srt/models/qwen3_omni_moe.py b/python/sglang/srt/models/qwen3_omni_moe.py
+index badb6be081..a1d11f5a11 100644
+--- a/python/sglang/srt/models/qwen3_omni_moe.py
++++ b/python/sglang/srt/models/qwen3_omni_moe.py
+@@ -15,6 +15,7 @@
+ """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
+ 
+ import math
++import re
+ from typing import Iterable, List, Optional, Tuple
+ 
+ import numpy as np
+@@ -460,16 +461,45 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
+ 
+     def get_audio_feature(self, items: List[MultimodalDataItem]):
+         device = next(self.audio_tower.parameters()).device
+-        feature_attention_mask = (
+-            torch.cat([item.feature_attention_mask for item in items], dim=0)
+-            .type(torch.long)
+-            .to(device)
+-        )
++
++        # 🚨 ===== [YULIN-MOD] START: 对齐同一 batch 内不同长度的 Omni 音频特征 =====
++
++        # RL rollout 中，每条样本会分别经过一次 Hugging Face processor。
++        # 不同音频得到的 mel 帧数往往不同，例如一条是 936 帧，另一条是 1056 帧。
++        #
++        # 原实现直接 torch.cat(dim=0)，但 mel 帧位于非拼接维；
++        # 只要同一 batch 存在两段不同长度的音频，就会因为 shape 不一致而崩溃。
++        #
++        # 这里先把 feature 和对应的 attention mask 右侧补到本批最大帧数：
++        # - feature 补 0；
++        # - mask 也补 0；
++        # - 下游通过 mask.bool() 只选有效帧，因此 padding 不参与音频编码。
++
++        # RL rollout 下每条样本各自调一次 HF processor，不同音频的 mel 帧数（最后一维）
++        # 各不相同（如 936 vs 1056）；直接 torch.cat(dim=0) 会因非拼接维不一致而崩。
++        # 先把同 batch 内的 feature / feature_attention_mask 右侧 zero-pad 到最大帧数再拼。
++        # 下游（476-478 行）用 mask.bool() 只抽有效帧，pad 部分 mask=0 不参与，故安全。
++        masks = [item.feature_attention_mask for item in items]
++        feats = [item.feature for item in items]
++        max_frames = max(m.shape[-1] for m in masks)
++        if any(m.shape[-1] != max_frames for m in masks):
++            masks = [
++                torch.nn.functional.pad(m, (0, max_frames - m.shape[-1]), value=0)
++                for m in masks
++            ]
++            feats = [
++                torch.nn.functional.pad(f, (0, max_frames - f.shape[-1]), value=0)
++                for f in feats
++            ]
++        feature_attention_mask = torch.cat(masks, dim=0).type(torch.long).to(device)
+         input_features = (
+-            torch.cat([item.feature for item in items])
++            torch.cat(feats)
+             .type(self.audio_tower.dtype)
+             .to(next(self.audio_tower.parameters()).device)
+         )
++
++        # 🚨 ===== [YULIN-MOD] END: 对齐同一 batch 内不同长度的 Omni 音频特征 =====
++
+         if feature_attention_mask is not None:
+             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+             input_features = input_features.permute(0, 2, 1)[
+@@ -493,6 +523,47 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
+ 
+ 
+ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
++    # 🚨 ===== [YULIN-MOD] START: 只给 Qwen3-Omni Thinker 文本主干挂载 LoRA =====
++
++    # SGLang 会针对最外层 Qwen3OmniMoeForConditionalGeneration 创建 LoRAManager。
++    # 因此 LoRA 能力和模块过滤规则必须声明在这个外层类上；
++    # 只写在内部 thinker 类上不会被 LoRAManager 查询到。
++    #
++    # packed_modules_mapping 告诉标准 SGLang：
++    # - PEFT 的 q_proj/k_proj/v_proj 对应模型里的 fused qkv_proj；
++    # - gate_proj/up_proj 对应 fused gate_up_proj。
++    #
++    # _lora_pattern 再把作用范围限制到 thinker.model 文本主干，
++    # 明确排除 thinker.audio_tower 和 thinker.visual。
++    # 这样 target_modules 中出现 qkv_proj 时，不会误伤具有同名后缀的
++    # 音频或视觉模块。
++
++    # Declare LoRA support at the outer model class. `model_runner` builds the
++    # `LoRAManager` against this class, so its `should_apply_lora` is what the
++    # manager queries during module discovery. The inner thinker's inherited
++    # `should_apply_lora` is never consulted because named_modules() prefixes
++    # everything with `thinker.`.
++    supports_lora = True
++    packed_modules_mapping = {
++        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
++        "gate_up_proj": ["gate_proj", "up_proj"],
++    }
++    # Restrict LoRA wrapping to the LLM body inside `thinker`. Explicitly
++    # excludes `thinker.audio_tower.*` and `thinker.visual.*`, whose layers
++    # also expose `layers.<id>.self_attn.qkv_proj` and would otherwise collide
++    # with `--lora-target-modules qkv_proj`.
++    _lora_pattern = re.compile(
++        r"^thinker\.(?:"
++        r"model\.layers\.(\d+)\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)"
++        r"|lm_head"
++        r"|model\.embed_tokens"
++        r")$"
++    )
++
++    def should_apply_lora(self, module_name: str) -> bool:
++        return bool(self._lora_pattern.match(module_name))
++    # 🚨 ===== [YULIN-MOD] END: 只给 Qwen3-Omni Thinker 文本主干挂载 LoRA =====
++
+     def __init__(
+         self,
+         config: Qwen3VLMoeConfig,
+diff --git a/python/sglang/srt/utils/patch_torch.py b/python/sglang/srt/utils/patch_torch.py
+index 68cc940020..c2210199ad 100644
+--- a/python/sglang/srt/utils/patch_torch.py
++++ b/python/sglang/srt/utils/patch_torch.py
+@@ -71,9 +71,26 @@ def register_sgl_tp_rank(rank: int):
+ 
+ def _reduce_tensor_modified(*args, **kwargs):
+     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
+-    output_args = _modify_tuple(
+-        output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
+-    )
++
++    # 🚨 ===== [YULIN-MOD] START: 跳过没有 CUDA device 参数的 CPU tensor reducer =====
++
++    # 这个 reducer patch 原本假定 output_args 的第 7 个元素一定是 CUDA device，
++    # 并把设备编号替换为 UUID，供跨进程 CUDA tensor 重建使用。
++    #
++    # 但 Relax 的 FlattenedTensorBucket 使用 CPU tensor 传输 LoRA 权重。
++    # CPU tensor 的 reducer 参数更短，不包含这个 CUDA device 字段；
++    # 如果仍然强行修改第 7 项，就会在序列化或热加载时越界。
++    #
++    # 因此只有参数中确实存在 device 字段时才做 UUID 转换：
++    # - CUDA IPC tensor 继续保持原来的 UUID 兼容行为；
++    # - CPU tensor 原样返回；
++    # - 标准 SGLang 的其他 tensor 更新路径不受影响。
++
++    if len(output_args) > _REDUCE_TENSOR_ARG_DEVICE_INDEX:
++        output_args = _modify_tuple(
++            output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
++        )
++    # 🚨 ===== [YULIN-MOD] END: 跳过没有 CUDA device 参数的 CPU tensor reducer =====
+     return output_fn, output_args
+ 
+ 
+diff --git a/test/srt/lora/_smoke_offline.py b/test/srt/lora/_smoke_offline.py
+new file mode 100644
+index 0000000000..7b91c609dc
+--- /dev/null
++++ b/test/srt/lora/_smoke_offline.py
+@@ -0,0 +1,123 @@
++"""Offline smoke test that doesn't import sglang.
++
++sglang doesn't import on Windows (uses Unix-only ``resource`` stdlib in
++``sglang.srt.utils.common``). This file re-extracts the regex and gate logic
++from source so we can validate behavior on any platform.
++
++Run with::
++
++    python test/srt/lora/_smoke_offline.py
++"""
++
++from __future__ import annotations
++
++import ast
++import re
++import sys
++from pathlib import Path
++
++
++REPO_ROOT = Path(__file__).resolve().parents[3]
++MODEL_FILE = REPO_ROOT / "python" / "sglang" / "srt" / "models" / "qwen3_omni_moe.py"
++LORA_MGR_FILE = REPO_ROOT / "python" / "sglang" / "srt" / "lora" / "lora_manager.py"
++
++
++def _extract_lora_pattern_source() -> str:
++    """Walk the AST of qwen3_omni_moe.py and pull out the string literal
++    assigned to ``_lora_pattern`` inside Qwen3OmniMoeForConditionalGeneration.
++    """
++    tree = ast.parse(MODEL_FILE.read_text(encoding="utf-8"))
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ClassDef) and node.name == "Qwen3OmniMoeForConditionalGeneration":
++            for stmt in node.body:
++                if (
++                    isinstance(stmt, ast.Assign)
++                    and len(stmt.targets) == 1
++                    and isinstance(stmt.targets[0], ast.Name)
++                    and stmt.targets[0].id == "_lora_pattern"
++                ):
++                    call = stmt.value
++                    assert isinstance(call, ast.Call), "_lora_pattern must be re.compile(...)"
++                    # The argument is either one literal string or several
++                    # string literals concatenated by the parser (implicit
++                    # adjacency).
++                    pieces = []
++                    for arg in call.args:
++                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
++                            pieces.append(arg.value)
++                        elif isinstance(arg, ast.JoinedStr):
++                            raise AssertionError("f-string in _lora_pattern not supported by smoke")
++                        else:
++                            raise AssertionError(f"unexpected arg in re.compile: {ast.dump(arg)}")
++                    return "".join(pieces)
++    raise AssertionError("Qwen3OmniMoeForConditionalGeneration._lora_pattern not found")
++
++
++def _gate_source_present() -> bool:
++    """Verify the should_apply_lora opt-in gate is wired into lora_manager."""
++    src = LORA_MGR_FILE.read_text(encoding="utf-8")
++    needles = [
++        'getattr(self.base_model, "should_apply_lora", None)',
++        "if callable(should_apply) and not should_apply(module_name):",
++        "continue",
++    ]
++    return all(n in src for n in needles)
++
++
++def main() -> int:
++    pattern_src = _extract_lora_pattern_source()
++    print(f"[ok] extracted _lora_pattern source ({len(pattern_src)} chars)")
++    pattern = re.compile(pattern_src)
++
++    must_match = [
++        "thinker.model.layers.0.self_attn.qkv_proj",
++        "thinker.model.layers.47.self_attn.o_proj",
++        "thinker.model.layers.5.mlp.experts",
++        "thinker.lm_head",
++        "thinker.model.embed_tokens",
++    ]
++    must_not_match = [
++        "thinker.audio_tower.layers.0.self_attn.qkv_proj",
++        "thinker.audio_tower.layers.31.self_attn.o_proj",
++        "thinker.audio_tower.layers.5.fc1",
++        "thinker.audio_tower.conv1",
++        "thinker.visual.blocks.5.attn.qkv",
++        "thinker.visual.merger.mlp.0",
++        "thinker.visual.patch_embed.proj",
++        "talker.model.layers.0.self_attn.qkv_proj",
++        "model.layers.0.self_attn.qkv_proj",
++        "thinker.model.embed_tokens.weight",
++        "thinker.model.layers.0.input_layernorm",
++    ]
++
++    failures: list[str] = []
++    for name in must_match:
++        if not pattern.match(name):
++            failures.append(f"  FAIL: expected match but did NOT match: {name!r}")
++    for name in must_not_match:
++        if pattern.match(name):
++            failures.append(f"  FAIL: expected NO match but DID match: {name!r}")
++
++    if not _gate_source_present():
++        failures.append(
++            "  FAIL: lora_manager.py is missing the should_apply_lora gate code"
++        )
++    else:
++        print("[ok] should_apply_lora gate is present in lora_manager.py")
++
++    if failures:
++        print(f"\n{len(failures)} failure(s):")
++        for f in failures:
++            print(f)
++        return 1
++
++    print(
++        f"[ok] regex accepts {len(must_match)} LLM names, "
++        f"rejects {len(must_not_match)} non-LLM names"
++    )
++    print("\nAll offline checks passed.")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/test/srt/lora/test_should_apply_lora_gate.py b/test/srt/lora/test_should_apply_lora_gate.py
+new file mode 100644
+index 0000000000..6c67eac2a0
+--- /dev/null
++++ b/test/srt/lora/test_should_apply_lora_gate.py
+@@ -0,0 +1,239 @@
++"""Unit tests for the should_apply_lora opt-in gate in LoRAManager and the
++Qwen3-Omni regex that drives it.
++
++These tests are CPU-only and avoid full sglang server bootstrapping. They
++directly construct minimal stand-in PyTorch modules and call
++``LoRAManager.init_lora_modules()`` through ``LoRAManager.__new__`` so the
++heavy ``__init__`` path (memory pool, adapter download, etc.) is bypassed.
++
++Run with::
++
++    pytest test/srt/lora/test_should_apply_lora_gate.py -v
++"""
++
++from __future__ import annotations
++
++import re
++import types
++from unittest.mock import MagicMock
++
++import pytest
++import torch.nn as nn
++
++from sglang.srt.lora.lora_manager import LoRAManager
++from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
++
++
++# ---------------------------------------------------------------------------
++# 1. Regex-only checks on Qwen3OmniMoeForConditionalGeneration._lora_pattern.
++#    Pure logic, no torch state required.
++# ---------------------------------------------------------------------------
++
++
++class TestQwen3OmniLoraPattern:
++    pattern = Qwen3OmniMoeForConditionalGeneration._lora_pattern
++
++    @pytest.mark.parametrize(
++        "name",
++        [
++            "thinker.model.layers.0.self_attn.qkv_proj",
++            "thinker.model.layers.47.self_attn.o_proj",
++            "thinker.model.layers.5.mlp.experts",
++            "thinker.lm_head",
++            "thinker.model.embed_tokens",
++        ],
++    )
++    def test_llm_body_matches(self, name):
++        assert self.pattern.match(name) is not None, (
++            f"expected match for {name!r}"
++        )
++
++    @pytest.mark.parametrize(
++        "name",
++        [
++            # audio tower uses the same `layers.<id>.self_attn.qkv_proj`
++            # convention -- this is exactly the collision case the gate
++            # exists to prevent.
++            "thinker.audio_tower.layers.0.self_attn.qkv_proj",
++            "thinker.audio_tower.layers.31.self_attn.o_proj",
++            "thinker.audio_tower.layers.5.fc1",
++            "thinker.audio_tower.conv1",
++            # vision tower has its own naming but must also stay untouched.
++            "thinker.visual.blocks.5.attn.qkv",
++            "thinker.visual.merger.mlp.0",
++            "thinker.visual.patch_embed.proj",
++            # Hypothetical sibling components.
++            "talker.model.layers.0.self_attn.qkv_proj",
++            # Missing thinker prefix -- the LLM is always reached via thinker.
++            "model.layers.0.self_attn.qkv_proj",
++            # Parameter path, not a module path.
++            "thinker.model.embed_tokens.weight",
++            # LLM layernorms must not be wrapped (not in target_modules anyway,
++            # but the regex also excludes them).
++            "thinker.model.layers.0.input_layernorm",
++        ],
++    )
++    def test_non_llm_rejected(self, name):
++        assert self.pattern.match(name) is None, (
++            f"expected NO match for {name!r}"
++        )
++
++    def test_should_apply_lora_method_callable_via_class(self):
++        # The method only reads ``self._lora_pattern`` (class attribute), so
++        # we can bind it to a lightweight namespace without constructing the
++        # full model.
++        fn = Qwen3OmniMoeForConditionalGeneration.should_apply_lora
++        proxy = types.SimpleNamespace(
++            _lora_pattern=Qwen3OmniMoeForConditionalGeneration._lora_pattern
++        )
++        assert fn(proxy, "thinker.model.layers.0.self_attn.qkv_proj") is True
++        assert fn(proxy, "thinker.audio_tower.layers.0.self_attn.qkv_proj") is False
++
++
++# ---------------------------------------------------------------------------
++# 2. Gate integration: LoRAManager.init_lora_modules must honor
++#    base_model.should_apply_lora when present, and must remain a no-op for
++#    legacy models that don't define it.
++# ---------------------------------------------------------------------------
++
++
++class _Qkv(nn.Module):
++    def __init__(self, dim: int = 8):
++        super().__init__()
++        self.qkv_proj = nn.Linear(dim, dim * 3, bias=False)
++        self.o_proj = nn.Linear(dim, dim, bias=False)
++
++
++class _AttnLayer(nn.Module):
++    def __init__(self, dim: int = 8):
++        super().__init__()
++        self.self_attn = _Qkv(dim)
++
++
++class _Body(nn.Module):
++    """Stand-in for ``thinker.model`` -- a stack of attention layers."""
++
++    def __init__(self, n_layers: int = 2, dim: int = 8):
++        super().__init__()
++        self.layers = nn.ModuleList([_AttnLayer(dim) for _ in range(n_layers)])
++
++
++class _Encoder(nn.Module):
++    """Stand-in for ``thinker.audio_tower`` -- intentionally uses the SAME
++    ``layers.<id>.self_attn.{qkv_proj,o_proj}`` naming as the LLM body to
++    reproduce the collision."""
++
++    def __init__(self, n_layers: int = 2, dim: int = 8):
++        super().__init__()
++        self.layers = nn.ModuleList([_AttnLayer(dim) for _ in range(n_layers)])
++
++
++def _make_fake_omni_like_model() -> nn.Module:
++    """Build a tree that mirrors Qwen3-Omni's collision: thinker wraps both
++    a language ``model`` and an ``audio_tower`` whose submodules share names.
++    """
++
++    _pattern = re.compile(
++        r"^thinker\.model\.layers\.\d+\.self_attn\.(?:qkv_proj|o_proj)$"
++    )
++
++    class _Thinker(nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.model = _Body()
++            self.audio_tower = _Encoder()
++
++    class _OmniLike(nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.thinker = _Thinker()
++
++        def should_apply_lora(self, module_name: str) -> bool:
++            return bool(_pattern.match(module_name))
++
++    return _OmniLike()
++
++
++def _bare_lora_manager(base_model, target_modules, num_layers: int = 2):
++    """Construct a LoRAManager skeleton sufficient for ``init_lora_modules``
++    to run without touching memory pools, adapter download, or CUDA."""
++    mgr = LoRAManager.__new__(LoRAManager)
++    mgr.base_model = base_model
++    mgr.target_modules = set(target_modules)
++    mgr.base_hf_config = MagicMock(num_hidden_layers=num_layers)
++    mgr.experts_shared_outer_loras = False
++    mgr.lora_use_virtual_experts = False
++    return mgr
++
++
++def _record_set_lora_module(bucket: list):
++    """Return a ``set_lora_module`` replacement that records names and
++    returns a MagicMock (which tolerates arbitrary attribute writes that the
++    real code performs on the wrapped layer)."""
++
++    def _impl(name, _mod):
++        bucket.append(name)
++        return MagicMock()
++
++    return _impl
++
++
++class TestShouldApplyLoraGate:
++    def test_gate_filters_audio_tower(self):
++        base = _make_fake_omni_like_model()
++        mgr = _bare_lora_manager(base, {"qkv_proj", "o_proj"}, num_layers=2)
++
++        wrapped: list[str] = []
++        mgr.set_lora_module = _record_set_lora_module(wrapped)
++
++        mgr.init_lora_modules()
++
++        leaks = [n for n in wrapped if "audio_tower" in n]
++        assert leaks == [], f"audio_tower modules leaked into LoRA wrap: {leaks}"
++
++        expected = {
++            "thinker.model.layers.0.self_attn.qkv_proj",
++            "thinker.model.layers.0.self_attn.o_proj",
++            "thinker.model.layers.1.self_attn.qkv_proj",
++            "thinker.model.layers.1.self_attn.o_proj",
++        }
++        missing = expected - set(wrapped)
++        assert not missing, f"missing LLM modules from LoRA wrap: {missing}"
++
++    def test_legacy_model_without_hook_keeps_suffix_match(self):
++        class _Vanilla(nn.Module):
++            def __init__(self):
++                super().__init__()
++                self.model = _Body(n_layers=2)
++            # Deliberately no should_apply_lora -> getattr returns None ->
++            # gate is a no-op (legacy suffix matching applies).
++
++        mgr = _bare_lora_manager(_Vanilla(), {"qkv_proj"}, num_layers=2)
++        wrapped: list[str] = []
++        mgr.set_lora_module = _record_set_lora_module(wrapped)
++
++        mgr.init_lora_modules()
++
++        assert "model.layers.0.self_attn.qkv_proj" in wrapped
++        assert "model.layers.1.self_attn.qkv_proj" in wrapped
++
++    def test_deny_all_hook_wraps_nothing(self):
++        class _DenyAll(nn.Module):
++            def __init__(self):
++                super().__init__()
++                self.model = _Body(n_layers=2)
++
++            def should_apply_lora(self, module_name: str) -> bool:
++                return False
++
++        mgr = _bare_lora_manager(_DenyAll(), {"qkv_proj", "o_proj"}, num_layers=2)
++        wrapped: list[str] = []
++        mgr.set_lora_module = _record_set_lora_module(wrapped)
++
++        mgr.init_lora_modules()
++
++        assert wrapped == [], f"deny-all hook should wrap nothing, got: {wrapped}"
++
++
++if __name__ == "__main__":
++    raise SystemExit(pytest.main([__file__, "-v"]))
