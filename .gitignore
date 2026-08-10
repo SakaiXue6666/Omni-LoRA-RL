@@ -15,3 +15,7 @@ checkpoints/
 # 本地环境
 .venv*/
 .env
+
+# 早期对话导出，只留本地存档，不入仓库
+cursor_sglang_lora.md
+rl_lora_omni-gpt.md
