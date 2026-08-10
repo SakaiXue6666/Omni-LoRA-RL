@@ -80,8 +80,30 @@ v1 的 delta 一共 7 个文件，和 Relax 那 44 个文件只有 `python/sglan
 
 sglang 侧不一样：上游至今没有 Omni 的 LoRA 支持，`qwen3_omni_moe.py` 里既没有 `should_apply_lora` 也没有 audio/vision tower 的 LoRA 排除逻辑。这部分是**永久 delta**，不是技术债，需要一直带着（也正是将来给 sgl-project 开 PR 的内容）。
 
+## 探针一结论：LoRA 的作用范围（已验证，2026-08-11）
+
+脚本 `mig_02_lora_scope.py` + `modal_probe_lora_scope.py`，在 v2 镜像 + Relax `9a5674af` 上跑通（T4，约 2 分钟；塔用 meta device 构建，不加载权重）。
+
+Relax 的 Megatron 模型 `Qwen3OmniMoeModel` 在 `pre_process` 的 rank 上确实建了两个塔，而且用的是 **transformers 的 HF 实现**（`Qwen3OmniMoeAudioEncoder` / `Qwen3OmniMoeVisionEncoder`），只有 `language_model` 是 Megatron 的 GPT。`PEFT.__call__` 走的是通用的 `_walk_model`，会下探到 HF 子模块，所以塔在遍历范围内——挂不挂上完全取决于名字撞不撞。
+
+实测（transformers 5.6.0）：
+
+| 塔 | 线性层叶子名 | 与 Megatron 命名是否撞车 |
+|---|---|---|
+| audio | `q_proj` `k_proj` `v_proj` `out_proj` `fc1` `fc2` `proj1` `proj2` `conv_out` | 全不撞 |
+| vision attention / merger | `qkv` `proj` `0` `2` | 不撞 |
+| vision MLP | `linear_fc1` `linear_fc2` | **撞** |
+
+命中结果：
+
+- `--lora-target-modules linear_qkv linear_proj`（v1 与官方默认，即 Q/K/V/O）→ 两个塔**命中 0 个模块**，LoRA 只落在 language model 上。
+- 追加 `linear_fc1 linear_fc2` → 命中 `vision_model.blocks.N.mlp.linear_fc1/2`，即视觉塔每一层的 MLP（探针把 depth 压到 1，实际 27 层就是 54 个模块）。
+
+**结论：只挂注意力投影时不需要改 Relax 的注入逻辑，CLI 默认值就是对的。** 但这是个隐式约束——哪天想给 MLP 加 LoRA，必须先用通配符（`ModuleMatcher` 支持 `*.layers.0.*.linear_qkv` 这种）或 `exclude_modules` 把视觉塔排除掉，否则会静默给视觉塔挂上 adapter，而 SGLang 基座那边根本没有对应模块。
+
 ## 待办
 
-- [ ] GPU 探针一：上游 PEFT 会不会把 LoRA 挂到 audio/vision tower 上；Relax 的 provider 建出来的 Megatron 模型到底含不含这两个 tower
-- [ ] GPU 探针二：`export_adapter_weights` 的张量命名与 v1 direct 导出做 parity 对照
+- [x] 探针一：LoRA 作用范围 —— 见上节
+- [ ] 探针二：`export_adapter_weights` 的张量命名与 v1 direct 导出做 parity 对照
 - [ ] 把 v1 的 sglang delta（7 文件，写在 0.5.9 上）移植到 `v0.5.12.post1`
+- [ ] 给 Relax 开第一个 PR：让 `convert_megatron_to_hf_target_modules` 支持通配符（现在通配符会原样落进 `adapter_config.json`，SGLang 的 PEFT 加载器不认 glob）
