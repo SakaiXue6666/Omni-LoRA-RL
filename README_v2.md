@@ -125,14 +125,33 @@ SGLang 侧往返验证（30B-A3B thinker：hidden=2048、32 头、4 KV 组、hea
 
 1. **拆开 vs 融合** —— v1 手写导出直接产 `qkv_proj.lora_{A,B}`；v2 产分开的 q/k/v，SGLang 的 `normalize_qkv_proj` 会堆回去，等价。
 2. **QKV 去交错** —— v1 写了 `_reorder_qkv_lora_b` 手工把按 query group 交错的排布重排成 `[q;k;v]`；上游已经做了同样的事。**这段代码可以整个丢弃。**
-3. **`base_model.model.` 前缀** —— v1 的名字带这个前缀，v2 不带（上游只在 `convert_adapter_weights_to_peft_state` 落盘时才加，而 Relax 的 `export_local_adapter` / `write_hf_peft_adapter` 都是原样用 `param_name`，没走那个函数）。对内存推送这条路无影响，因为 SGLang 全靠后缀和正则匹配。
+3. **`base_model.model.` 前缀** —— v1 的名字带这个前缀，v2 不带（上游只在 `convert_adapter_weights_to_peft_state` 落盘时才加，而 Relax 的 `export_local_adapter` / `write_hf_peft_adapter` 都是原样用 `param_name`，没走那个函数）。对推给 SGLang 这条路无影响，因为 SGLang 全靠后缀和正则匹配；但对导出产物有影响，见下一节。
 
-顺带发现一个**待查的风险**（不阻塞 S2TT 文本训练，但会影响断点续训）：`write_hf_peft_adapter` 的 docstring 说产出的目录能被 Megatron-Bridge 的 `load_peft_adapter` 读回，但它写的 key 不带 `base_model.model.` 前缀，而标准 HF-PEFT 的 `adapter_model.safetensors` 是带的。需要读一下 `load_peft_adapter` 确认它容不容忍——如果不容忍，这是给 Relax 开的第二个 PR。
+## 探针三结论：导出的 adapter 目录标准 PEFT 读不回来（已验证，2026-08-11）
+
+脚本 `mig_04_peft_prefix.py` + `modal_probe_peft_prefix.py`（纯 CPU，约 2 分钟）。
+
+起因是探针二发现 Relax 落盘的 key 不带 `base_model.model.` 前缀——`write_hf_peft_adapter` 是把 `export_adapter_weights` 的 `param_name` 原样 `save_file` 的，没走上游的 `convert_adapter_weights_to_peft_state`（那个函数才负责加前缀）。
+
+先澄清一个**不成立的担心**：这不影响断点续训。`checkpoint.py` 的 `_save_lora_to_checkpoint` 写得很明确，`lora_adapter/` 是「可移植的导出产物，供外部/推理使用」，**不是续训来源**——LoRA 参数就是普通模型参数，原生 Megatron torch_dist checkpoint 已经存了。
+
+但那句「例如用 `peft.PeftModel.from_pretrained` 加载」是不成立的。实测（peft 0.20.0 + transformers 5.6.0）：标准 PEFT 自己写出的 key 全部形如 `base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight`；把前缀去掉再读回，`PeftModel.from_pretrained` **不报错**，只发一条 `UserWarning: Found missing adapter keys`，然后 `lora_B` 全是零——也就是拿到一个「什么都没学到」的模型。
+
+影响范围：
+
+| 路径 | 是否受影响 | 原因 |
+|---|---|---|
+| 训练中推给 SGLang（内存 / 磁盘） | 否 | SGLang 按后缀和正则匹配，与前缀无关 |
+| 断点续训 | 否 | 走原生 torch_dist checkpoint |
+| 用标准 PEFT 加载导出的 adapter | **是** | 静默加载出全零 LoRA |
+
+顺带印证了 v1 用的 `base_model.model.thinker.model.layers...` 命名本来就是符合 PEFT 规范的。
 
 ## 待办
 
-- [x] 探针一：LoRA 作用范围 —— 见上节
-- [x] 探针二：`export_adapter_weights` 的命名与 v1 direct 导出 parity —— 见上节
-- [ ] 查 `load_peft_adapter` 是否要求 `base_model.model.` 前缀（影响断点续训）
+- [x] 探针一：LoRA 作用范围 —— 见上文
+- [x] 探针二：`export_adapter_weights` 的命名与 v1 direct 导出 parity —— 见上文
+- [x] 探针三：导出的 adapter 目录能否被标准 PEFT 读回 —— 不能，见上文
 - [ ] 把 v1 的 sglang delta（7 文件，写在 0.5.9 上）移植到 `v0.5.12.post1`
 - [ ] 给 Relax 开第一个 PR：让 `convert_megatron_to_hf_target_modules` 支持通配符（现在通配符会原样落进 `adapter_config.json`，SGLang 的 PEFT 加载器不认 glob）
+- [ ] 给 Relax 开第二个 PR：`write_hf_peft_adapter` 落盘时补 `base_model.model.` 前缀（或改走 `convert_adapter_weights_to_peft_state`）
