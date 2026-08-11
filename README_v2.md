@@ -147,11 +147,36 @@ SGLang 侧往返验证（30B-A3B thinker：hidden=2048、32 头、4 KV 组、hea
 
 顺带印证了 v1 用的 `base_model.model.thinker.model.layers...` 命名本来就是符合 PEFT 规范的。
 
+## sglang delta 移植（已完成，2026-08-11）
+
+v1 的 delta 写在 0.5.9 上，共五处改动。逐条在 v0.5.12.post1（+ Relax vendor patch）上核对后，**四处仍然需要**：
+
+| v1 的改动 | 在 v0.5.12.post1 上的状态 |
+|---|---|
+| `lora_manager` 的 `getattr` 兼容垫片 | 丢弃 —— 四个 ServerArgs 字段都已存在且默认值一致 |
+| `lora_manager` 的 `should_apply_lora` 门 | 仍需要，且是上游回归（见下） |
+| `tp_worker` 补 `monkey_patch_torch_reductions` | 仍需要 —— 上游只在 `update_weights_from_tensor` 里调了 |
+| `patch_torch` 的 CPU tensor 保护 | 仍需要 —— 仍是无条件改第 7 个参数 |
+| `qwen3_omni_moe` 的音频对齐 + LoRA 声明 | 仍需要 —— 上游该文件原封不动 |
+
+**`should_apply_lora` 是上游回归**：v0.5.12.post1 里有 13 个模型定义了这个钩子（`qwen3_vl`、`qwen3_vl_moe`、`qwen2_vl`、`gpt_oss`、`gemma*` 等），`init_lora_modules` 的注释也还在说「embed_tokens 和 lm_head 要在 should_apply_lora gate 之前处理」，但**整个仓库没有任何调用方**——钩子成了死代码。Relax 的 vendor patch 没碰过 `lora_manager.py`，所以这是上游自身的状态。也就是说，v1 当年写的这段并不是 Omni 专属 hack，而是在补上游自己假设存在的行为。
+
+移植后 `lora-omni-v2` 分支的构成（三个提交，叠在上游 tag `v0.5.12.post1` 上）：
+
+1. `ce1717a786` —— Relax 的 vendor patch（44 文件），与官方 Docker 镜像保持一致
+2. `b7225ce5ec` —— 三处上游修复：恢复 gate 调用、CPU reducer 保护、adapter 加载前装 torch reducer
+3. `aa87211755` —— Omni 专属：外层类声明 LoRA 支持 + 变长音频对齐
+
+拆成两个提交是为了将来能把第 2 个直接抽出来提给 sgl-project，不用再从 Omni 改动里剥离。
+
 ## 待办
 
 - [x] 探针一：LoRA 作用范围 —— 见上文
 - [x] 探针二：`export_adapter_weights` 的命名与 v1 direct 导出 parity —— 见上文
 - [x] 探针三：导出的 adapter 目录能否被标准 PEFT 读回 —— 不能，见上文
-- [ ] 把 v1 的 sglang delta（7 文件，写在 0.5.9 上）移植到 `v0.5.12.post1`
+- [x] 把 v1 的 sglang delta 移植到 `v0.5.12.post1` —— 见上文
+- [ ] 探针四：用 meta device 建 sglang 侧的 Qwen3-Omni，核对 `_lora_pattern` 对真实模块名的命中
+- [ ] 给 sgl-project 开 PR：恢复 `should_apply_lora` 调用点（+ 另两处修复）
+- [ ] 补 gate 的单元测试（v1 有 `test_should_apply_lora_gate.py`，尚未移植）
 - [ ] 给 Relax 开第一个 PR：让 `convert_megatron_to_hf_target_modules` 支持通配符（现在通配符会原样落进 `adapter_config.json`，SGLang 的 PEFT 加载器不认 glob）
 - [ ] 给 Relax 开第二个 PR：`write_hf_peft_adapter` 落盘时补 `base_model.model.` 前缀（或改走 `convert_adapter_weights_to_peft_state`）
