@@ -201,6 +201,25 @@ v1 那份 `test_should_apply_lora_gate.py` 写在 `test/srt/lora/` 下，用的�
 | `test/registered/unit/models/test_qwen3_omni_lora_pattern.py` | `_lora_pattern` 的正负样例，模块名取自探针四的实测结果 | 我们的 delta |
 
 拆开是为了让上游 PR 只带通用测试，不用捆 Omni 的改动。两份都靠 `LoRAManager.__new__` 跳过 `__init__`，不碰显存池也不下 adapter。跑法：`modal run modal_run_lora_tests.py`（挂本地测试文件到 fork 的 clone 上，改完不用先推）。
+## 上游 PR（2026-08-11）
+
+三个改动确认是上游的问题（而不是我们的适配），分别提了 PR。作者只署我自己。
+
+| PR | 仓库 | 分支 | 状态 |
+|---|---|---|---|
+| Honor `should_apply_lora` when wrapping LoRA target modules | sgl-project/sglang | `fix/lora-honor-should-apply-lora` | 已提，#34428，等 CI 与 review |
+| `fix(lora): expand path-pattern target modules to HF names` | redai-infra/Relax | `fix/lora-target-modules-wildcard-export` | 已推 fork，待开 PR |
+| `fix(lora): write exported adapters in PEFT's key layout` | redai-infra/Relax | `fix/lora-adapter-peft-prefix` | 已推 fork，待开 PR |
+
+正文分别在 `pr/sglang-01-body.md`、`pr/relax-01-wildcard-body.md`、`pr/relax-02-peft-prefix-body.md`。
+
+Relax 那两个的动机各自都有硬证据：
+
+- **通配符**：Relax 自己的 `scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-lora-mtp-8xgpu.sh` 就在用 `*decoder.layers.*.linear_qkv`，注释写明是为了让 MTP 层保持冻结。注入侧（Bridge）认这个模式，导出侧不认——glob 会原样落进 `adapter_config.json` 和 SGLang 启动参数，而两边都只按后缀匹配，等于导出的 config 一个模块都没点到。
+- **PEFT 前缀**：`_save_lora_to_checkpoint` 的 docstring 和中英文档都承诺 `lora_adapter/` 可以用 `peft.PeftModel.from_pretrained` 加载，但落盘的 key 不带 `base_model.model.`。探针三实测：不报错，只警告一句 missing keys，然后 `lora_B` 全零。续训和 SGLang 都不受影响，受影响的恰好就是这个产物承诺的唯一用途。
+
+两个分支都做了双向验证（`modal_verify_relax_prs.py`）：打了补丁 47/48 个用例全过；把 `megatron_peft_utils.py` 换回上游 `main` 再跑，新加的用例全挂。`ruff format --check` 与 `ruff check` 干净（`modal_lint_relax_prs.py`，本地 pip 连不上源所以放容器里跑）。
+
 ## 待办
 
 - [x] 探针一：LoRA 作用范围 —— 见上文
@@ -208,7 +227,9 @@ v1 那份 `test_should_apply_lora_gate.py` 写在 `test/srt/lora/` 下，用的�
 - [x] 探针三：导出的 adapter 目录能否被标准 PEFT 读回 —— 不能，见上文
 - [x] 把 v1 的 sglang delta 移植到 `v0.5.12.post1` —— 见上文
 - [x] 探针四：`_lora_pattern` 对真实模块名的命中 —— 见上文
-- [ ] 给 sgl-project 开 PR：恢复 `should_apply_lora` 调用点（+ 另两处修复）
+- [x] 给 sgl-project 开 PR：恢复 `should_apply_lora` 调用点 —— #34428
 - [x] 补 gate 的单元测试 —— 已按上游新目录约定重写，6 个用例在 T4 上全过 —— 见上文
-- [ ] 给 Relax 开第一个 PR：让 `convert_megatron_to_hf_target_modules` 支持通配符（现在通配符会原样落进 `adapter_config.json`，SGLang 的 PEFT 加载器不认 glob）
-- [ ] 给 Relax 开第二个 PR：`write_hf_peft_adapter` 落盘时补 `base_model.model.` 前缀（或改走 `convert_adapter_weights_to_peft_state`）
+- [x] 给 Relax 开第一个 PR：`convert_megatron_to_hf_target_modules` 支持路径模式 —— 分支已推，正文已写
+- [x] 给 Relax 开第二个 PR：`write_hf_peft_adapter` 补 `base_model.model.` 前缀 —— 分支已推，正文已写
+- [ ] sglang 的另两处修复（`patch_torch` 的 CPU 张量越界保护、`tp_worker` 的 reducer 安装）单独提 PR
+- [ ] 真机跑通 Omni Thinker LoRA adapter mode 的端到端 rollout
