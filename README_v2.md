@@ -191,6 +191,16 @@ thinker.model.layers.{0,1}.self_attn.{qkv_proj,o_proj}   <-- 放行
 
 脚本：`mig_05_sglang_lora_scope.py` + `modal_probe_sglang_scope.py`。注意 runner 会 clone fork 的 `lora-omni-v2` 分支并把 `python/` 顶到 `PYTHONPATH` 最前面，否则验的是镜像里预装的那份 sglang，看不到新加的门。
 
+## 单元测试（已完成，2026-08-11）
+
+v1 那份 `test_should_apply_lora_gate.py` 写在 `test/srt/lora/` 下，用的是 pytest 风格。0.5.12.post1 把测试重排到了 `test/registered/`（跑服务的）和 `test/registered/unit/`（不起服务的），并要求：镜像源码树的目录结构、文件顶部调 `register_cpu_ci` / `register_cuda_ci`、用 `unittest` + `CustomTestCase`、`__main__` 里不许裸调 `pytest.main`（仓库里有 `test_no_bare_pytest_main.py` 专门查这条）。所以按新约定重写，并拆成两份：
+
+| 文件 | 内容 | 归属 |
+|---|---|---|
+| `test/registered/unit/lora/test_should_apply_lora_gate.py` | 通用 gate 行为：塔不被包、没有钩子的模型保持后缀匹配、全拒钩子什么都不包 | 随上游 PR 一起提，不含任何 Omni 依赖 |
+| `test/registered/unit/models/test_qwen3_omni_lora_pattern.py` | `_lora_pattern` 的正负样例，模块名取自探针四的实测结果 | 我们的 delta |
+
+拆开是为了让上游 PR 只带通用测试，不用捆 Omni 的改动。两份都靠 `LoRAManager.__new__` 跳过 `__init__`，不碰显存池也不下 adapter。跑法：`modal run modal_run_lora_tests.py`（挂本地测试文件到 fork 的 clone 上，改完不用先推）。
 ## 待办
 
 - [x] 探针一：LoRA 作用范围 —— 见上文
@@ -199,6 +209,6 @@ thinker.model.layers.{0,1}.self_attn.{qkv_proj,o_proj}   <-- 放行
 - [x] 把 v1 的 sglang delta 移植到 `v0.5.12.post1` —— 见上文
 - [x] 探针四：`_lora_pattern` 对真实模块名的命中 —— 见上文
 - [ ] 给 sgl-project 开 PR：恢复 `should_apply_lora` 调用点（+ 另两处修复）
-- [ ] 补 gate 的单元测试（v1 有 `test_should_apply_lora_gate.py`，尚未移植）
+- [x] 补 gate 的单元测试 —— 已按上游新目录约定重写，6 个用例在 T4 上全过 —— 见上文
 - [ ] 给 Relax 开第一个 PR：让 `convert_megatron_to_hf_target_modules` 支持通配符（现在通配符会原样落进 `adapter_config.json`，SGLang 的 PEFT 加载器不认 glob）
 - [ ] 给 Relax 开第二个 PR：`write_hf_peft_adapter` 落盘时补 `base_model.model.` 前缀（或改走 `convert_adapter_weights_to_peft_state`）
