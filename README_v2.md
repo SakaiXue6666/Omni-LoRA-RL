@@ -288,6 +288,24 @@ thinker.model.layers.{0,1}.self_attn.o_proj.lora_A.weight  (32, 4096)
 
 脚本：`mig_08_train_side.py` + `modal_probe_train_side.py`。用的是 Relax 自己的 `build_lora_peft` 和 bridge，不是重写一遍，所以验的是真实代码路径。
 
+## 与 v1 的对照（2026-08-12，做端到端训练之前的核对）
+
+把 v1 训练侧翻了一遍，和探针七的结果逐条对，有五处需要记下来。
+
+**1. LoRA 超参不一致，端到端时要改回 v1 的。** v1 冒烟脚本用的是 `--lora-rank 16 --lora-alpha 32`（sglang 侧 `--sglang-max-lora-rank 16`），探针五和七我用的是 32/64。功能上都成立，但 v1 那条 100 步 S2TT 的 BLEU 曲线是在 16/32 上跑出来的，v2 想和它对比就得对齐超参，否则说不清差异来自迁移还是来自 rank。
+
+**2. `--lora-target-modules` 的默认值是 v1 的一处 delta，我们没有移植，而且不该移植。** v1 把默认改成了 `*language_model*linear_qkv` / `*language_model*linear_proj`，理由是裸的 `linear_qkv` 会挂到 `audio_model`。但 v1 那个结论出自 `verify_lora_attach.py` 里手搭的 Omni-like 树，不是真模型。探针七在 Relax 真建出来的 `Qwen3OmniMoeModel` 上用裸名字，8 个 adapter 参数全在语言模型里，塔干净 —— 因为 v2 的 audio/vision 是 HF 模块，叫 `q_proj/k_proj/v_proj`，压根不叫 `linear_qkv`。
+
+   而且这里有个反向依赖：**通配符恰好是我们给 Relax 提 [#261](https://github.com/redai-infra/Relax/pull/261) 要修的那个 bug**（glob 会原样落进 `adapter_config.json`，导出侧一个模块都点不到）。所以真要用 v1 的加固写法，就得先带上 #261；用裸名字则不需要。结论是保持裸名字，不把 #261 变成端到端训练的前置条件。
+
+**3. v1 那个"adapter 名里带 audio/vision 就告警"的守卫（`_assert_lora_attached`）在 v2 上游不存在。** 探针七证明当前不需要它，但它便宜，可以作为后续给 Relax 的一个小 PR，或者先在我们这侧留个断言。
+
+**4. v1 根本没有 `export_adapter_weights`。** 它 pin 的 redai bridge（`f13bec09`）早于这个 API，导出走的是 `convert_qwen3omni_to_hf` 的 direct 路线，里面还得手写 `_reorder_qkv_lora_b()` 做 GQA 维度重排。探针七证明 v2 的 bridge 原生就把 fused `linear_qkv` 拆成 `q/k/v_proj` —— 这一整条 direct 路径连同重排函数，在 v2 里整个删掉。这是这次迁移最大的一块减法。
+
+**5. 下一个风险点是 TP>1 的 adapter gather，探针七只验了 TP=1。** v1 在这儿流过血（坑 16：TP=4 手写 all_gather 撞 CUDA illegal access），并且专门留了 `verify_lora_tp.py`（TP=2）和 `verify_tp_gather.py`（TP=4）两个探针。v2 这块交给 bridge 做，大概率没事，但"大概率"不算验过 —— 上 4×A100 之前值得先花两张卡验一次导出 parity。
+
+端到端时要照抄的 v1 配置：`TP=4 / EP=4 / PP=1`，**关掉 sequence-parallel 和 recompute**（v1 记录：recompute + SP + LoRA 会让 `lora_B` 的 backward 出 NaN），`A100-80GB:4`、timeout 240 分钟、`retries=10`（Modal 抢占后从卷上的 ckpt 续跑）。
+
 ## 待办
 
 - [x] 探针一：LoRA 作用范围 —— 见上文
@@ -303,4 +321,5 @@ thinker.model.layers.{0,1}.self_attn.o_proj.lora_A.weight  (32, 4096)
 - [x] 探针五：1×A100 上验 adapter 热加载、可逆、稳定 —— 五项全过，见上文
 - [ ] sglang 的另两处修复（`patch_torch` 的 CPU 张量越界保护、`tp_worker` 的 reducer 安装）单独提 PR —— 证据已备齐（探针六）
 - [x] 探针七：训练侧冒烟（Bridge 建 Omni + LoRA 注入 + adapter 导出）—— 一次通过，见上文
+- [ ] 探针八：TP=2 的 adapter 导出 parity（对准 v1 坑 16 的 TP gather）
 - [ ] 真机跑通端到端训练（下一级：参照 v1 的 `modal_relax_smoke.py::learn_audio` + `run-qwen3-30B-A3B-omni-lora-smoke.sh`，4×A100 上跑 S2TT）
