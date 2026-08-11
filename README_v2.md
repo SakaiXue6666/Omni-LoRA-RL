@@ -208,8 +208,8 @@ v1 那份 `test_should_apply_lora_gate.py` 写在 `test/srt/lora/` 下，用的�
 | PR | 仓库 | 分支 | 状态 |
 |---|---|---|---|
 | Honor `should_apply_lora` when wrapping LoRA target modules | sgl-project/sglang | `fix/lora-honor-should-apply-lora` | 已提，#34428，等 CI 与 review |
-| `fix(lora): expand path-pattern target modules to HF names` | redai-infra/Relax | `fix/lora-target-modules-wildcard-export` | 已推 fork，待开 PR |
-| `fix(lora): write exported adapters in PEFT's key layout` | redai-infra/Relax | `fix/lora-adapter-peft-prefix` | 已推 fork，待开 PR |
+| `fix(lora): expand path-pattern target modules to HF names` | redai-infra/Relax | `fix/lora-target-modules-wildcard-export` | 已提 #261，CI 全绿 |
+| `fix(lora): write exported adapters in PEFT's key layout` | redai-infra/Relax | `fix/lora-adapter-peft-prefix` | 已提 #262，修掉 docformatter 后 CI 全绿 |
 
 正文分别在 `pr/sglang-01-body.md`、`pr/relax-01-wildcard-body.md`、`pr/relax-02-peft-prefix-body.md`。
 
@@ -220,6 +220,41 @@ Relax 那两个的动机各自都有硬证据：
 
 CI 上踩过一个坑：Relax 的 `.pre-commit-config.yaml` 里有个本地 hook `docformatter --wrap-descriptions 79`，ruff 不管这条。#262 第一版就是因为测试文件里一段 docstring 按 ~90 列折行，被 docformatter 改写后判定「files were modified」而挂掉（Lint 和 ruff 全过，所以光跑 ruff 看不出来）。日志要登录才能下，用 `modal_precommit_relax_prs.py` 在容器里把仓库自带的 pre-commit 原样跑一遍就复现了。以后给 Relax 提 PR，docstring 描述段一律折到 79 列以内，或者直接跑那个脚本。
 两个分支都做了双向验证（`modal_verify_relax_prs.py`）：打了补丁 47/48 个用例全过；把 `megatron_peft_utils.py` 换回上游 `main` 再跑，新加的用例全挂。`ruff format --check` 与 `ruff check` 干净（`modal_lint_relax_prs.py`，本地 pip 连不上源所以放容器里跑）。
+
+## 探针六：CPU 张量的 reduce 越界（2026-08-11，纯 CPU）
+
+给第三个 sglang PR 攒的实证，顺便解释了为什么 `patch_torch` 和 `tp_worker` 两处改动必须捆在一起提。
+
+上游 `_reduce_tensor_modified` 无条件改写参数元组的 index 6，注释里的依据是「签名多年没变」。那个假设只对 CUDA 张量成立。实测一个 CPU 张量经 `reductions.reduce_tensor` 出来是：
+
+```
+rebuild 函数: rebuild_tensor      参数元组长度: 3
+  [0] _TensorMeta   [1] TypedStorage   [2] (0, torch.Size([4, 4]), (4, 1), False)
+```
+
+长度 3，取 index 6 直接 `IndexError: tuple index out of range` —— 不是静默写坏某个字段，是硬崩。A/B 三段都成立：守卫版序列化通过、换成上游那版当场抛 IndexError、换回守卫版又能通过。
+
+因果链值得写清楚，否则容易误以为这是上游的既有 bug：v1 在 0.5.9 上推 CPU 张量没事，是因为当时 LoRA 那条路压根没调 `monkey_patch_torch_reductions`；是我们给 `tp_worker` 补上 reducer 安装之后，越界才暴露出来。所以这两处是同一个改动的两半，要一起提。verl 踩过同一个坑（bug #4065）。
+
+脚本：`mig_07_cpu_reduce.py`，入口 `modal run modal_probe_serve_lora.py --stage reduce`（CPU，约 90 秒）。
+
+## 探针五：真机上把 adapter 热推给 sglang（2026-08-11，1×A100-80GB）
+
+第一次在真硬件上跑通 v2 的推理侧。判据沿用 v1 的三条 —— 只判「输出变了」太弱，改一个字节的权重输出也会变。
+
+| 检查 | 结果 |
+|---|---|
+| 带 `enable_lora` 起 Omni | 起来了。这一步本身就是 gate 的验证：塔要是被误包，加载时 hidden dim 就对不上 |
+| base 生成 | `今天天气很好。`，套了 chat 模板（v1 教训：不套会直接吐 `<|im_end|>`） |
+| 可逆性：推 B=0 的 adapter | 与 base 的 logprob **最大差 0.000000** |
+| 生效性：换非零 B（scale 0.12） | 最大差 2.416，输出明显跑偏 |
+| 稳定性：连续 unload 到 load 三轮 | 不崩，空闲显存稳定在 11.5/79.3 GiB |
+
+可逆那条是这次最有价值的一条：B=0 时精确复现 base，说明 384 个张量的命名全部被 sglang 认了下来。要是有名字没对上，那部分权重会被静默丢弃，B=0 时同样看不出差别 —— 但反过来，能精确复现、同时非零 B 又确实生效，两条合起来才排除了「名字错了所以没生效」和「名字错了但恰好没影响」这两种假通过。这把探针二的静态命名比对升级成了真机验证。
+
+adapter 全程是 CPU 张量（384 个），走的正是探针六那条序列化路径。
+
+脚本：`mig_06_serve_lora.py`，三个 stage：`--stage inspect`（CPU，查模型卷与源码）、`--stage reduce`（CPU，探针六）、`--stage probe`（A100，本节）。设计直接沿用 v1 `modal_run.py` 的实验 G/J：引擎参数 `disable_cuda_graph=True, mem_fraction_static=0.85, tp_size=1`、chat 模板、adapter 构造方式、logprob 比对，都是 v1 已经验过的，这次没有重新试错。
 
 ## 待办
 
@@ -232,5 +267,7 @@ CI 上踩过一个坑：Relax 的 `.pre-commit-config.yaml` 里有个本地 hook
 - [x] 补 gate 的单元测试 —— 已按上游新目录约定重写，6 个用例在 T4 上全过 —— 见上文
 - [x] 给 Relax 开第一个 PR：`convert_megatron_to_hf_target_modules` 支持路径模式 —— 分支已推，正文已写
 - [x] 给 Relax 开第二个 PR：`write_hf_peft_adapter` 补 `base_model.model.` 前缀 —— 分支已推，正文已写
-- [ ] sglang 的另两处修复（`patch_torch` 的 CPU 张量越界保护、`tp_worker` 的 reducer 安装）单独提 PR
-- [ ] 真机跑通 Omni Thinker LoRA adapter mode 的端到端 rollout
+- [x] 探针六：CPU 张量 reduce 越界的 A/B —— 上游 IndexError，守卫版通过，见上文
+- [x] 探针五：1×A100 上验 adapter 热加载、可逆、稳定 —— 五项全过，见上文
+- [ ] sglang 的另两处修复（`patch_torch` 的 CPU 张量越界保护、`tp_worker` 的 reducer 安装）单独提 PR —— 证据已备齐（探针六）
+- [ ] 真机跑通端到端训练（下一级：参照 v1 的 `modal_relax_smoke.py::learn_audio` + `run-qwen3-30B-A3B-omni-lora-smoke.sh`，4×A100 上跑 S2TT）
