@@ -218,6 +218,7 @@ Relax 那两个的动机各自都有硬证据：
 - **通配符**：Relax 自己的 `scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-lora-mtp-8xgpu.sh` 就在用 `*decoder.layers.*.linear_qkv`，注释写明是为了让 MTP 层保持冻结。注入侧（Bridge）认这个模式，导出侧不认——glob 会原样落进 `adapter_config.json` 和 SGLang 启动参数，而两边都只按后缀匹配，等于导出的 config 一个模块都没点到。
 - **PEFT 前缀**：`_save_lora_to_checkpoint` 的 docstring 和中英文档都承诺 `lora_adapter/` 可以用 `peft.PeftModel.from_pretrained` 加载，但落盘的 key 不带 `base_model.model.`。探针三实测：不报错，只警告一句 missing keys，然后 `lora_B` 全零。续训和 SGLang 都不受影响，受影响的恰好就是这个产物承诺的唯一用途。
 
+CI 上踩过一个坑：Relax 的 `.pre-commit-config.yaml` 里有个本地 hook `docformatter --wrap-descriptions 79`，ruff 不管这条。#262 第一版就是因为测试文件里一段 docstring 按 ~90 列折行，被 docformatter 改写后判定「files were modified」而挂掉（Lint 和 ruff 全过，所以光跑 ruff 看不出来）。日志要登录才能下，用 `modal_precommit_relax_prs.py` 在容器里把仓库自带的 pre-commit 原样跑一遍就复现了。以后给 Relax 提 PR，docstring 描述段一律折到 79 列以内，或者直接跑那个脚本。
 两个分支都做了双向验证（`modal_verify_relax_prs.py`）：打了补丁 47/48 个用例全过；把 `megatron_peft_utils.py` 换回上游 `main` 再跑，新加的用例全挂。`ruff format --check` 与 `ruff check` 干净（`modal_lint_relax_prs.py`，本地 pip 连不上源所以放容器里跑）。
 
 ## 待办
