@@ -169,13 +169,35 @@ v1 的 delta 写在 0.5.9 上，共五处改动。逐条在 v0.5.12.post1（+ Re
 
 拆成两个提交是为了将来能把第 2 个直接抽出来提给 sgl-project，不用再从 Omni 改动里剥离。
 
+## 探针四结论：`_lora_pattern` 打在了哪些模块上（已验证，2026-08-11）
+
+前三个探针都是训练侧（Megatron / Bridge）的，这个是推理侧的：把 sglang 的 `Qwen3OmniMoeForConditionalGeneration` 真建出来，看 `_lora_pattern` 对**真实模块名**的命中。
+
+做法：只把配置压小（文本 48→2 层、专家 128→4、音频 32→2、视觉 27→2），在 meta device 上建模，不加载任何权重。T4 单卡两分钟。建模前要先 `initialize_dp_attention`，否则 `LayerCommunicator` 会在建 decoder layer 时报 `dp attention not initialized`。
+
+121 个模块里，`--lora-target-modules qkv_proj o_proj` 的**纯后缀匹配命中 8 个，其中 4 个在塔里**：
+
+```
+thinker.visual.blocks.0.attn.qkv_proj              <-- 被门挡掉
+thinker.visual.blocks.1.attn.qkv_proj              <-- 被门挡掉
+thinker.audio_tower.layers.0.self_attn.qkv_proj    <-- 被门挡掉
+thinker.audio_tower.layers.1.self_attn.qkv_proj    <-- 被门挡掉
+thinker.model.layers.{0,1}.self_attn.{qkv_proj,o_proj}   <-- 放行
+```
+
+也就是说，没有 `should_apply_lora` 这个门，上游会把**一半**的目标模块挂到视觉塔和音频塔上——而 adapter 里根本没有这些模块的权重。这条正好是探针一（训练侧只在语言模型上挂 LoRA）的推理侧镜像，两边闭合。
+
+顺带确认门本身放行的 8 个模块（`embed_tokens`、`lm_head`、每层的 `mlp.experts` 和两个投影）里，只有投影会真正落到 target 集合内，其余是 pattern 里的预留项，不会误伤。
+
+脚本：`mig_05_sglang_lora_scope.py` + `modal_probe_sglang_scope.py`。注意 runner 会 clone fork 的 `lora-omni-v2` 分支并把 `python/` 顶到 `PYTHONPATH` 最前面，否则验的是镜像里预装的那份 sglang，看不到新加的门。
+
 ## 待办
 
 - [x] 探针一：LoRA 作用范围 —— 见上文
 - [x] 探针二：`export_adapter_weights` 的命名与 v1 direct 导出 parity —— 见上文
 - [x] 探针三：导出的 adapter 目录能否被标准 PEFT 读回 —— 不能，见上文
 - [x] 把 v1 的 sglang delta 移植到 `v0.5.12.post1` —— 见上文
-- [ ] 探针四：用 meta device 建 sglang 侧的 Qwen3-Omni，核对 `_lora_pattern` 对真实模块名的命中
+- [x] 探针四：`_lora_pattern` 对真实模块名的命中 —— 见上文
 - [ ] 给 sgl-project 开 PR：恢复 `should_apply_lora` 调用点（+ 另两处修复）
 - [ ] 补 gate 的单元测试（v1 有 `test_should_apply_lora_gate.py`，尚未移植）
 - [ ] 给 Relax 开第一个 PR：让 `convert_megatron_to_hf_target_modules` 支持通配符（现在通配符会原样落进 `adapter_config.json`，SGLang 的 PEFT 加载器不认 glob）
