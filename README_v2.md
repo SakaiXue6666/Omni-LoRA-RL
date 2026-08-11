@@ -306,6 +306,29 @@ thinker.model.layers.{0,1}.self_attn.o_proj.lora_A.weight  (32, 4096)
 
 端到端时要照抄的 v1 配置：`TP=4 / EP=4 / PP=1`，**关掉 sequence-parallel 和 recompute**（v1 记录：recompute + SP + LoRA 会让 `lora_B` 的 backward 出 NaN），`A100-80GB:4`、timeout 240 分钟、`retries=10`（Modal 抢占后从卷上的 ckpt 续跑）。
 
+## 探针八：TP=2 的 adapter 导出 parity（2026-08-12，2×A10G，约 5 分钟）
+
+探针七只验了 TP=1，而 v1 恰恰在 TP>1 的 adapter gather 上流过血（坑 16：TP=4 手写 all_gather 撞 CUDA illegal access），当年为此留了两个专门的探针。v2 把 gather 交给 bridge，理应没事——但"理应"不算验过。
+
+判据设计上有个坑必须绕开：**不能拿 TP=1 和 TP=2 的导出直接比数值**。Megatron 的 TP 初始化按 rank 分 RNG 种子，同一个逻辑权重在两种并行度下本来就不是同一份随机数，比出来的差异毫无意义。改成两条自洽判据：形状必须是完整尺寸；导出的 q/k/v 三块拼起来，必须和我们手工 `all_gather` 出来的 fused 矩阵是同一批行。
+
+结果全过，顺带看清了分片长什么样——这是这次最有价值的发现：
+
+```
+linear_qkv.adapter.linear_in   (16, 2048)   partition_dim=0   <-- rank 维被切了！32 -> 16
+linear_qkv.adapter.linear_out  (2560, 32)   partition_dim=0        输出维切，5120 -> 2560
+linear_proj.adapter.linear_in  (32, 2048)   partition_dim=1        输入维切
+linear_proj.adapter.linear_out (1024, 32)   partition_dim=0
+```
+
+**LoRA 的 rank 维本身也参与 TP 切分**（`linear_in` 每卡只有 16 行，两卡合起来才是 rank=32），这点之前没意识到。导出的 `q_proj.lora_A` 是完整的 `(32, 2048)`，说明 bridge 把这一维也正确拼回来了。三种不同的切分模式（rank 维、输出维、输入维）在一次导出里全部还原正确。
+
+对账细节：手工 gather 的 fused `linear_out` 是 `(5120, 32)`，导出的 q+k+v 拼接也是 `(5120, 32)`，两者排序后逐元素相等；且 `q_proj` 的每一行都能在 fused 矩阵里找到——gather 没丢数据，GQA 的 de-interleave 也没错位。
+
+一个观察：TP>1 时 `Qwen3OmniModelProvider.finalize()` 会强制打开 `sequence_parallel`。这次没跑 backward 所以无所谓，但 v1 记录过 recompute + SP + LoRA 会让 `lora_B` 的 backward 出 NaN，端到端时要注意这个交互。
+
+脚本：`mig_09_tp_export.py` + `modal_probe_tp_export.py`（torchrun 起 2 进程）。
+
 ## 待办
 
 - [x] 探针一：LoRA 作用范围 —— 见上文
@@ -321,5 +344,5 @@ thinker.model.layers.{0,1}.self_attn.o_proj.lora_A.weight  (32, 4096)
 - [x] 探针五：1×A100 上验 adapter 热加载、可逆、稳定 —— 五项全过，见上文
 - [ ] sglang 的另两处修复（`patch_torch` 的 CPU 张量越界保护、`tp_worker` 的 reducer 安装）单独提 PR —— 证据已备齐（探针六）
 - [x] 探针七：训练侧冒烟（Bridge 建 Omni + LoRA 注入 + adapter 导出）—— 一次通过，见上文
-- [ ] 探针八：TP=2 的 adapter 导出 parity（对准 v1 坑 16 的 TP gather）
+- [x] 探针八：TP=2 的 adapter 导出 parity —— 三种切分模式全部正确还原，见上文
 - [ ] 真机跑通端到端训练（下一级：参照 v1 的 `modal_relax_smoke.py::learn_audio` + `run-qwen3-30B-A3B-omni-lora-smoke.sh`，4×A100 上跑 S2TT）
