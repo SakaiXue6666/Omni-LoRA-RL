@@ -256,6 +256,38 @@ adapter 全程是 CPU 张量（384 个），走的正是探针六那条序列化
 
 脚本：`mig_06_serve_lora.py`，三个 stage：`--stage inspect`（CPU，查模型卷与源码）、`--stage reduce`（CPU，探针六）、`--stage probe`（A100，本节）。设计直接沿用 v1 `modal_run.py` 的实验 G/J：引擎参数 `disable_cuda_graph=True, mem_fraction_static=0.85, tp_size=1`、chat 模板、adapter 构造方式、logprob 比对，都是 v1 已经验过的，这次没有重新试错。
 
+## 探针七：训练侧冒烟（2026-08-12，1×A10G，约 3 分钟）
+
+前六个探针验的全是推理侧和导出命名的静态预测，训练侧在 v2 上一次都没跑过。这一步只回答三件事，完全不碰 rollout、数据集、优化器。
+
+省钱的关键是缩层：`provider.num_layers = 2`，随机初始化，不加载 30B 真实权重。这不是我们发明的 hack —— Relax 的 `model_provider.py` 把 `num_layers` 列进了 `bridge_keys`，注释写明「Allow CLI to override layer count for layer-reduced training」，是官方支持的路子。缩完 3.06B，一张 A10G（22 GiB）绰绰有余，用不着 A100。
+
+| 检查 | 结果 |
+|---|---|
+| `AutoBridge` 建 Omni | `Qwen3OmniModelProvider` → `Qwen3OmniMoeModel`，48 层缩到 2 层 |
+| LoRA 注入范围 | 8 个 adapter 参数，每层 4 个（`linear_qkv` / `linear_proj` 各 A/B），全在 `language_model.*`，塔里一个都没有 |
+| 底模冻结 | 可训参数恰好就是那 8 个 adapter |
+| adapter 导出 | 16 个张量，命名与形状见下 |
+
+导出的命名和形状：
+
+```
+thinker.model.layers.{0,1}.self_attn.q_proj.lora_A.weight  (32, 2048)
+thinker.model.layers.{0,1}.self_attn.q_proj.lora_B.weight  (4096, 32)
+thinker.model.layers.{0,1}.self_attn.k_proj.lora_B.weight  (512, 32)
+thinker.model.layers.{0,1}.self_attn.o_proj.lora_A.weight  (32, 4096)
+```
+
+三条结论：
+
+1. **Megatron 侧是 fused 的 `linear_qkv`，导出时被 Bridge 的 `QKVMapping` 拆成了 `q/k/v_proj`。** 这正是 v1 手写 de-interleave 干的事，现在上游做了 —— 探针二是静态推断，这次是真模型上的实证，那段代码可以退休。
+2. **形状与 v1 写死的值逐个对上**：hidden 2048、q_out 4096、kv_out 512。
+3. **数量闭环**：2 层导出 16 个，48 层就是 384 个 —— 正好是探针五推给 sglang 引擎的那 384 个张量。训练侧产出什么、推理侧吃什么，两边咬合上了。
+
+`convert_megatron_to_hf_target_modules(['linear_qkv', 'linear_proj'])` 落到 `adapter_config.json` 里是 `['q_proj', 'k_proj', 'v_proj', 'o_proj']`，与导出的叶子模块完全覆盖。
+
+脚本：`mig_08_train_side.py` + `modal_probe_train_side.py`。用的是 Relax 自己的 `build_lora_peft` 和 bridge，不是重写一遍，所以验的是真实代码路径。
+
 ## 待办
 
 - [x] 探针一：LoRA 作用范围 —— 见上文
@@ -270,4 +302,5 @@ adapter 全程是 CPU 张量（384 个），走的正是探针六那条序列化
 - [x] 探针六：CPU 张量 reduce 越界的 A/B —— 上游 IndexError，守卫版通过，见上文
 - [x] 探针五：1×A100 上验 adapter 热加载、可逆、稳定 —— 五项全过，见上文
 - [ ] sglang 的另两处修复（`patch_torch` 的 CPU 张量越界保护、`tp_worker` 的 reducer 安装）单独提 PR —— 证据已备齐（探针六）
+- [x] 探针七：训练侧冒烟（Bridge 建 Omni + LoRA 注入 + adapter 导出）—— 一次通过，见上文
 - [ ] 真机跑通端到端训练（下一级：参照 v1 的 `modal_relax_smoke.py::learn_audio` + `run-qwen3-30B-A3B-omni-lora-smoke.sh`，4×A100 上跑 S2TT）
