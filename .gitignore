@@ -19,3 +19,7 @@ checkpoints/
 # 早期对话导出，只留本地存档，不入仓库
 cursor_sglang_lora.md
 rl_lora_omni-gpt.md
+
+# 一次性的本地补丁/诊断脚本
+_patch_*.py
+_probe_env.py

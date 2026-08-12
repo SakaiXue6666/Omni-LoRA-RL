@@ -201,22 +201,38 @@ v1 那份 `test_should_apply_lora_gate.py` 写在 `test/srt/lora/` 下，用的�
 | `test/registered/unit/models/test_qwen3_omni_lora_pattern.py` | `_lora_pattern` 的正负样例，模块名取自探针四的实测结果 | 我们的 delta |
 
 拆开是为了让上游 PR 只带通用测试，不用捆 Omni 的改动。两份都靠 `LoRAManager.__new__` 跳过 `__init__`，不碰显存池也不下 adapter。跑法：`modal run modal_run_lora_tests.py`（挂本地测试文件到 fork 的 clone 上，改完不用先推）。
-## 上游 PR（2026-08-11）
+## 上游 PR（2026-08-11 起）
 
-三个改动确认是上游的问题（而不是我们的适配），分别提了 PR。作者只署我自己。
+五个改动确认是上游的问题（而不是我们的适配），分别提了 PR。作者只署我自己。
 
 | PR | 仓库 | 分支 | 状态 |
 |---|---|---|---|
 | Honor `should_apply_lora` when wrapping LoRA target modules | sgl-project/sglang | `fix/lora-honor-should-apply-lora` | 已提，#34428，等 CI 与 review |
 | `fix(lora): expand path-pattern target modules to HF names` | redai-infra/Relax | `fix/lora-target-modules-wildcard-export` | 已提 #261，CI 全绿 |
 | `fix(lora): write exported adapters in PEFT's key layout` | redai-infra/Relax | `fix/lora-adapter-peft-prefix` | 已提 #262，修掉 docformatter 后 CI 全绿 |
+| `fix(lora): inline adapter tensors into the engine payload` | redai-infra/Relax | `fix/lora-adapter-transport-shm` | 分支已推 `1ceb779b`，正文已写 |
+| Fix IndexError when reducing CPU tensors after `monkey_patch_torch_reductions` | sgl-project/sglang | `fix/reduce-tensor-cpu-guard` | 分支已推 `11093f14`，正文已写 |
 
-正文分别在 `pr/sglang-01-body.md`、`pr/relax-01-wildcard-body.md`、`pr/relax-02-peft-prefix-body.md`。
+正文分别在 `pr/sglang-01-body.md`、`pr/relax-01-wildcard-body.md`、`pr/relax-02-peft-prefix-body.md`、`pr/relax-03-transport-body.md`。
 
 Relax 那两个的动机各自都有硬证据：
 
 - **通配符**：Relax 自己的 `scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-lora-mtp-8xgpu.sh` 就在用 `*decoder.layers.*.linear_qkv`，注释写明是为了让 MTP 层保持冻结。注入侧（Bridge）认这个模式，导出侧不认——glob 会原样落进 `adapter_config.json` 和 SGLang 启动参数，而两边都只按后缀匹配，等于导出的 config 一个模块都没点到。
 - **PEFT 前缀**：`_save_lora_to_checkpoint` 的 docstring 和中英文档都承诺 `lora_adapter/` 可以用 `peft.PeftModel.from_pretrained` 加载，但落盘的 key 不带 `base_model.model.`。探针三实测：不报错，只警告一句 missing keys，然后 `lora_B` 全零。续训和 SGLang 都不受影响，受影响的恰好就是这个产物承诺的唯一用途。
+
+- **adapter 传输**：真机 4×A100 上第一次推 adapter 就死在 TP0，而 TP1–3 成功。根因是
+  payload 里装的是 `/dev/shm` 引用不是字节，见下文探针九。这个 PR 把序列化抽成
+  `megatron_peft_utils.serialize_adapter_tensors` 再改内联——抽函数不是为了好看，是因为
+  原调用处所在的 `update_weight_from_tensor.py` 模块级就 `from megatron.core import mpu`，
+  CPU CI 里 import 不进来，测试只能 skip，等于没有保护。挪到纯 torch 的工具模块后，
+  测试落在已经跑在 CI 里的 `tests/utils/test_megatron_peft_utils.py`。
+
+- **CPU 张量越界**：`monkey_patch_torch_reductions()` 换掉的是**所有**张量的 reducer，不只
+  CUDA 的，而 `_reduce_tensor_modified` 无条件改写第 6 个参数——CPU 张量归约出来的元组根本
+  没有那一位，于是 `IndexError`。这条不是我们独有：verl 的
+  [#4065](https://github.com/volcengine/verl/issues/4065) 从 2025 年 11 月挂到现在，多人复现，
+  traceback 一模一样，帖子里流传的临时补丁就是这个长度守卫。也就是说下游用户现在要么手改
+  site-packages，要么改走 merge 模式绕开推 adapter。
 
 CI 上踩过一个坑：Relax 的 `.pre-commit-config.yaml` 里有个本地 hook `docformatter --wrap-descriptions 79`，ruff 不管这条。#262 第一版就是因为测试文件里一段 docstring 按 ~90 列折行，被 docformatter 改写后判定「files were modified」而挂掉（Lint 和 ruff 全过，所以光跑 ruff 看不出来）。日志要登录才能下，用 `modal_precommit_relax_prs.py` 在容器里把仓库自带的 pre-commit 原样跑一遍就复现了。以后给 Relax 提 PR，docstring 描述段一律折到 79 列以内，或者直接跑那个脚本。
 两个分支都做了双向验证（`modal_verify_relax_prs.py`）：打了补丁 47/48 个用例全过；把 `megatron_peft_utils.py` 换回上游 `main` 再跑，新加的用例全挂。`ruff format --check` 与 `ruff check` 干净（`modal_lint_relax_prs.py`，本地 pip 连不上源所以放容器里跑）。
@@ -342,7 +358,137 @@ linear_proj.adapter.linear_out (1024, 32)   partition_dim=0
 - [x] 给 Relax 开第二个 PR：`write_hf_peft_adapter` 补 `base_model.model.` 前缀 —— 分支已推，正文已写
 - [x] 探针六：CPU 张量 reduce 越界的 A/B —— 上游 IndexError，守卫版通过，见上文
 - [x] 探针五：1×A100 上验 adapter 热加载、可逆、稳定 —— 五项全过，见上文
-- [ ] sglang 的另两处修复（`patch_torch` 的 CPU 张量越界保护、`tp_worker` 的 reducer 安装）单独提 PR —— 证据已备齐（探针六）
+- [x] sglang 的 `patch_torch` CPU 张量越界保护 —— 分支已推，正文已写；`tp_worker` 那处在 main 上已作废（上游把反序列化收敛进 `_deserialize_own_rank`，里面就装了 reducer，LoRA 那条路也走它）
 - [x] 探针七：训练侧冒烟（Bridge 建 Omni + LoRA 注入 + adapter 导出）—— 一次通过，见上文
 - [x] 探针八：TP=2 的 adapter 导出 parity —— 三种切分模式全部正确还原，见上文
-- [ ] 真机跑通端到端训练（下一级：参照 v1 的 `modal_relax_smoke.py::learn_audio` + `run-qwen3-30B-A3B-omni-lora-smoke.sh`，4×A100 上跑 S2TT）
+- [x] 探针九：adapter 传输三路对照 —— 复现真机 ENOENT，内联字节全过，见下文
+- [x] 给 Relax 开第三个 PR：adapter 推送改内联字节 —— 分支已推，正文已写
+- [x] 真机跑通端到端训练 —— 4×A100 跑完 40 步 S2TT，逐段贴着 v1 的曲线，见下文
+- [ ] 同传 S2TT 的移植 —— v1 的 `examples/simul_s2tt/rollout.py` 走 `--custom-generate-function-path`，务必连 `3a6eb2f` 那个 reward 去污染补丁一起带过来
+- [ ] 续训不生效的排查 —— 见下文「两条运维教训」
+
+## 端到端训练：从 v1 移植过来的那套
+
+目标是回答一件事：迁到 v2 之后还学不学得动。所以超参逐项照抄 v1 那次 100 步 S2TT
+实验，reward 也逐字移植——口径动一点，曲线就没法比。v1 的参照曲线：前 10 步 BLEU
+均值约 0.29，31-40 步约 0.41，80-90 步约 0.53。判据必须用窗口均值，因为 v1 自己的
+单步波动能有 ±0.1（step 90 是 0.539，step 100 掉到 0.397）。
+
+首跑定 40 步：v1 记录每步约 4.4 分钟，40 步约 3 小时，卡在一个 240 分钟的容器窗口
+里跑得完；而 30-40 步正好是信号浮出噪声的位置。100 步要靠 SAVE_INTERVAL + retries
+跨容器续跑才撑得下来，验证迁移不需要付这个成本。
+
+三个新文件：
+
+- `omni_s2tt/bleu_rm.py` —— 句级 BLEU，挂在 `--custom-rm-path` 上。v1 是直接改
+  Relax 源码加了个 `rm_type=bleu` 分支，v2 有扩展点，这条 delta 从"改框架"降级成
+  "加一个文件"。算法与 v1 逐字一致，故意不做改进。只加了一处观测：统计响应里带
+  `<|...|>` 的条数（v1 在同传里发现过这种污染会把 BLEU 压到真实值的约四成），但不
+  改分数，因为 v1 的 S2TT 基线当时也没打这个补丁。
+- `omni_s2tt/run-qwen3-omni-lora-s2tt-4gpu.sh` —— v1 冒烟脚本的 v2 版。
+- `modal_train_s2tt.py` —— runner，含 CPU 版 `check`、断点续跑、BLEU 曲线判定。
+
+### 相对 v1 少掉的三样东西（都是上游变好了）
+
+1. **LoRA 开关**：v1 的 `--lora-enable --lora-name policy` 在 v2 不存在。LoRA 由
+   `--lora-rank > 0` 打开，adapter 名字是代码常量 `LORA_ADAPTER_NAME`，再加
+   `--lora-adapter-mode` 走 adapter 模式。
+2. **sglang 的 LoRA 参数**：v1 要手写 `--sglang-enable-lora` /
+   `--sglang-max-lora-rank` / `--sglang-lora-target-modules`，v2 的
+   `sglang_engine.py` 自己从训练侧参数推（target 经
+   `convert_megatron_to_hf_target_modules` 转成 `q/k/v/o_proj`），rollout 也自动带
+   `lora_path`。整条链路是上游接好的。
+3. **一堆绕行**：`SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK`、`--sglang-attention-backend
+   triton`、`--sglang-disable-cuda-graph`、`--sglang-disable-custom-all-reduce`。这些
+   在 v1 是因为往旧 slime 镜像里注入了更新的 sglang，内核二进制对不上；v2 用 Relax
+   官方镜像 + 同版本(0.5.12.post1)的 sglang fork，不存在这个错配。
+
+保留 v1 的一条安全默认：**不开 sequence-parallel、不开 recompute**（v1 记录过
+recompute + SP + LoRA 会让 lora_B 的 backward 出 NaN）。注意 TP>1 时 Omni 的
+provider 会在 `finalize()` 里自己打开 sequence_parallel，这里不额外叠加。
+
+`--lora-target-modules` 用裸名字 `linear_qkv linear_proj` 而不是 v1 的通配符：探针七
+确认过塔不会被误挂（v2 的 audio/vision 是 HF 模块，叫 `q_proj` 之类，压根不叫
+`linear_qkv`），而通配符会原样落进 `adapter_config.json`（已提 Relax #261）。
+
+### 数据
+
+复用 v1 的 `s2tt-data` 卷，128 条 FLEURS en→zh，与 v1 当年同一批，音频零缺失。
+样本形如 `{"prompt": "<audio>...", "audios": [wav], "label": {"ground_truth": ...},
+"metadata": {"tgt_lang": "zh", ...}}`。128 条配 rollout-batch 8 是每 16 步一个 epoch，
+40 步约 2.5 个 epoch —— v1 跑 100 步时是同样的数据量，所以可比。
+
+## 探针九：adapter 传输的三路对照（2026-08-12，纯 CPU，几分钟）
+
+第一次起 40 步训练时，模型建好、LoRA 注入、引擎起来、基础权重同步完成（19743 个参数、
+7.7 秒），死在第一次推 adapter。而且只死一个 rank：TP1–TP3 都打了
+`loading from tensors completes`，只有 TP0 报
+
+```
+RuntimeError: unable to open shared memory object </torch_4103_2908601601_198>
+in read-write mode: No such file or directory
+```
+
+`4103` 是训练侧 rank 0 的 pid。**这暴露了探针五的盲区**：探针五验的是进程内
+`sglang.Engine` 的热加载，根本没经过跨进程共享内存这条路，所以「adapter 能热推」这个
+结论在真实的 Ray → HTTP 链路下并不自动成立。
+
+用一个几乎免费的 CPU 探针（`modal_probe_transport.py`：一个 Ray actor 序列化，四个
+consumer actor 反序列化）把三种传输方式摆在一起：
+
+| 传输方式 | 结果 |
+|---|---|
+| `file_descriptor`（torch 默认） | 四个 rank 全挂，`AuthenticationError` |
+| `file_system`（上游实际在用） | TP0 挂在 ENOENT，TP1–3 成功 |
+| pickle + base64 内联（v1 的做法） | 四个 rank 全过，校验和都对得上 |
+
+第二行和真机报错一字不差。**关键是必须让 TP0 迟到才能复现**：`/dev/shm` 那个文件是
+引用计数管理的，先到的 rank 映射完、返回时释放引用，计数归零文件即被 unlink，落在后面
+的 rank 再去开就 ENOENT。第一次跑探针时四个消费者几乎同时进来，反而全过；加 8 秒延迟
+立刻复现。这解释了真机上为什么偏偏只有 TP0 死，也说明这个 bug 一直是靠调度运气活着的。
+
+值得记一笔：上游的注释显示他们**已经踩过一次**——默认策略跨不过 Ray→HTTP，所以主动切成
+了 `file_system`。真机死的是绕完之后的第二个坑。两种策略的共性才是问题所在：payload 里
+放的是引用，而引用的有效期取决于生产者还攥不攥着那块存储。
+
+修法是 adapter 那一路改成内联真字节，payload 从 0.1 MB 变成 31.6 MB（rank 16 的 adapter
+约 24 MB，v1 扛着这个代价跑完了 100 步）。sglang 一侧不用动，因为
+`MultiprocessingSerializer.deserialize` 本来就是 base64 解码 + unpickle。基础权重那一路
+不碰：那些张量在设备上，序列化成 CUDA IPC 句柄，本身自包含——这也正是基础权重同步从来
+没出过事的原因。
+
+## 端到端 40 步 S2TT（2026-08-12，4×A100-80GB，colocate TP4/EP4）
+
+跑完 40/40 步，每步推一次 adapter，没有再出传输错误。按十步分段与 v1 对照
+（v1 表是 1 起步、我们是 0 起步，已对齐）：
+
+| 区间 | v1 | v2 | 差 |
+|---|---|---|---|
+| 前 10 步 | 0.287 | 0.294 | +0.007 |
+| 第 11–20 步 | 0.344 | 0.331 | −0.013 |
+| 第 21–30 步 | 0.345 | 0.357 | +0.012 |
+| 第 31–40 步 | 0.389 | 0.391 | +0.002 |
+| 涨幅（末段−首段） | +0.102 | +0.098 | — |
+
+四段全部落在噪声内，涨幅几乎一致。判据在开跑前就写死了（后 10 步均值落在 0.36–0.42、
+且前后差值同量级），不是看到结果再补的。逐步数值在 `_curve.json`。
+
+**两条曲线可比的前提**要说清楚：v1 的 100 步 S2TT 基线是 `lora-omni-baseline @ 8bcbb42`，
+而 reward 去污染那个提交 `3a6eb2f` 是**之后**为同传才做的——也就是说 v1 的 S2TT 曲线和
+我们这条一样带 `<|im_end|>` 污染。所以这次不剥离恰恰是对的。将来要比同传，才必须把那个
+补丁一起移过去，否则会重演 v1 记过的「BLEU 平躺 0.06、advantage≈0、学不动」。
+
+至此 v1 → v2 的迁移在端到端层面闭环：sglang 的 `should_apply_lora` 门、Omni 的
+`_lora_pattern`、Relax 的通配符展开与 PEFT 前缀、以及 adapter 传输，全部由这一次训练
+隐式验证过了。
+
+### 两条运维教训
+
+1. **`remote()` 会把训练的生命周期绑在本地那个 modal 进程上。** 第一次跑 40 步时本地一断，
+   app 在第 5 步被收掉（`Runner has been shutting down for too long`），只留下
+   `iter_0000004`。改成 v1 的做法——`train.spawn(...)`，把调用交给服务端就走人，配
+   `modal run --detach`。取结果用
+   `modal run modal_train_s2tt.py::result --call-id <id>`。
+2. **续训没生效。** 重起时本意是从 `iter_0000004` 接着跑，实际从 0 开始了，原因是上次被
+   提前收掉、`latest_checkpointed_iteration.txt` 没写出来。这次反而因祸得福：拿到了完整
+   的 0–39 一条曲线，和 v1 对照更干净。但 LoRA 的续训路径仍未验证过，长跑之前要单独查。
