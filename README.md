@@ -14,7 +14,7 @@ Qwen3-Omni Thinker + LoRA 的强化学习训练工程。当前跑通的任务是
 |---|---|---|---|
 | `Relax/` | fork 自 `redai-infra/Relax` | `lora-omni-v2` | 训练侧（Megatron-Bridge + LoRA + rollout） |
 | `sglang/` | fork 自 `sgl-project/sglang` `v0.5.12.post1` | `lora-omni-v2` | 推理侧（Omni 的 LoRA serving） |
-| `omni_s2tt/` | 本仓库自带 | - | S2TT 的训练脚本、BLEU 奖励、数据准备 |
+| `omni_s2tt/` | 本仓库自带 | - | S2TT 的训练脚本、BLEU 奖励、数据准备、曲线统计 |
 
 之所以还要 fork，是因为有五处改动还没进上游（PR 已提，见 `README_v2.md` 的「上游 PR」）。
 一旦合并，fork 就能退化成"上游 + Omni 专属那两处"。
@@ -185,24 +185,77 @@ Ray 不用自己起。脚本会 source `Relax/scripts/entrypoint/local.sh`，那
 后台跑就套 `nohup ... &` 或 tmux。管道那里注意 `set -o pipefail`（脚本里已经有了）：
 不套的话退出码取的是 `tee` 的，训练崩了也报成功。
 
-## 六、看结果
+## 六、记录与看结果
 
-BLEU 曲线在日志里，每步一行：
+跑在服务器上不像 Modal 有面板兜着，所以先说清楚每样东西落在哪。**只要设了 `SAVE_DIR`，
+下面前三样都是自动的**，不用加开关。
 
-```bash
-grep -o "rollout [0-9]*: {'rollout/raw_reward': [0-9.]*" train.log
+### 逐样本的 reward（最该收的一份）
+
+`$SAVE_DIR/rollout_result/train/<step>.jsonl`，每步一个文件，每行一条样本：
+
+```
+rollout_id / sample_index / group_index / prompt / response / reward / label
+prompt_length / response_length / total_length / status
 ```
 
-`raw_reward` 就是这一步 batch 的句级 BLEU 均值。判据用**窗口均值**而不是单步——单步
-噪声很大，v1 自己的曲线单步能从 0.539 掉到 0.397。健康的 40 步大致是：
+BLEU 曲线只是这份数据的均值，而排查问题要的是原始 response——译文空了、带 `<|im_end|>`、
+还是组内八条完全一样（那样 GRPO 没有梯度），都得翻这里。没设 `SAVE_DIR` 的话显式给
+`--rollout-result-dir <目录>` 也行。
+
+统计曲线：
+
+```bash
+python3 omni_s2tt/curve.py $SAVE_DIR/rollout_result/train --csv curve.csv
+```
+
+它按步打印均值与直方条，并算首尾窗口均值。判据用**窗口均值**而不是单步——单步噪声
+很大，v1 的曲线单步能从 0.539 掉到 0.397。健康的 40 步大致是：
 
 | 区间 | 参照值 |
 |---|---|
 | 前 10 步 | 0.29 左右 |
 | 第 31–40 步 | 0.39–0.41 |
 
-另外两处产出：Relax 的完整日志在 `log/qwen3-omni-lora-s2tt-<时间戳>.log`，
-checkpoint 在 `$SAVE_DIR/iter_XXXXXXX`（含 optimizer 状态，可续跑）。
+### TensorBoard
+
+默认就开着（`--use-tensorboard` 默认为真）。落盘目录有优先级：`TENSORBOARD_DIR` 环境变量
+> `$SAVE_DIR/tensorboard_log` > `tensorboard_log/<项目>/<实验>`（相对路径，会跟着 Ray job
+的工作目录跑，不好找）。建议在跑之前显式钉死绝对路径：
+
+```bash
+export TENSORBOARD_DIR=/data/s2tt/tb/run1        # 要在 ray start 之前 export
+tensorboard --logdir /data/s2tt/tb --host 0.0.0.0 --port 6006
+```
+
+曲线在 `rollout/raw_reward`（这一步的 BLEU 均值）、`rollout/rewards`、`response_len/*`
+以及 `perf/*` 下面。
+
+### 文本日志
+
+两处，作用不同：
+
+- `log/qwen3-omni-lora-s2tt-<时间戳>.log` —— 脚本自己 tee 的，是 Ray driver 的输出，
+  训练主线程与每步的 metrics 行都在这儿
+- `/tmp/ray/session_latest/logs/` —— Ray worker 的日志。**训练崩了要看的是这里**，
+  driver 那边往往只剩一句 actor died，真正的 traceback 在 worker 的 `python-core-worker-*.log`
+  和 `worker-*.err` 里
+
+服务器上记得把这两处也落到能长期保存的盘：`/tmp` 一重启就没了。
+
+### wandb（可选）
+
+实验室机器常没外网，用离线模式，回头再 `wandb sync`：
+
+```bash
+export WANDB_API_KEY=...          # 在线才需要
+# 在训练脚本的 WANDB_ARGS 里加：--use-wandb --wandb-mode offline --wandb-dir /data/s2tt/wandb
+```
+
+### checkpoint
+
+`$SAVE_DIR/iter_XXXXXXX`，含 optimizer 状态，`--load` 指向同一目录即可续跑。默认
+`--max-actor-ckpt-to-keep 1`，只留最新一个，想多留就调 `MAX_CKPT_KEEP`。
 
 ## 想调什么，去哪调
 
