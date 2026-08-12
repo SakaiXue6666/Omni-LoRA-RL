@@ -1,4 +1,4 @@
-# omni-lora-rl
+# Omni-LoRA-RL
 
 Qwen3-Omni Thinker + LoRA 的强化学习训练工程。当前跑通的任务是 **S2TT**（英语语音 →
 中文文本），奖励用句级 BLEU，算法用 GRPO，推理侧走 sglang 的 LoRA adapter 热加载。
@@ -31,8 +31,8 @@ Qwen3-Omni Thinker + LoRA 的强化学习训练工程。当前跑通的任务是
 ## 一、拉代码
 
 ```bash
-git clone --recursive -b v2 https://github.com/SakaiXue6666/omni-lora-rl.git
-cd omni-lora-rl
+git clone --recursive https://github.com/SakaiXue6666/Omni-LoRA-RL.git
+cd Omni-LoRA-RL
 
 # 已经 clone 但忘了 --recursive：
 git submodule update --init --recursive
@@ -56,7 +56,7 @@ docker run --gpus all -it --rm \
   --ipc=host --shm-size=32g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   --network host \
-  -v $PWD:/workspace/omni-lora-rl \
+  -v $PWD:/workspace/Omni-LoRA-RL \
   -v /path/to/qwen3-omni:/models/qwen3-omni \
   -v /path/to/s2tt-data:/data/s2tt \
   ghcr.io/redai-infra/relaxrl@sha256:8dc39af377a570e6cd7ec88c8b7fcd44c1eb820111e9d2069f1c7c3024b2ea23 \
@@ -76,7 +76,7 @@ pip install --no-cache-dir sacrebleu
 这是最容易翻车的一步，三条都必须有：
 
 ```bash
-cd /workspace/omni-lora-rl
+cd /workspace/Omni-LoRA-RL
 export PYTHONPATH=$PWD:$PWD/sglang/python:$PYTHONPATH
 ```
 
@@ -94,7 +94,7 @@ print('megatron', megatron.core.__file__); print('relax', relax.__file__); \
 print('sglang ', sglang.__file__); print('reward ', b.__file__)"
 ```
 
-`sglang` 那行必须指向 `/workspace/omni-lora-rl/sglang/python/...`。指到别处就是被镜像里
+`sglang` 那行必须指向 `/workspace/Omni-LoRA-RL/sglang/python/...`。指到别处就是被镜像里
 那份盖住了，LoRA 会挂到 audio/vision 塔上去。
 
 ## 三、准备权重
@@ -144,7 +144,7 @@ python3 omni_s2tt/prep_fleurs_s2tt.py --out-dir /data/s2tt --limit 128
 ## 五、跑训练
 
 ```bash
-cd /workspace/omni-lora-rl
+cd /workspace/Omni-LoRA-RL
 
 export HF_CKPT=/models/qwen3-omni
 export DATA=/data/s2tt/train_s2tt.jsonl
@@ -254,6 +254,6 @@ modal run modal_train_s2tt.py::result --call-id <ID>      # 取结果
 
 - `README_v2.md` —— v2 的迁移全过程：九个探针的结论、五个上游 PR、40 步与 v1 的逐段对照
 - `IMPORTANT/my_plan.md` —— 设计文档与实验记录
-- v1 在本仓库的 `main` 分支（tag `v1-frozen`），那边有 `README_v1.md`（镜像 digest 与
+- v1 在本仓库的 `v1` 分支（tag `v1-frozen`），那边有 `README_v1.md`（镜像 digest 与
   复现步骤）和 `patches/`（v1 相对上游的三份归档 patch）。v1 只读，是这条链路上唯一
   一份在真机上完整跑通过的参考实现，v2 出问题时先去那里对照
