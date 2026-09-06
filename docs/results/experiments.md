@@ -10,7 +10,7 @@
 |---|---|---|---|---|---|
 | 0 | 数学 MCQ + 0/1 奖励 | hard 数学选择题 | — | **失败**，零方差 | — |
 | 1 | zh→en 翻译 + 句级 BLEU | 自造长难句 256 条 | 10 | 0.463 → 0.523 | `translate-10step-curve.json` |
-| 2 | **en→zh S2TT（离线单轮）** | FLEURS | **100** | **0.287 → 0.487** | `s2tt-100step-curve.json` |
+| 2 | **en→zh S2TT（离线单轮）** | FLEURS 128 条 | **100** | **0.287 → 0.487** | `s2tt-100step-curve.json` |
 | 3 | 同传（960ms 定长块，多轮） | FLEURS 97 条整段 | 20 | 0.155 → 0.265 | `simul-20step-curve.json` |
 | 4 | en→zh S2TT（当前代码路径） | FLEURS 128 条 | 40 | 0.294 → 0.391 | `s2tt-40step-curve.json` |
 
@@ -51,6 +51,10 @@
 配置：4×A100-80GB colocate，TP4 / EP4 / PP1；LoRA rank 16 / alpha 32，挂 thinker
 language_model 的 `qkv_proj` + `o_proj`；GRPO，kl-loss-coef 0；adam lr 1e-4 constant；
 rollout-batch 8 / n-samples 8 / global-batch 64 / temperature 1.1；奖励 sacreBLEU(中文 tokenizer)/100。
+
+数据是 FLEURS validation 前 128 条 —— 当时没有把条数记进日志，这个数字来自 `prep_s2tt`
+的默认 `limit=128`，与第 4 次实验用的是同一份卷上的数据。128 条配 rollout-batch 8 是每 16 步
+一个 epoch，100 步约 6.25 个 epoch。
 
 十步窗口均值：
 
