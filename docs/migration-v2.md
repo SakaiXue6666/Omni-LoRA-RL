@@ -204,14 +204,15 @@ v1 那份 `test_should_apply_lora_gate.py` 写在 `test/srt/lora/` 下，用的�
 ## 上游 PR（2026-08-11 起）
 
 五个改动确认是上游的问题（而不是我们的适配），分别提了 PR。作者只署我自己。
+下表状态截至 2026-09-05；最新状态以 README 的「当前进度」为准。
 
 | PR | 仓库 | 分支 | 状态 |
 |---|---|---|---|
-| Honor `should_apply_lora` when wrapping LoRA target modules | sgl-project/sglang | `fix/lora-honor-should-apply-lora` | 已提，#34428，等 CI 与 review |
+| Honor `should_apply_lora` when wrapping LoRA target modules | sgl-project/sglang | `fix/lora-honor-should-apply-lora` | 已提 #34428，CI 卡在缺 `run-ci` label，测试从未真正执行 |
 | `fix(lora): expand path-pattern target modules to HF names` | redai-infra/Relax | `fix/lora-target-modules-wildcard-export` | 已提 #261，CI 全绿 |
 | `fix(lora): write exported adapters in PEFT's key layout` | redai-infra/Relax | `fix/lora-adapter-peft-prefix` | 已提 #262，修掉 docformatter 后 CI 全绿 |
-| `fix(lora): inline adapter tensors into the engine payload` | redai-infra/Relax | `fix/lora-adapter-transport-shm` | 分支已推 `1ceb779b`，正文已写 |
-| Fix IndexError when reducing CPU tensors after `monkey_patch_torch_reductions` | sgl-project/sglang | `fix/reduce-tensor-cpu-guard` | 分支已推 `11093f14`，正文已写 |
+| `fix(lora): inline adapter tensors into the engine payload` | redai-infra/Relax | `fix/lora-adapter-transport-shm` | 已提 #265（2026-08-12），等 code owner |
+| Fix IndexError when reducing CPU tensors after `monkey_patch_torch_reductions` | sgl-project/sglang | `fix/reduce-tensor-cpu-guard` | 已提 #34595（2026-08-12），CI 卡在缺 `run-ci` label |
 
 正文分别在 `docs/upstream-prs/sglang-01-body.md`、`docs/upstream-prs/relax-01-wildcard-body.md`、`docs/upstream-prs/relax-02-peft-prefix-body.md`、`docs/upstream-prs/relax-03-transport-body.md`。
 
