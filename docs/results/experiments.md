@@ -82,8 +82,9 @@ Ten-step window means:
 All ten windows rise monotonically except the last, which is flat.
 
 Supporting evidence: response length dropped from 28 tokens to 20 (tighter translations), and
-log_probs rose (more confident generation). A sampled translation, "东非岛屿位于非洲东海岸外的
-印度洋上", scored BLEU 0.659. Zero errors across all 100 steps.
+log_probs rose (more confident generation). A sampled translation, "东非岛屿位于非洲东海岸外的印度洋上"
+("the East African islands lie in the Indian Ocean off the east coast of Africa"), scored BLEU
+0.659. Zero errors across all 100 steps.
 
 This curve was produced in two sittings: steps 1–40 on 06-04, then continued from the checkpoint
 to step 100 on 07-08. The first 40 values are identical digit for digit across both records — it
