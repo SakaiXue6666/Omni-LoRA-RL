@@ -20,6 +20,7 @@ checkpoints/
 cursor_sglang_lora.md
 rl_lora_omni-gpt.md
 
-# 一次性的本地补丁/诊断脚本、临时输出（下划线开头一律不入库）
-_*.py
-_*.json
+# 一次性的本地补丁/诊断脚本、临时输出。只匹配仓库根目录，别误伤包内的
+# __init__.py 和 _selftest_*.py 之类。
+/_*.py
+/_*.json

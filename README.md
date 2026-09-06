@@ -66,7 +66,8 @@ log_probs 上升。逐步原始数据 `docs/results/s2tt-100step-curve.json`。
   继续爬到 0.487，在当前代码上没验过。前 40 步两者逐段吻合（差值都在 ±0.013 内）。
 - **续训没验证过。** 最近一次想从 `iter_0000004` 接着跑，实际从 0 开始了 —— 上次被提前
   收掉，`latest_checkpointed_iteration.txt` 没写出来。LoRA 的续训路径至今没单独查过。
-- **同传还没移到当前代码路径。** `examples/simul_s2tt/` 那套没搬过来。
+- **同传代码已移过来，但一次没跑过。** `omni_s2tt/simul/`，四处必要改动已做；已知风险与
+  预期报错见 [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md)，上卡前先读。
 - **口径**：`omni_s2tt/curve.py` 按 `rollout_result` 的逐样本 reward 统计，上面的数字来自
   训练日志的 `rollout/raw_reward`。两者理论上相等，但没交叉核对过。
 
@@ -97,7 +98,7 @@ PR 正文存档在 `docs/upstream-prs/`。两个 sglang PR 卡的不是技术问
 
 1. 推动 sglang 两个 PR 的 `run-ci` label
 2. 排查 LoRA 续训不生效
-3. 把同传（`examples/simul_s2tt/`）移到当前代码路径，务必连奖励去污染那个补丁一起带过来
+3. 跑通同传（代码已就位，见 `docs/design/simul-port-notes.md` 的风险清单）
 4. 当前代码路径跑满 100 步，确认能复现 0.487
 
 ---
@@ -396,6 +397,7 @@ export WANDB_API_KEY=...          # 在线才需要
 |---|---|
 | [`docs/results/experiments.md`](docs/results/experiments.md) | 四次实验的完整记录：配置、逐步曲线、结论、失败的那次为什么失败 |
 | [`docs/design/reward-design.md`](docs/design/reward-design.md) | 为什么奖励是 BLEU、温度为什么是 1.1、组内方差怎么造 |
+| [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md) | 同传移植：改了哪四处、六条已知风险与各自的报错长什么样 |
 | [`docs/migration-v2.md`](docs/migration-v2.md) | 当前实现是怎么来的：九个探针的结论、五个上游 PR 的动机与证据 |
 | [`scripts/probes/`](scripts/probes/) | 上面每条结论对应的可复现脚本，附索引 |
 | `docs/design/my_plan.md` | 早期的规划与参数快照 |

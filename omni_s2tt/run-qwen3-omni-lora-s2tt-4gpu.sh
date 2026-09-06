@@ -162,6 +162,10 @@ MISC_ARGS=(
    --no-rope-fusion
 )
 
+# 扩展点：额外的 train 参数（空格分隔）。同传脚本用它挂 custom generate，
+# 避免复制整份脚本后与本文件各自漂移。
+read -r -a EXTRA_ARGS_ARR <<< "${EXTRA_ARGS:-}"
+
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address=${RAY_ADDRESS:-"http://127.0.0.1:8265"} \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
@@ -181,4 +185,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address=${RAY_ADDRESS:-"http://127.0.
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-omni-lora-s2tt-${now}.log
+   "${MISC_ARGS[@]}"    ${EXTRA_ARGS_ARR[@]+"${EXTRA_ARGS_ARR[@]}"}  2>&1 | tee log/${LOG_NAME:-qwen3-omni-lora-s2tt}-${now}.log
