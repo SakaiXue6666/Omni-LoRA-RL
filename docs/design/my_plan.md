@@ -1,31 +1,43 @@
-# 背景
+# Background
 - slime
-    - relax: 支持音频输入
-    - miles: 支持lora
+    - relax: supports audio input
+    - miles: supports lora
 - verl
 - ms-swift
 
-# 已实现
-- Qwen3-Omni thinker + LoRA (qkv, o) 的 speech-to-text offline 翻译（英语音频→中文），reward（sacreBLEU quality）在 100 steps 内随训练上升。
+# Done
+- Qwen3-Omni thinker + LoRA (qkv, o) doing offline speech-to-text translation (English audio →
+  Chinese); the reward (sacreBLEU quality) rises with training within 100 steps.
 
-## 参数快照（可回滚基线，改 2a/2b 前固化）
-> 回滚点：Relax 分支 `lora-omni-baseline` @ `8bcbb42`（smoke 脚本含续训修复）；
-> Modal 入口 `v1 分支 modal_relax_smoke.py::learn_audio`（任务 `s2tt`）。以下为两者叠加后的有效参数。
+## Parameter snapshot (rollback baseline, frozen before touching 2a/2b)
+> Rollback point: Relax branch `lora-omni-baseline` @ `8bcbb42` (the smoke script includes the
+> resume fix); Modal entry point `modal_relax_smoke.py::learn_audio` on the `v1` branch (task
+> `s2tt`). Below are the effective parameters after combining the two.
 >
-> - 模型/部署：Qwen3-Omni-30B-A3B thinker，bf16；colocate，单机 4×A100-80GB；offload 开（colocate 默认）。
-> - 并行：TP=4 / EP=4 / ETP=1 / PP=1 / CP=1；micro-batch=1。
-> - LoRA：rank=16，alpha=32，dropout=0.0，name=policy；target=thinker language_model 的 qkv_proj / o_proj。
-> - GRPO：advantage=grpo，kl-loss-coef=0，entropy-coef=0，eps-clip=0.2 / eps-clip-high=0.28；max-staleness=0。
-> - 优化器：adam，lr=1e-4，lr-decay-style=constant，weight-decay=0，beta=(0.9, 0.95)，optimizer-cpu-offload，precision-aware-optimizer。
-> - Rollout：rm-type=bleu，num-rollout=100，rollout-batch=8，n-samples-per-prompt=8，global-batch=64，temperature=1.1，max-response=512，max-prompt=4096，multimodal-keys={"audio":"audios"}。
-> - sglang：rollout-num-gpus-per-engine=4，mem-fraction-static=0.7，enable-lora，max-lora-rank=16，max-loras-per-batch=1，lora-target-modules=qkv_proj o_proj，attention-backend=triton，disable-cuda-graph，disable-custom-all-reduce。
-> - Megatron misc：attention-backend=flash，no-rope-fusion，dropout=0，grad-allreduce-fp32，attention-softmax-fp32。
-> - 存档：save=load=/s2tt/ckpt/s2tt_probe，save-interval=5，max-actor-ckpt-to-keep=1，override-opt_param-scheduler。
-> - Modal：4×A100-80GB，retries=10，--detach。
+> - Model / deployment: Qwen3-Omni-30B-A3B thinker, bf16; colocated, single node 4×A100-80GB;
+>   offload on (the colocate default).
+> - Parallelism: TP=4 / EP=4 / ETP=1 / PP=1 / CP=1; micro-batch=1.
+> - LoRA: rank=16, alpha=32, dropout=0.0, name=policy; target = the thinker language model's
+>   qkv_proj / o_proj.
+> - GRPO: advantage=grpo, kl-loss-coef=0, entropy-coef=0, eps-clip=0.2 / eps-clip-high=0.28;
+>   max-staleness=0.
+> - Optimizer: adam, lr=1e-4, lr-decay-style=constant, weight-decay=0, beta=(0.9, 0.95),
+>   optimizer-cpu-offload, precision-aware-optimizer.
+> - Rollout: rm-type=bleu, num-rollout=100, rollout-batch=8, n-samples-per-prompt=8,
+>   global-batch=64, temperature=1.1, max-response=512, max-prompt=4096,
+>   multimodal-keys={"audio":"audios"}.
+> - sglang: rollout-num-gpus-per-engine=4, mem-fraction-static=0.7, enable-lora, max-lora-rank=16,
+>   max-loras-per-batch=1, lora-target-modules=qkv_proj o_proj, attention-backend=triton,
+>   disable-cuda-graph, disable-custom-all-reduce.
+> - Megatron misc: attention-backend=flash, no-rope-fusion, dropout=0, grad-allreduce-fp32,
+>   attention-softmax-fp32.
+> - Storage: save=load=/s2tt/ckpt/s2tt_probe, save-interval=5, max-actor-ckpt-to-keep=1,
+>   override-opt_param-scheduler.
+> - Modal: 4×A100-80GB, retries=10, --detach.
 
-> 每步 raw_reward（BLEU，batch 均值）：
+> Per-step raw_reward (BLEU, batch mean):
 >
-> | 步 | BLEU | 步 | BLEU | 步 | BLEU | 步 | BLEU |
+> | Step | BLEU | Step | BLEU | Step | BLEU | Step | BLEU |
 > |----|------|----|------|----|------|----|------|
 > | 1 | 0.257 | 11 | 0.352 | 21 | 0.318 | 31 | 0.412 |
 > | 2 | 0.276 | 12 | 0.324 | 22 | 0.373 | 32 | 0.402 |
@@ -38,7 +50,7 @@
 > | 9 | 0.322 | 19 | 0.347 | 29 | 0.342 | 39 | 0.418 |
 > | 10 | 0.304 | 20 | 0.329 | 30 | 0.306 | 40 | 0.418 |
 
-> | 步 | BLEU | 步 | BLEU | 步 | BLEU |
+> | Step | BLEU | Step | BLEU | Step | BLEU |
 > |----|------|----|------|----|------|
 > | 41 | 0.407 | 51 | 0.333 | 61 | 0.365 |
 > | 42 | 0.416 | 52 | 0.402 | 62 | 0.482 |
@@ -51,7 +63,7 @@
 > | 49 | 0.386 | 59 | 0.445 | 69 | 0.432 |
 > | 50 | 0.444 | 60 | 0.424 | 70 | 0.415 |
 
-> | 步 | BLEU | 步 | BLEU | 步 | BLEU |
+> | Step | BLEU | Step | BLEU | Step | BLEU |
 > |----|------|----|------|----|------|
 > | 71 | 0.371 | 81 | 0.475 | 91 | 0.425 |
 > | 72 | 0.558 | 82 | 0.517 | 92 | 0.456 |
@@ -64,32 +76,44 @@
 > | 79 | 0.416 | 89 | 0.386 | 99 | 0.528 |
 > | 80 | 0.531 | 90 | 0.539 | 100 | 0.397 |
 
-- 同传（多轮定长音频块 rollout；整段音频在 env 里按 960ms 切块，每轮喂一块生成增量译文，reward 为整段拼接译文 BLEU）
+- Simultaneous interpretation (multi-turn fixed-length audio-chunk rollout; the full clip is split
+  into 960 ms chunks inside the env, each turn feeds one chunk and produces an incremental
+  translation, and the reward is BLEU over the concatenated whole)
 
-## 参数快照（相对上面 s2tt 基线的差异；其余同基线）
-> Relax 分支 `lora-omni-baseline`：`3a6eb2f`(reward-fix) + `bb7642f`(no-offload)；
-> Modal 入口 `v1 分支 modal_relax_smoke.py::learn_simul --tag v2`（save/load=/s2tt/ckpt/s2tt_probe_simul_v2，全新从头训）。
+## Parameter snapshot (differences from the s2tt baseline above; everything else is the same)
+> Relax branch `lora-omni-baseline`: `3a6eb2f` (reward-fix) + `bb7642f` (no-offload);
+> Modal entry point `modal_relax_smoke.py::learn_simul --tag v2` on the `v1` branch
+> (save/load=/s2tt/ckpt/s2tt_probe_simul_v2, trained from scratch).
 >
-> - 同传专属：`--custom-generate-function-path examples.simul_s2tt.rollout.generate`
->   + `--custom-config-path examples/simul_s2tt/config.yaml`（`max_turns=64`, `simul_chunk_ms=960`）。
-> - 数据：FLEURS en→zh，卷里 97 条整段音频，平均 9.6s（3.8~23.4s），960ms/块 → 平均 ~10 块/条（4~25）。
-> - 部署差异（2a 常驻优化，已并入 simul 脚本）：`--no-offload-train --no-offload-rollout`，
->   `--sglang-mem-fraction-static 0.55`（给常驻 base 腾显存）。base 冻结、两端常驻。
-> - 其余（TP4/EP4、LoRA r16/α32 qkv_proj+o_proj、GRPO kl=0、adam lr=1e-4 constant、
->   rm=bleu、rollout-batch=8、n-samples=8、global-batch=64、temp=1.1、max-resp=512、max-prompt=4096）与 s2tt 基线一致。
-> - 耗时：~2.8~3.2 min/step（no-offload 后比带 offload 的 ~4.4 min/step 快约 27~35%），无 OOM。
+> - Simultaneous-specific: `--custom-generate-function-path examples.simul_s2tt.rollout.generate`
+>   plus `--custom-config-path examples/simul_s2tt/config.yaml` (`max_turns=64`,
+>   `simul_chunk_ms=960`).
+> - Data: FLEURS en→zh, 97 full audio clips on the volume, averaging 9.6 s (3.8–23.4 s), 960 ms
+>   per chunk → about 10 chunks per clip on average (4–25).
+> - Deployment differences (the 2a resident optimization, now folded into the simul script):
+>   `--no-offload-train --no-offload-rollout`, `--sglang-mem-fraction-static 0.55` (to make room
+>   for the resident base). Base frozen and resident on both sides.
+> - Everything else (TP4/EP4, LoRA r16/α32 on qkv_proj+o_proj, GRPO kl=0, adam lr=1e-4 constant,
+>   rm=bleu, rollout-batch=8, n-samples=8, global-batch=64, temp=1.1, max-resp=512,
+>   max-prompt=4096) matches the s2tt baseline.
+> - Cost: ~2.8–3.2 min/step (about 27–35% faster than the ~4.4 min/step with offloading), no OOM.
 
-## 两处关键修复
-> 1. **reward 去污染**（`3a6eb2f`）：每轮 sglang 返回文本带 `<|im_end|>`，原先直接拼进 `sample.response`
->    喂 BLEU，既多出参考没有的 token、又把跨块 n-gram 全打断。实测（zh tokenizer）BLEU 被压到真实值
->    ~40%（7.2 vs 17.9，≈2.5x）、并抹平组内方差 → advantage≈0、RL 学不动。修法：拼接前正则去 `<|...|>`。
-> 2. **no-offload 提速**（`bb7642f`）：2a 的 base 常驻优化此前只在 noffload 脚本，simul 脚本漏了，
->    导致每步照样 offload→wake_up base、耗时无改善。已把两个 flag + mem-fraction 0.55 并入 simul 脚本。
+## Two key fixes
+> 1. **Reward de-contamination** (`3a6eb2f`): the text sglang returns each turn carries
+>    `<|im_end|>`, and it used to be concatenated straight into `sample.response` and fed to BLEU,
+>    which both adds tokens the reference does not have and breaks every cross-chunk n-gram.
+>    Measured (Chinese tokenizer), BLEU was pushed down to ~40% of its true value (7.2 vs 17.9,
+>    ≈2.5x) and in-group variance was flattened → advantage ≈ 0, RL could not learn. Fix: strip
+>    `<|...|>` with a regex before concatenating.
+> 2. **no-offload speedup** (`bb7642f`): the 2a resident-base optimization had only been applied to
+>    the noffload script and was missed in the simul script, so every step still went
+>    offload → wake_up base with no improvement in cost. Both flags plus mem-fraction 0.55 have
+>    now been folded into the simul script.
 
-> 每步 raw_reward（batch 均值 BLEU，全新 20 步，reward-fix 后）：
-> 注：step K = 第 (K-1) 个 rollout dump（框架 0 索引）。
+> Per-step raw_reward (batch-mean BLEU, a fresh 20 steps, after the reward fix):
+> Note: step K = rollout dump number (K-1) (the framework is 0-indexed).
 >
-> | 步 | BLEU | 步 | BLEU | 步 | BLEU | 步 | BLEU |
+> | Step | BLEU | Step | BLEU | Step | BLEU | Step | BLEU |
 > |----|------|----|------|----|------|----|------|
 > | 1 | 0.110 | 6 | 0.211 | 11 | 0.163 | 16 | 0.233 |
 > | 2 | 0.064 | 7 | 0.199 | 12 | 0.262 | 17 | 0.264 |
@@ -97,58 +121,102 @@
 > | 4 | 0.204 | 9 | 0.220 | 14 | 0.303 | 19 | 0.234 |
 > | 5 | 0.158 | 10 | 0.240 | 15 | 0.249 | 20 | 0.231 |
 >
-> 趋势：前 1/3(step1-7)均值≈0.15 → 后 1/3(step14-20)均值≈0.27，明显上升（min 0.064@step2，max 0.339@step18）。
-> 结论：reward-fix 后 RL 确实能学（污染时是 0.06 平躺、advantage≈0）；但这是"整段 BLEU"下的翻译质量提升，
-> 非真·同传（缺 read/write 监督、碎块声学孤立编码、reward 无延迟惩罚）——真同传需语义单元切块 / 冷启动 SFT / 延迟奖励。
+> Trend: first third (steps 1–7) mean ≈ 0.15 → last third (steps 14–20) mean ≈ 0.27, a clear rise
+> (min 0.064 @step2, max 0.339 @step18).
+> Conclusion: after the reward fix RL really does learn (while contaminated it sat flat at 0.06
+> with advantage ≈ 0); but this is a translation-quality gain under "whole-clip BLEU", not true
+> simultaneous interpretation (no read/write supervision, fragments encoded acoustically in
+> isolation, no latency penalty in the reward) — real simultaneous interpretation needs
+> semantic-unit chunking / cold-start SFT / a latency-aware reward.
 
 
-# todo
+# TODO
 - 100 steps ✅
-- 权重同步优化（现状：每步都全量推 base + LoRA 每步 unload→reload，两处浪费）：base 冻结，不再 offload/onload，两端常驻 ✅
-- 改成同传，即多轮 每轮输入chunk，看 reward 是否上升 ✅
-- LoRA 加上 mlp / moe
-- 改成 speech-to-speech (训练 thinker)
-- 改成异步
+- Weight-sync optimization (current state: the full base is pushed every step, and LoRA is
+  unloaded→reloaded every step — two wastes): freeze the base, stop offloading/onloading, keep
+  both sides resident ✅
+- Switch to simultaneous interpretation, i.e. multi-turn with one chunk fed per turn, and see
+  whether the reward rises ✅
+- Add mlp / moe to LoRA
+- Switch to speech-to-speech (training the thinker)
+- Switch to fully async
 
-# 其他方法
+# Other approaches
 - ms-swift
 - verl
 
-（LoRA 加上 mlp / moe）
-我上面的判断可能错了。光看文件名就有强烈反证:sglang 里有 lora_moe_runners.py、triton_ops/fused_moe_lora_kernel.py、triton_ops/virtual_experts.py,测试里甚至有 test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff.py(正是你的模型) 和 test_lora_moe_tp_logprob_diff.py。这直接打脸我"sglang 不支持 MoE LoRA"的说法。让我把关键源码读实。
+(Adding mlp / moe to LoRA)
+My judgement above may have been wrong. The filenames alone are strong counter-evidence: sglang
+has lora_moe_runners.py, triton_ops/fused_moe_lora_kernel.py, triton_ops/virtual_experts.py, and
+the tests even include test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff.py (exactly your model)
+and test_lora_moe_tp_logprob_diff.py. That flatly contradicts my claim that "sglang does not
+support MoE LoRA". Let me read the actual source.
 
-Megatron 侧的 matcher 默认 target 就含 linear_fc1/linear_fc2,且是按模块名+类型匹配。关键要看它怎么处理 MoE 的 grouped experts。再读 Megatron-Bridge 的 lora.py,以及 sglang 的 lora layers.py 和那个 30B-A3B MoE 测试。
+On the Megatron side the matcher's default targets already include linear_fc1/linear_fc2, and it
+matches on module name plus type. The key question is how it handles MoE grouped experts. Next,
+read Megatron-Bridge's lora.py, plus sglang's lora layers.py and that 30B-A3B MoE test.
 
-这是关键证据,我之前的判断大部分是错的。看 Megatron-Bridge 的 LoRA:
+This is decisive evidence, and most of my earlier judgement was wrong. Looking at
+Megatron-Bridge's LoRA:
 
-明确支持 MoE expert:有 is_expert_linear、is_expert 标志、normalize_moe_lora(专门为 MoE 归一 rank),甚至 LoRAMerge.transform 里有 else: # TE Grouped Linear 分支,for i in range(module.to_wrap.num_gemms) 逐 gemm 处理(351-361 行)。
-还支持给 router 挂 LoRA(LoRATopKRouter)。
-所以"Megatron 能不能挂 grouped expert"根本不是问号——原生支持。让我再确认 sglang 侧对 MoE LoRA 的支持和它期望的命名格式,读那个 30B-A3B 测试和 lora layers。
+MoE experts are explicitly supported: there are is_expert_linear and is_expert flags,
+normalize_moe_lora (rank normalization specifically for MoE), and even an
+`else: # TE Grouped Linear` branch inside LoRAMerge.transform that iterates
+`for i in range(module.to_wrap.num_gemms)` gemm by gemm (lines 351–361).
+It also supports attaching LoRA to the router (LoRATopKRouter).
+So "can Megatron attach to grouped experts" is not an open question at all — it is natively
+supported. Let me now confirm sglang's MoE LoRA support and the naming format it expects, by
+reading that 30B-A3B test and the lora layers.
 
-查清楚了,我得收回之前的判断——那两个"dealbreaker"基本是错的。给你摆事实:
+Checked, and I have to retract my earlier judgement — those two "dealbreakers" were basically
+wrong. Here are the facts:
 
-更正:两端其实都原生支持 MoE LoRA
-① sglang 侧(我说"几乎肯定不支持"→ 错)
+Correction: both ends natively support MoE LoRA
+① sglang side (I said "almost certainly unsupported" → wrong)
 
-有专门的 FusedMoEWithLoRA 类(layers.py:859)、lora_moe_runners.py、fused_moe_lora_kernel.py。
-有一个针对 Qwen3-30B-A3B-Instruct-2507 的 LoRA 回归测试(正是你 thinker 的文本骨干),而且它验证的就是 LoRA logprob 与 trainer 对齐(KL < 5e-3),enable_lora=True + MoE runner 直接跑通。
-Engine 参数里有 moe_runner_backend、experts_shared_outer_loras=True 这些 MoE LoRA 专用开关。
-② Megatron-Bridge 侧(我说"能不能挂是大问号"→ 错)
+There is a dedicated FusedMoEWithLoRA class (layers.py:859), lora_moe_runners.py, and
+fused_moe_lora_kernel.py.
+There is a LoRA regression test targeting Qwen3-30B-A3B-Instruct-2507 (exactly your thinker's text
+backbone), and what it validates is LoRA logprob alignment with the trainer (KL < 5e-3);
+enable_lora=True plus the MoE runner works out of the box.
+The engine parameters include MoE-LoRA-specific switches such as moe_runner_backend and
+experts_shared_outer_loras=True.
+② Megatron-Bridge side (I said "whether it can attach is a big question mark" → wrong)
 
-LoRA.transform 里有 is_expert_linear、is_expert 标志、normalize_moe_lora(专为 MoE 归一 rank)。
-LoRAMerge 明确有 # TE Grouped Linear 分支,for i in range(num_gemms) 逐 gemm 处理——grouped expert 原生支持。
-连 router 都能挂(LoRATopKRouter)。
-所以 "Megatron 挂不上 / sglang 服务不了" 这两条我说错了,两个端点都现成支持,还各有针对你这个模型的实测。
+LoRA.transform has is_expert_linear and is_expert flags, plus normalize_moe_lora (rank
+normalization specifically for MoE).
+LoRAMerge explicitly has a `# TE Grouped Linear` branch iterating `for i in range(num_gemms)` gemm
+by gemm — grouped experts are natively supported.
+Even the router can be attached to (LoRATopKRouter).
+So "Megatron cannot attach / sglang cannot serve it" — both of those were wrong. Both endpoints
+support it out of the box, and each has a measured test against this very model.
 
-那真正的难点在哪(这条仍然成立)
-难的不是两个端点,而是夹在中间、你自己 fork 里的那套"in-memory 权重转换+同步契约"——也就是 qwen3_omni_moe.py 的 _convert_qwen3omni_lora_adapter + update_lora_from_tensor.py。它俩现在只认 attention,MLP/MoE 一律 raise ValueError。
+Where the real difficulty is (this part still holds)
+The hard part is not either endpoint, it is the "in-memory weight conversion + sync contract"
+sandwiched in between, inside your own fork — namely
+`_convert_qwen3omni_lora_adapter` in qwen3_omni_moe.py and update_lora_from_tensor.py. Right now
+those two only understand attention; MLP/MoE raise ValueError across the board.
 
-要扩,你得让转换层产出 sglang FusedMoEWithLoRA 期望的布局和命名,具体几个真实坑:
+To extend it, the conversion layer has to emit the layout and naming that sglang's
+FusedMoEWithLoRA expects. The concrete pitfalls:
 
-gate/up 融合:linear_fc1 的 lora_B 要按 sglang 的 use_gate_up_lora / run_gate_up_lora 格式拆/拼(不是简单 chunk)。
-expert 结构:sglang 用 experts_shared_outer_loras=True(专家共享 outer LoRA);Megatron 的 TEGroupedLinear 也是一个 adapter 共享给整组 gemm(LoRAMerge 里对每个 weight{i} 用同一个 linear_in/out)。两边理念一致 → 大概率是每层一个共享 adapter,不是 128 个独立的。这反而降低了复杂度,但要对齐清楚。
-router LoRA(如果你也挂):又是另一套。
-结论(修正版)
-不是"整条链路推不动",而是一个**"对齐契约"的工程活**:两端能力都在,你补的是中间转换/同步的 MoE 分支。
-工作量:比我上次说的小,因为不用去啃"Megatron 能不能挂 / sglang 能不能服务"这种不可控的东西——它们已被官方测试覆盖。你要做的是照 sglang 期望的 MoE LoRA 布局,把转换层写对(gate_up 融合拆分 + shared-outer expert 命名),然后用那个 test_lora_qwen3_30b_a3b 的思路验证 logprob 对齐。
-仍然成立的建议:先验证 attention-only 是否欠拟合再决定要不要扩;但"扩 MoE"本身没有我上次说的那种硬阻塞。
+gate/up fusion: linear_fc1's lora_B has to be split/joined in sglang's use_gate_up_lora /
+run_gate_up_lora format (not a simple chunk).
+Expert structure: sglang uses experts_shared_outer_loras=True (experts share the outer LoRA);
+Megatron's TEGroupedLinear likewise shares one adapter across a whole group of gemms (LoRAMerge
+uses the same linear_in/out for every weight{i}). The two ends agree conceptually → most likely
+one shared adapter per layer rather than 128 independent ones. That actually lowers the
+complexity, but it has to be lined up carefully.
+Router LoRA (if you attach that too): another matter entirely.
+
+Conclusion (revised)
+It is not that "the whole pipeline cannot be pushed through"; it is **an alignment-contract
+engineering job**: the capability exists at both ends, and what you fill in is the MoE branch of
+the conversion/sync in the middle.
+Effort: smaller than I said last time, because you do not have to wrestle with uncontrollable
+questions like "can Megatron attach / can sglang serve" — those are already covered by official
+tests. What you have to do is write the conversion layer correctly against the MoE LoRA layout
+sglang expects (gate_up fusion split + shared-outer expert naming), then validate logprob
+alignment following the approach of that test_lora_qwen3_30b_a3b test.
+Still-valid advice: first check whether attention-only underfits before deciding to extend; but
+"extending to MoE" has none of the hard blockers I described last time.

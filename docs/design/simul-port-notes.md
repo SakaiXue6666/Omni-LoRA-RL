@@ -1,106 +1,116 @@
-# 同传移植笔记
+# Notes on porting simultaneous interpretation
 
-同传（simultaneous S2TT）的代码位置与 v1 一致：`Relax/examples/simul_s2tt/`（submodule 里）。
-启动脚本 `omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh` 留在本仓库，跟单轮那个放一起。
+The simultaneous S2TT code sits where it did in v1: `Relax/examples/simul_s2tt/` (inside the
+submodule). The launch script `omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh` stays in this repo,
+next to the single-turn one.
 
-**这份代码本身是跑通过的** —— 2026-07-10 在旧实现上跑完 20 步，BLEU 0.155 → 0.265
-（`docs/results/experiments.md` 实验 3）。逻辑不需要怀疑。
+**The code itself has been run successfully** — 20 steps on the older implementation on
+2026-07-10, BLEU 0.155 → 0.265 (`docs/results/experiments.md`, experiment 3). The logic is not in
+question.
 
-没跑过的是**移植本身**：迁移时丢了一个补丁，以及本次改的四处。下面分开写，别把两者混为一谈。
+What has *not* been run is **the port itself**: one patch was lost in the migration, plus the four
+edits made here. The two are written up separately below — do not conflate them.
 
-## 移了什么
+## What was moved
 
-| 文件 | 来源 | 说明 |
+| File | Origin | Notes |
 |---|---|---|
-| `Relax/examples/simul_s2tt/rollout.py` | v1 同名文件 | 主体，多轮 generate（788 行） |
-| `Relax/examples/simul_s2tt/audio_chunk_env.py` | 同上 | 960ms 定长切块 env，未改逻辑 |
-| `Relax/examples/simul_s2tt/config.yaml` | 同上 | `max_turns: 64` / `simul_chunk_ms: 960` |
-| `Relax/examples/simul_s2tt/_selftest_env.py` | 同上 | 纯 numpy 切块自测 |
-| `Relax/examples/simul_s2tt/__init__.py` | 同上 | 文档字符串 |
-| `omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh` | 新写 | 单轮脚本的薄包装 |
+| `Relax/examples/simul_s2tt/rollout.py` | v1 file of the same name | The body: multi-turn generate (788 lines) |
+| `Relax/examples/simul_s2tt/audio_chunk_env.py` | same | 960 ms fixed-chunk env, logic unchanged |
+| `Relax/examples/simul_s2tt/config.yaml` | same | `max_turns: 64` / `simul_chunk_ms: 960` |
+| `Relax/examples/simul_s2tt/_selftest_env.py` | same | Pure-numpy chunking self-test |
+| `Relax/examples/simul_s2tt/__init__.py` | same | Docstring |
+| `omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh` | newly written | Thin wrapper around the single-turn script |
 
-**没移** `omni_rollout.py`（396 行）—— 那是 sglang-omni Thinker 变体，当前代码已经不含
-sglang-omni submodule。要用的话去 `v1` 分支拿。
+**Not moved:** `omni_rollout.py` (396 lines) — that is the sglang-omni Thinker variant, and the
+current code no longer carries the sglang-omni submodule. Grab it from the `v1` branch if needed.
 
-## 为什么放 Relax fork 里
+## Why it lives inside the Relax fork
 
-与 v1 一致，也和它借用的 `examples/deepeyes/base_env.py` 放在一起。代价是往 fork 里加了
-~1000 行，日后同步上游更容易冲突；但 Relax 的改动本来就要走 submodule 三步流程，
-放哪都一样，见 README 的「改 Relax / sglang 的代码」。
+Same as v1, and next to the `examples/deepeyes/base_env.py` it borrows from. The cost is ~1000
+lines of extra divergence in the fork, which makes syncing with upstream more conflict-prone; but
+any change to Relax has to go through the three-step submodule flow anyway, so the location makes
+no difference there. See "Changing Relax / sglang code" in the README.
 
-## 改了哪四处
+## The four changes
 
-| # | 位置 | 改动 | 为什么 |
+| # | Location | Change | Why |
 |---|---|---|---|
-| ① | `rollout.py` import + 638/749 行 | `_ENCODE_EXECUTOR` → `get_encode_executor()` | 当前 Relax 把那个私有全局换成了惰性构造的访问器 |
-| ② | `_run_inference_step` | `post(url, payload)` → `state.post_generate(url, payload)`，函数签名多收一个 `state` | 见下面「permit」 |
-| ③ | 文件末尾 | 新增 `generate.manages_inference_permit = True` | 与 ② 成对，缺一不可 |
-| ④ | `generate()` | 拆成 `generate()` 外壳 + `_generate_impl()`，外壳接住 `GenerationAborted` | 上游契约要求它不能逃出去 |
+| ① | `rollout.py` imports + lines 638/749 | `_ENCODE_EXECUTOR` → `get_encode_executor()` | Current Relax replaced that private global with a lazily constructed accessor |
+| ② | `_run_inference_step` | `post(url, payload)` → `state.post_generate(url, payload)`; the signature takes an extra `state` | See "permit" below |
+| ③ | End of file | Added `generate.manages_inference_permit = True` | Pairs with ②; neither works alone |
+| ④ | `generate()` | Split into a `generate()` shell plus `_generate_impl()`, with the shell catching `GenerationAborted` | The upstream contract requires it not to escape |
 
-**关于 permit**：当前 Relax 新增了 `relax/engine/rollout/request_permit.py`（v1 没有）。
-多轮 rollout 若不声明 `manages_inference_permit`，会全程占住 session 级信号量的一个槽位，
-横跨全部 ~10 轮加上中间的切块/编码时间。不死锁、不串行，是吞吐下降。上游注释原话：
-*"Custom multi-turn rollouts should use inference_permit()/post_generate() instead."*
+**About the permit:** current Relax added `relax/engine/rollout/request_permit.py` (v1 had no such
+thing). A multi-turn rollout that does not declare `manages_inference_permit` holds one slot of
+the session-level semaphore for the entire run — across all ~10 turns plus the chunking and
+encoding time in between. It does not deadlock and does not serialize; it costs throughput. The
+upstream comment puts it exactly: *"Custom multi-turn rollouts should use
+inference_permit()/post_generate() instead."*
 
 ---
 
-# 真正的两个风险
+# The two real risks
 
-## 1. rope device 补丁（迁移时丢了，**现已修复**）
+## 1. The rope device patch (lost in the migration, **now fixed**)
 
-> **已修**：Relax fork `lora-omni-v2` 的 `9e94202` 直接在
-> `relax/models/qwen_omni/modeling_qwen3_omni/utils.py` 里把 `audio_seqlens` 归到 CPU，
-> 与 video 分支的做法一致。下面保留原委，方便日后往上游提 PR。
+> **Fixed**: commit `9e94202` on the Relax fork's `lora-omni-v2` moves `audio_seqlens` onto the
+> CPU directly inside `relax/models/qwen_omni/modeling_qwen3_omni/utils.py`, matching what the
+> video branch already does. The background below is kept so it can be sent upstream later.
 
-**这不是代码缺陷，是迁移遗漏。** 证据链很硬：
+**This is not a code defect, it is a migration omission.** The evidence is solid:
 
-- 补丁 `patch_qwen3_omni_rope_index_device()` 是 commit `a700c7f`（2026-07-10）加的，
-  该 commit 标题就是「新增 Qwen3-Omni 同传(多轮定长音频块)自定义 rollout」——
-  **补丁和同传是同一个 commit 出生的，它就是被同传逼出来的**
-- 所以 v1 那 20 步能跑通，恰恰是因为补丁在。成功跑通是 bug 存在的证据，不是不存在的证据
-- 当前 Relax 里没有这个补丁，而等价代码在新位置上仍是老样子
+- The patch `patch_qwen3_omni_rope_index_device()` was added in commit `a700c7f` (2026-07-10),
+  whose title is literally "add the Qwen3-Omni simultaneous (multi-turn fixed audio chunk) custom
+  rollout" — **the patch and the simultaneous rollout were born in the same commit; the patch
+  exists because simultaneous interpretation forced it into being**
+- So those 20 steps in v1 succeeded precisely *because* the patch was there. Having run
+  successfully is evidence that the bug exists, not evidence that it does not
+- Current Relax does not carry the patch, and the equivalent code at its new location is
+  unchanged
 
-**为什么 v1 的补丁照搬无效**：它 patch 的是
-`megatron.bridge.models.qwen_omni.modelling_qwen3_omni.model.get_rope_index`；而
-`relax/models/qwen_omni/qwen3_omni_provider.py:23` import 的是 Relax **自己 vendor 的**
-`Qwen3OmniMoeModel`，走自己的 `modeling_qwen3_omni/utils.py`。两个不同模块。更糟的是 v1 那段
-包在 `try/except ImportError: pass` 里，**打不上也不会报错**，会静默失效。
+**Why v1's patch cannot simply be copied over:** it patches
+`megatron.bridge.models.qwen_omni.modelling_qwen3_omni.model.get_rope_index`, whereas
+`relax/models/qwen_omni/qwen3_omni_provider.py:23` imports Relax's **own vendored**
+`Qwen3OmniMoeModel`, which goes through its own `modeling_qwen3_omni/utils.py`. Two different
+modules. Worse, v1's code is wrapped in `try/except ImportError: pass`, so **it fails silently
+when it fails to apply**.
 
-代码层面逐环节核实如下，未实机复现：
-
-链条：
+Verified link by link at the code level, never reproduced on real hardware:
 
 ```
 model.py:206   audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)   # CUDA
-model.py:368   get_rope_index(..., audio_seqlens=audio_feature_lengths)           # 没 .cpu()
-utils.py:9     _get_feat_extract_output_lengths()  纯算术，不改 device            # 仍 CUDA
-utils.py:188   audio_len = _get_feat_extract_output_lengths(audio_seqlens[i])     # CUDA 标量
-utils.py:192   st += text_len + bos_len + audio_len + eos_len                     # 污染 CPU 计数器
+model.py:368   get_rope_index(..., audio_seqlens=audio_feature_lengths)           # no .cpu()
+utils.py:9     _get_feat_extract_output_lengths()  pure arithmetic, device unchanged  # still CUDA
+utils.py:188   audio_len = _get_feat_extract_output_lengths(audio_seqlens[i])     # CUDA scalar
+utils.py:192   st += text_len + bos_len + audio_len + eos_len                     # poisons the CPU counter
 ```
 
-同一函数的 **video 分支显式 `.cpu()`**（`utils.py:235`、`271`），audio 分支没有 —— 和 v1
-当年那个 bug 是同一形态。
+In the same function the **video branches call `.cpu()` explicitly** (`utils.py:235`, `271`); the
+audio branch does not — the same shape of bug v1 hit back then.
 
-**只在一条序列含 ≥2 段音频时触发。** 单轮 S2TT 每条只有 1 段，永远碰不到（所以 40 步那次一路
-顺）；同传每条约 10 块，必然踩。
+**It only fires once a sequence holds two or more audio segments.** Single-turn S2TT has exactly
+one per item and never reaches it (which is why the 40-step run went through cleanly);
+simultaneous interpretation has ~10 chunks per item and hits it every time.
 
-预期报错：
+Expected error:
 
 ```
 RuntimeError: Expected all tensors to be on the same device,
 but found at least two devices, cuda:0 and cpu!
 ```
 
-栈里会出现 `get_rope_index`。**修法**（照抄 video 分支的做法，只改计算设备不改数值）：在
-`model.py:368` 的调用处把 `audio_seqlens=audio_feature_lengths.cpu()`，或在 `utils.py` 进
-audio 分支前 `.cpu()`。
+`get_rope_index` will be in the traceback. **The fix** (copy what the video branch does — it
+changes the compute device only, not the values): at the call site `model.py:368` pass
+`audio_seqlens=audio_feature_lengths.cpu()`, or call `.cpu()` in `utils.py` before entering the
+audio branch.
 
-这一处也可以直接推给上游当第六个 PR —— 性质和已提的五个一样：上游自己的代码在
-video 分支做了 `.cpu()`，audio 分支漏了。
+This one could also go straight upstream as a sixth PR — same character as the five already
+filed: upstream's own code guards the video branch with `.cpu()` and forgot the audio branch.
 
-## 2. 本次改动 ②③ 没配套（permit）
+## 2. Changes ②③ getting out of sync (permit)
 
-改动 ②③ 是成对的。只改一半会直接抛：
+Changes ② and ③ are a pair. Doing only half of it raises immediately:
 
 ```
 RuntimeError: inference_permit()/post_generate() was called while the session-level
@@ -108,91 +118,109 @@ lock is held. A custom generate function must declare `manages_inference_permit 
 to use per-request permits; without it ... acquiring a permit would deadlock.
 ```
 
-好消息是它**大声报错而不是默默死锁**。看到这条就去检查文件末尾那行还在不在。
+The good news is it **fails loudly rather than deadlocking silently**. If you see this, check
+whether that line at the end of the file is still there.
 
 ---
 
-# 以下不是风险，是行为说明
+# The following are not risks, they are behavior notes
 
-原先我把这四条也列成「风险」，那是过度解读 —— v1 跑通过，说明它们都按预期工作。
-留在这里是因为它们不直观，第一次接手容易误判。
+These four were originally listed as "risks" as well, which was an overreading — v1 ran fine, so
+they all work as intended. They are kept here because they are unintuitive and easy to misjudge
+on first contact.
 
-## 3. 双 token 流对齐（v1 已验证正确）
+## 3. The dual token stream alignment (verified correct in v1)
 
-`rollout.py` 维护两条流：`sample.rollout_tokens` 发 sglang（每段音频一个未展开 marker），
-`sample.tokens` 给 Megatron（processor 已展开，与音频特征对齐），`_merge_mm_train()`
-把各块的 `input_features` pad 到同一长度再沿 dim=0 拼。
+`rollout.py` maintains two streams: `sample.rollout_tokens` goes to sglang (one unexpanded marker
+per audio segment), `sample.tokens` goes to Megatron (expanded by the processor, aligned with the
+audio features), and `_merge_mm_train()` pads each chunk's `input_features` to a common length and
+concatenates along dim=0.
 
-这套逻辑在 v1 上验证过是对的，本次移植一行没动。唯一的不确定是镜像换了之后
-transformers/processor 的行为是否有差异 —— 我没有任何具体证据说它变了，只是没跑过。
+This logic was verified correct in v1 and not a single line of it changed in the port. The only
+uncertainty is whether transformers/processor behavior differs now that the image changed — I have
+no specific evidence that it did, it simply has not been run.
 
-真出问题通常不是异常，而是**训练发散或 loss 异常**，因为 loss_mask 和 token 对不上。
-要查的不变式（v1 的 CPU 自测就是断这些的）：
+When this does go wrong it usually is not an exception but **divergent training or an odd loss**,
+because `loss_mask` and the tokens no longer line up. The invariants to check (v1's CPU self-test
+asserted exactly these):
 
 - `len(loss_mask) == response_length`
 - `len(rollout_log_probs) == response_length`
 - `len(tokens) == prompt_len + response_length`
-- `sum(loss_mask) == 生成 token 总数`（不含注入的观测 token）
-- sglang 调用次数 `== num_chunks`
-- `input_features` 存在，且第一维 == 音频段数
+- `sum(loss_mask) == total generated tokens` (excluding the injected observation tokens)
+- number of sglang calls `== num_chunks`
+- `input_features` present, with its first dimension == number of audio segments
 
-`sample.metadata` 里有 `simul_num_chunks` 和 `simul_stop_reason` 可以对。
+`sample.metadata` carries `simul_num_chunks` and `simul_stop_reason` to check against.
 
-## 4. `--no-offload-train/rollout` 现在有效，但 help 与代码不一致
+## 4. `--no-offload-train/rollout` works today, but the help text disagrees with the code
 
-启动脚本用了这两个 flag（v1 的常驻配置，比带 offload 快约 27~35%）。它们目前**有效** ——
-`arguments.py:3170` 是 `if args.offload_train is None: = True`，只在没显式指定时才强制。
+The launch script uses both flags (v1's resident configuration, ~27–35% faster than running with
+offloading). They currently **do work** — `arguments.py:3170` reads
+`if args.offload_train is None: = True`, so it is only forced when you did not set it explicitly.
 
-但同一处的 help 文本写着 *"This will always be true when --colocate is set."* 两者不一致。
-上游哪天把代码改得和 help 一致，同传会**静默退回 offload 模式** —— 不报错，只是变慢、显存
-行为变了。发现每步耗时突然从 ~3 分钟涨到 ~4.4 分钟，先查这里。
+But the help text in the same place says *"This will always be true when --colocate is set."* The
+two disagree. The day upstream changes the code to match the help, simultaneous interpretation
+will **silently fall back to offload mode** — no error, just slower with different memory
+behavior. If per-step time suddenly jumps from ~3 minutes to ~4.4 minutes, look here first.
 
-## 5. 奖励去污染的口径与单轮**不同**（设计如此）
+## 5. Special-token stripping differs from single-turn (by design)
 
-| | `<\|...\|>` 特殊 token |
+| | `<\|...\|>` special tokens |
 |---|---|
-| 同传（本模块） | **去掉**再拼 response（`_clean_gen_text`，`rollout.py:156`） |
-| 单轮 S2TT | **不去掉**，只报警不改分 |
+| Simultaneous (this module) | **Stripped** before concatenating the response (`_clean_gen_text`, `rollout.py:156`) |
+| Single-turn S2TT | **Not stripped**; warns only, score unchanged |
 
-这不是 bug，是各自的历史原因：
+This is not a bug; each has its own history:
 
-- 同传必须去 —— 每两块之间插一个 marker，跨块 2/3/4-gram 全废，实测 BLEU 被压到真实值的
-  ~40%（7.2 vs 17.9）。不修的话 advantage≈0，RL 直接学不动（v1 第一次 40 步就是这么废的）。
-- 单轮不去 —— 记录在案的曲线都是在带污染条件下跑的，改了就没法跟它们比。
+- Simultaneous *has* to strip — a marker gets inserted between every pair of chunks, which
+  destroys every cross-chunk 2/3/4-gram. Measured, BLEU is pushed down to ~40% of its true value
+  (7.2 vs 17.9). Without the fix advantage ≈ 0 and RL simply cannot learn (that is exactly how
+  v1's first 40-step run was wasted).
+- Single-turn does not strip — every recorded curve was produced under contaminated conditions,
+  and changing it would make them incomparable.
 
-**后果：同传曲线和单轮曲线的绝对值不可直接比较。** 各自跟自己的历史比。
+**Consequence: absolute values from the simultaneous curve and the single-turn curve are not
+directly comparable.** Compare each against its own history.
 
-## 6. 数据要求：每条样本恰好一段整段音频（v1 同一个 assert）
+## 6. Data requirement: exactly one full audio clip per sample (same assert as v1)
 
-`AudioChunkEnv.__init__` 有硬断言：
+`AudioChunkEnv.__init__` has a hard assertion:
 
 ```python
-assert len(audios) == 1, "AudioChunkEnv 期望初始恰好 1 段完整音频..."
+assert len(audios) == 1, "AudioChunkEnv expects exactly 1 complete audio clip initially..."
 ```
 
-切块是 env 自己做的，喂进来的必须是**整段**。单轮那份 128 条数据符合要求。v1 当时用的是
-97 条整段音频，平均 9.6 秒（3.8~23.4s），960ms 一块 → 平均约 10 块一条。
+Chunking is done by the env itself, so what you feed in must be the **complete** clip. The 128
+items used for single-turn satisfy this. v1 used 97 full clips averaging 9.6 seconds (3.8–23.4 s),
+one chunk per 960 ms → roughly 10 chunks per clip.
 
 ---
 
-## 没移过来的测试
+## Tests that were not brought over
 
-v1 有两个自测，都留在 `v1` 分支的 `modal_relax_smoke.py` 里，本次没移：
+v1 had two self-tests, both still living in `modal_relax_smoke.py` on the `v1` branch; neither was
+ported:
 
-- `selftest_simul`（第 2185 行）→ `selftest_simul_encode` —— **CPU，约 1 分钟**。走真实
-  `process_raw_sample` 造 3 秒合成音频（4 块，末块偏短，故意复现变长特征拼接），mock 掉
-  `GenerateState`/`post`，跑完整多轮 `generate()`，断上面第 3 节那些不变式。
-  **这是唯一能在烧卡前发现改动 ①②③ 有没有做对的东西。**
-- `selftest_rope`（第 2313 行）—— T4，1~2 分钟，纯函数复现第 1 节那个 device bug。
+- `selftest_simul` (line 2185) → `selftest_simul_encode` — **CPU, about 1 minute**. Builds a
+  3-second synthetic clip through the real `process_raw_sample` path (4 chunks, with a
+  deliberately short final chunk to reproduce variable-length feature concatenation), mocks out
+  `GenerateState`/`post`, runs the full multi-turn `generate()`, and asserts the invariants listed
+  in section 3 above. **This is the only thing that can tell you whether changes ①②③ are correct
+  before you spend GPU time.**
+- `selftest_rope` (line 2313) — T4, 1–2 minutes, reproduces the device bug from section 1 against
+  the pure function.
 
-要用的话：`git show v1:modal_relax_smoke.py`，摘 `_offline_build_simul_out` 和
-`selftest_simul_encode` 两个函数出来改写。
+To use them: `git show v1:modal_relax_smoke.py`, then lift `_offline_build_simul_out` and
+`selftest_simul_encode` out and adapt them.
 
-已经移过来的 `_selftest_env.py` 作用有限：它只测纯 numpy 的切块逻辑，用 `SimpleNamespace`
-造假 sample，零 relax 依赖，而且 `examples/deepeyes/base_env.py` 在两个版本间逐字节一致 ——
-所以它必然通过，验证不了任何与本次移植相关的东西。留着是因为改 chunk 逻辑时它仍然有用。
+The `_selftest_env.py` that *was* brought over is of limited use: it exercises only the pure-numpy
+chunking logic with a fake sample built from `SimpleNamespace`, has zero relax dependencies, and
+`examples/deepeyes/base_env.py` is byte-for-byte identical across the two versions — so it is
+guaranteed to pass and verifies nothing related to this port. It is kept because it is still
+useful when changing the chunking logic.
 
-## 怎么跑
+## How to run it
 
 ```bash
 HF_CKPT=/models/qwen3-omni DATA=/s2tt/train_s2tt.jsonl NUM_ROLLOUT=20 \
@@ -200,6 +228,7 @@ SAVE_DIR=/data/s2tt/ckpt/simul_run1 \
 bash omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh
 ```
 
-它是单轮脚本的薄包装，超参全部复用，只加 `--custom-generate-function-path` /
-`--custom-config-path` 两项，外加常驻配置。日志和 tensorboard 项目名已经和单轮分开，
-不会混在一起。
+It is a thin wrapper around the single-turn script: all hyperparameters are reused, and it only
+adds `--custom-generate-function-path` / `--custom-config-path` plus the resident configuration.
+The log file and the tensorboard project name are already separated from the single-turn ones, so
+they will not get mixed together.

@@ -1,64 +1,76 @@
-# 实验记录
+# Experiment log
 
-这个项目做过的所有 RL 实验，按时间排。逐步原始数据在同目录的 `*.json` 里，每份都带
-`_meta` 说明指标口径、硬件、数据和代码路径。
+Every RL experiment this project has run, in chronological order. The per-step raw data lives in
+the `*.json` files in this directory; each one carries a `_meta` block stating the metric
+convention, hardware, data and code path.
 
-统一口径：**指标是每步 `rollout/raw_reward`，即那一批样本句级 BLEU 的均值**；判据一律用
-**十步窗口均值**而不是单步 —— 单步噪声很大，这条链路上见过单步从 0.539 掉到 0.397。
+One convention throughout: **the metric is `rollout/raw_reward` per step, i.e. the mean
+sentence-level BLEU over that batch of samples**; the criterion is always a **ten-step window
+mean**, never a single step — single-step noise is large, and on this pipeline we have seen it
+drop from 0.539 to 0.397 in one step.
 
-| # | 实验 | 数据 | 步数 | 结果（首窗 → 末窗） | 原始数据 |
+| # | Experiment | Data | Steps | Result (first window → last window) | Raw data |
 |---|---|---|---|---|---|
-| 0 | 数学 MCQ + 0/1 奖励 | hard 数学选择题 | — | **失败**，零方差 | — |
-| 1 | zh→en 翻译 + 句级 BLEU | 自造长难句 256 条 | 10 | 0.463 → 0.523 | `translate-10step-curve.json` |
-| 2 | **en→zh S2TT（离线单轮）** | FLEURS 128 条 | **100** | **0.287 → 0.487** | `s2tt-100step-curve.json` |
-| 3 | 同传（960ms 定长块，多轮） | FLEURS 97 条整段 | 20 | 0.155 → 0.265 | `simul-20step-curve.json` |
-| 4 | en→zh S2TT（当前代码路径） | FLEURS 128 条 | 40 | 0.294 → 0.391 | `s2tt-40step-curve.json` |
+| 0 | Math MCQ + 0/1 reward | hard multiple-choice math | — | **Failed**, zero variance | — |
+| 1 | zh→en translation + sentence BLEU | 256 hand-made long sentences | 10 | 0.463 → 0.523 | `translate-10step-curve.json` |
+| 2 | **en→zh S2TT (offline, single-turn)** | FLEURS, 128 items | **100** | **0.287 → 0.487** | `s2tt-100step-curve.json` |
+| 3 | Simultaneous (960 ms fixed chunks, multi-turn) | FLEURS, 97 full clips | 20 | 0.155 → 0.265 | `simul-20step-curve.json` |
+| 4 | en→zh S2TT (current code path) | FLEURS, 128 items | 40 | 0.294 → 0.391 | `s2tt-40step-curve.json` |
 
 ---
 
-## 0. 数学 MCQ：一次有价值的失败（2026-06 上旬）
+## 0. Math MCQ: a useful failure (early June 2026)
 
-用 hard 数学选择题跑 colocate RL，闭环正常、reward 函数正确（答对得 1.0），但
-**`raw_reward = 1.0`，32/32 全对**。Qwen3-Omni-30B 的 thinker 带 CoT 把 2–3 位乘法做到满分，
-组内零方差 → advantage = 0 → 没有梯度。
+We ran colocated RL on hard multiple-choice math. The loop was fine and the reward function was
+correct (1.0 for a right answer), but **`raw_reward = 1.0`, 32/32 all correct**. Qwen3-Omni-30B's
+thinker with CoT nails 2–3 digit multiplication, so in-group variance was zero → advantage = 0 →
+no gradient.
 
-试过压低难度：thinking 开 = 100%，thinking 关或把 `max_response_len` 砍到 96 token = 0%
-（`<answer>` 被截断的伪全错），**中间没有过渡带**，所以砍 token 这条路不通。
+We tried to lower the difficulty: thinking on = 100%; thinking off, or `max_response_len` cut to
+96 tokens = 0% (a fake all-wrong, because `<answer>` gets truncated). **There is no transition
+band in between**, so cutting tokens was not a viable route.
 
-结论直接决定了后面所有实验的奖励设计，见 `docs/design/reward-design.md`。
+This conclusion directly determined the reward design of every experiment that followed — see
+`docs/design/reward-design.md`.
 
-## 1. zh→en 翻译 + 句级 BLEU（2026-06-02，10 步）
+## 1. zh→en translation + sentence-level BLEU (2026-06-02, 10 steps)
 
-换成连续奖励后的可行性验证。逐步曲线：
+A feasibility check after switching to a continuous reward. The per-step curve:
 
 ```
 0.48  0.44  0.47  0.52  0.47  0.55  0.53  0.50  0.50  0.57
 ```
 
-前 3 步均值 0.463 → 后 3 步均值 0.523，Δ = +0.060，判定「有学习信号 + 趋势上升」。
+First 3 steps mean 0.463 → last 3 steps mean 0.523, Δ = +0.060, verdict "learning signal present
+and trending up".
 
-> 原始记录的摘要写的是 0.463 → 0.525 / Δ +0.061。逐步值当时只保留了两位小数，按这十个数
-> 实算是 0.523 / +0.060。差异来自四舍五入，不影响结论。
+> The original record's summary says 0.463 → 0.525 / Δ +0.061. The per-step values were only kept
+> to two decimals at the time; computing from those ten numbers gives 0.523 / +0.060. The
+> difference is rounding and does not affect the conclusion.
 
-同期还做了一次音频链路的因果验证（2026-06-03）：把 A 的 prompt 配上 B 的音频，输出立刻
-变成 B 的内容，对 A 参考的 BLEU 从 0.435 崩到 **0.004**；2 对、4 个交叉组全部如此。
-证明音频确实被编码并驱动生成，不是语言先验在答题。
+Around the same time (2026-06-03) we also ran a causal check on the audio path: pairing prompt A
+with audio B made the output switch to B's content immediately, and BLEU against reference A
+collapsed from 0.435 to **0.004**; all 4 cross combinations across 2 pairs behaved this way. That
+proves the audio really is encoded and driving generation, rather than a language prior answering
+from memory.
 
-## 2. en→zh S2TT 离线单轮，100 步（2026-06-04 起，07-08 续训至 100）
+## 2. en→zh S2TT, offline single-turn, 100 steps (started 2026-06-04, continued to 100 on 07-08)
 
-**这是本项目最完整的一条曲线。**
+**This is the most complete curve in the project.**
 
-配置：4×A100-80GB colocate，TP4 / EP4 / PP1；LoRA rank 16 / alpha 32，挂 thinker
-language_model 的 `qkv_proj` + `o_proj`；GRPO，kl-loss-coef 0；adam lr 1e-4 constant；
-rollout-batch 8 / n-samples 8 / global-batch 64 / temperature 1.1；奖励 sacreBLEU(中文 tokenizer)/100。
+Configuration: 4×A100-80GB colocated, TP4 / EP4 / PP1; LoRA rank 16 / alpha 32 attached to the
+thinker language model's `qkv_proj` + `o_proj`; GRPO with kl-loss-coef 0; adam lr 1e-4 constant;
+rollout-batch 8 / n-samples 8 / global-batch 64 / temperature 1.1; reward sacreBLEU (Chinese
+tokenizer) / 100.
 
-数据是 FLEURS validation 前 128 条 —— 当时没有把条数记进日志，这个数字来自 `prep_s2tt`
-的默认 `limit=128`，与第 4 次实验用的是同一份卷上的数据。128 条配 rollout-batch 8 是每 16 步
-一个 epoch，100 步约 6.25 个 epoch。
+The data is the first 128 items of FLEURS validation — the count was not written into the log at
+the time; this number comes from `prep_s2tt`'s default `limit=128`, and it is the same data on
+the same volume that experiment 4 used. 128 items at rollout-batch 8 is one epoch every 16 steps,
+so 100 steps is about 6.25 epochs.
 
-十步窗口均值：
+Ten-step window means:
 
-| 区间 | BLEU | | 区间 | BLEU |
+| Range | BLEU | | Range | BLEU |
 |---|---|---|---|---|
 | 1–10 | 0.2868 | | 51–60 | 0.4137 |
 | 11–20 | 0.3442 | | 61–70 | 0.4400 |
@@ -66,72 +78,92 @@ rollout-batch 8 / n-samples 8 / global-batch 64 / temperature 1.1；奖励 sacre
 | 31–40 | 0.3886 | | 81–90 | 0.4890 |
 | 41–50 | 0.4020 | | 91–100 | 0.4873 |
 
-**前 10 步 0.287 → 后 10 步 0.487，Δ = +0.201。** 区间 [0.234 @step3, 0.610 @step95]。
-十个窗口除最后一格持平外单调上升。
+**First 10 steps 0.287 → last 10 steps 0.487, Δ = +0.201.** Range [0.234 @step3, 0.610 @step95].
+All ten windows rise monotonically except the last, which is flat.
 
-旁证：response 长度从 28 token 降到 20（译文变紧凑）、log_probs 上升（生成更自信）。
-抽样译文「东非岛屿位于非洲东海岸外的印度洋上」BLEU 0.659。全程零报错。
+Supporting evidence: response length dropped from 28 tokens to 20 (tighter translations), and
+log_probs rose (more confident generation). A sampled translation, "东非岛屿位于非洲东海岸外的
+印度洋上", scored BLEU 0.659. Zero errors across all 100 steps.
 
-这条曲线分两次跑完：6-04 跑到第 40 步，7-08 从 checkpoint 续训到第 100 步。前 40 步的
-数值在两份记录里逐位一致，是同一次 run。
+This curve was produced in two sittings: steps 1–40 on 06-04, then continued from the checkpoint
+to step 100 on 07-08. The first 40 values are identical digit for digit across both records — it
+is one run.
 
-## 3. 同传：960ms 定长块多轮 rollout（2026-07-10，20 步）
+## 3. Simultaneous interpretation: 960 ms fixed-chunk multi-turn rollout (2026-07-10, 20 steps)
 
-把整段音频在 env 里按 960ms 切块，每轮喂一块生成增量译文，奖励是整段拼接译文的 BLEU。
+The full audio clip is split into 960 ms chunks inside the env; each turn feeds one chunk and the
+model emits an incremental translation. The reward is BLEU over the concatenation of the whole
+translation.
 
-数据：FLEURS en→zh，97 条整段音频，平均 9.6 秒（3.8~23.4s），960ms 一块 → 平均约 10 块一条。
-相对离线基线的差异：`--custom-generate-function-path` 走 `examples.simul_s2tt.rollout.generate`，
-`max_turns=64`、`simul_chunk_ms=960`；base 冻结两端常驻（`--no-offload-train --no-offload-rollout`），
-`sglang-mem-fraction-static` 降到 0.55 给常驻 base 腾显存。耗时 ~2.8–3.2 min/step
-（比带 offload 的 ~4.4 min/step 快约 27–35%）。
+Data: FLEURS en→zh, 97 full audio clips averaging 9.6 seconds (3.8–23.4 s), one chunk per 960 ms
+→ roughly 10 chunks per clip. Differences from the offline baseline:
+`--custom-generate-function-path` points at `examples.simul_s2tt.rollout.generate`, with
+`max_turns=64` and `simul_chunk_ms=960`; the base model is frozen and resident on both sides
+(`--no-offload-train --no-offload-rollout`), and `sglang-mem-fraction-static` is lowered to 0.55
+to make room for it. Cost is ~2.8–3.2 min/step (about 27–35% faster than the ~4.4 min/step with
+offloading).
 
-**前 1/3（步 1–7）0.155 → 后 1/3（步 14–20）0.265，Δ = +0.110。** 区间 [0.064 @step2, 0.339 @step18]。
+**First third (steps 1–7) 0.155 → last third (steps 14–20) 0.265, Δ = +0.110.** Range
+[0.064 @step2, 0.339 @step18].
 
-**在学，但绝对值只有离线的一半左右，原因已经定位，不是 bug：**
+**It learns, but the absolute value is only about half the offline number. The reason is
+diagnosed and it is not a bug:**
 
-1. **缺 read/write 监督或惩罚。** 没有「该等的时候等」的信号，模型要么每块硬吐（碎、重复，
-   拉低 BLEU），要么摆烂。
-2. **碎块丢上下文。** 960ms 大约 1~2 个英文词，逐块独立翻译，句子级语境没了。
-3. 奖励里没有延迟惩罚，所以「同传」这件事本身没有被优化。
+1. **No read/write supervision or penalty.** There is no signal for "wait when you should wait",
+   so the model either forces out a fragment every chunk (choppy, repetitive, which drags BLEU
+   down) or gives up.
+2. **Fragmented chunks lose context.** 960 ms is roughly 1–2 English words; translating each
+   chunk independently destroys sentence-level context.
+3. **There is no latency penalty in the reward**, so "being simultaneous" is not actually being
+   optimized for.
 
-真正的同传需要语义单元切块、冷启动 SFT、延迟奖励三者之一或全部。这次验证的是**多轮定长块
-的链路能跑通且 reward 会涨**，不是同传质量本身。
+Real simultaneous interpretation needs some or all of: semantic-unit chunking, a cold-start SFT
+phase, and a latency-aware reward. What this run validated is that **the multi-turn fixed-chunk
+path works end to end and the reward goes up** — not the quality of the interpretation itself.
 
-> 一个坑：早期同传跑出来 BLEU 平躺在 0.06、advantage≈0，是奖励被 `<|im_end|>` 之类特殊
-> token 污染。修掉之后才有上面这条曲线（`3a6eb2f`）。上表是修复后全新从头训的 20 步。
+> One pitfall: an early simultaneous run had BLEU flat at 0.06 with advantage ≈ 0, because the
+> reward was contaminated by special tokens such as `<|im_end|>`. The curve above is from a fresh
+> 20-step run started from scratch after that fix (`3a6eb2f`).
 
-## 4. en→zh S2TT，当前代码路径，40 步（2026-08-12）
+## 4. en→zh S2TT, current code path, 40 steps (2026-08-12)
 
-迁到现在 main 的这套代码之后重跑，回答「换了实现还学不学得动」。超参逐项对齐实验 2
-（LoRA 16/32、TP4/EP4、temperature 1.1、rollout-batch 8 / n-samples 8 / global-batch 64、lr 1e-4），
-数据 FLEURS validation 前 128 条。
+A rerun after migrating to the implementation now on main, answering one question: does it still
+learn under the new implementation? Hyperparameters match experiment 2 item by item (LoRA 16/32,
+TP4/EP4, temperature 1.1, rollout-batch 8 / n-samples 8 / global-batch 64, lr 1e-4), data is the
+first 128 items of FLEURS validation.
 
-| 区间 | BLEU |
+| Range | BLEU |
 |---|---|
-| 步 1–10 | 0.2937 |
-| 步 11–20 | 0.3308 |
-| 步 21–30 | 0.3571 |
-| 步 31–40 | 0.3914 |
+| Steps 1–10 | 0.2937 |
+| Steps 11–20 | 0.3308 |
+| Steps 21–30 | 0.3571 |
+| Steps 31–40 | 0.3914 |
 
-**0.294 → 0.391，Δ = +0.098。** 与实验 2 同期的四个窗口（0.287 / 0.344 / 0.345 / 0.389）
-逐段吻合，差值都在 ±0.013 以内。
+**0.294 → 0.391, Δ = +0.098.** Segment by segment this matches the same span of experiment 2
+(0.287 / 0.344 / 0.345 / 0.389) to within ±0.013 everywhere.
 
-判据在开跑前就写死了（后 10 步均值落在 0.36–0.42、且前后差值同量级），不是看到结果再补的。
+The criterion was fixed before the run started (last-10 mean landing in 0.36–0.42, with a
+first-to-last delta of the same order), not fitted after seeing the result.
 
-**边界：当前代码路径只验证到 40 步**，实验 2 那条 100 步曲线是在旧实现上跑出来的。
-40 步之后能不能继续爬到 0.487，没有在当前代码上验过。
+**Limit: the current code path has only been verified to 40 steps.** The 100-step curve in
+experiment 2 was produced on the older implementation. Whether it keeps climbing to 0.487 past
+step 40 has not been verified on the current code.
 
 ---
 
-## 已知的口径问题
+## A known discrepancy in convention
 
-`omni_s2tt/curve.py` 从 `rollout_result/train/*.jsonl` 的**逐样本 reward** 统计，而上面所有
-数字来自**训练日志的 `rollout/raw_reward`**。两者理论上应该相等（后者就是前者的 batch 均值），
-但从未交叉核对过。自己跑出来的数如果和这里差一点点，先确认是不是口径问题，再怀疑训练。
+`omni_s2tt/curve.py` computes from the **per-sample rewards** in `rollout_result/train/*.jsonl`,
+whereas every number above comes from **`rollout/raw_reward` in the training log**. The two should
+be equal (the latter is the batch mean of the former), but they have never been cross-checked. If
+your own numbers differ slightly from these, rule out the convention mismatch before suspecting
+the training.
 
-## 还没验证的
+## Not yet verified
 
-- 续训：2026-08-12 那次想从 `iter_0000004` 接着跑，实际从 0 开始了——上一次被提前收掉，
-  `latest_checkpointed_iteration.txt` 没写出来。LoRA 的续训路径至今没有单独验证过。
-- 当前代码路径跑满 100 步。
-- 同传在当前代码路径上的移植（`examples/simul_s2tt/` 还没搬过来）。
+- Resuming: on 2026-08-12 we meant to continue from `iter_0000004` but it actually restarted from
+  0 — the previous run was killed early and `latest_checkpointed_iteration.txt` was never written.
+  The LoRA resume path has never been verified on its own.
+- Running the current code path for the full 100 steps.
+- Simultaneous interpretation on the current code path — the code has been ported
+  (`Relax/examples/simul_s2tt/`) but never run.

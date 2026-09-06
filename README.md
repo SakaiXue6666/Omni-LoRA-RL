@@ -1,55 +1,62 @@
 # Omni-LoRA-RL
 
-Qwen3-Omni Thinker + LoRA 的强化学习训练工程。任务是 **S2TT**（英语语音 → 中文文本），
-算法用 GRPO，奖励用句级 BLEU，推理侧走 sglang 的 LoRA adapter 热加载 —— 训练每步把更新
-后的 adapter 直接从显存推给推理引擎，不落盘。
+Reinforcement-learning training for Qwen3-Omni Thinker + LoRA. The task is **S2TT** (English
+speech → Chinese text), the algorithm is GRPO, the reward is sentence-level BLEU, and inference
+goes through sglang's LoRA adapter hot-loading — every training step pushes the updated adapter
+straight from GPU memory into the inference engine, without touching disk.
 
-**最好的结果：4×A100-80GB 上跑满 100 步，BLEU 从 0.287 升到 0.487。**
-当前代码路径已复现前 40 步（0.294 → 0.391）。四次实验的完整逐步数据在
-[`docs/results/experiments.md`](docs/results/experiments.md)。
+**Best result: 100 full steps on 4×A100-80GB, BLEU from 0.287 to 0.487.**
+The current code path has reproduced the first 40 steps (0.294 → 0.391). Complete per-step data
+for all four experiments is in [`docs/results/experiments.md`](docs/results/experiments.md).
 
-本仓库是**入口 / hub**，真正的代码以 submodule 指向两个 fork。
+This repository is the **entry point / hub**; the actual code is pulled in as submodules pointing
+at two forks.
 
-## 仓库组成
+## What is in here
 
-| 目录 | 来源 | 分支 | 作用 |
+| Directory | Origin | Branch | Role |
 |---|---|---|---|
-| `Relax/` | fork 自 `redai-infra/Relax` | `lora-omni-v2` | 训练侧（Megatron-Bridge + LoRA + rollout） |
-| `sglang/` | fork 自 `sgl-project/sglang` `v0.5.12.post1` | `lora-omni-v2` | 推理侧（Omni 的 LoRA serving） |
-| `omni_s2tt/` | 本仓库自带 | — | 训练脚本、BLEU 奖励、数据准备、曲线统计 |
-| `scripts/`、`docs/` | 本仓库自带 | — | Modal 入口与迁移期探针；文档与实验数据 |
+| `Relax/` | fork of `redai-infra/Relax` | `lora-omni-v2` | Training side (Megatron-Bridge + LoRA + rollout) |
+| `sglang/` | fork of `sgl-project/sglang` `v0.5.12.post1` | `lora-omni-v2` | Inference side (LoRA serving for Omni) |
+| `omni_s2tt/` | this repo | — | Training scripts, BLEU reward, data preparation, curve statistics |
+| `scripts/`, `docs/` | this repo | — | Modal entry point and migration-era probes; documentation and experiment data |
 
-之所以还要 fork，是因为有五处改动还没进上游（PR 都已提，见下面「当前进度」）。
-一旦合并，fork 就能退化成"上游 + Omni 专属那两处"。
+The forks exist because five changes have not landed upstream yet (all filed as PRs, see "Current
+status" below). Once they merge, the forks can collapse back to "upstream plus the two
+Omni-specific bits".
 
-**硬件**：4 张 80GB 卡（A100/H100）。模型是 30B 的 MoE（激活 3B），配置是 colocate ——
-训练与推理共用同一批卡，TP4 / EP4 / PP1。单机即可，不需要多机。显存吃紧先调
-`SGLANG_MEM_FRACTION`（默认 0.7），它决定推理引擎占多少。
+**Hardware**: four 80GB cards (A100/H100). The model is a 30B MoE (3B active), configured
+colocated — training and inference share the same cards, TP4 / EP4 / PP1. A single node is
+enough; no multi-node setup needed. If memory is tight, start by adjusting
+`SGLANG_MEM_FRACTION` (default 0.7), which decides how much the inference engine takes.
 
 ---
 
-# 做了什么实验，结果如何
+# What was tried, and what came out
 
-数据集统一是 **FLEURS**（`google/fleurs`，`en_us` 音频 + `cmn_hans_cn` 文本按 `id` 平行对齐），
-奖励是 sacreBLEU（中文 tokenizer）/ 100。指标是每步 `rollout/raw_reward`，也就是那一批样本
-BLEU 的均值。**判据一律用十步窗口均值，不看单步** —— 单步噪声很大，见过从 0.539 掉到 0.397。
+The dataset throughout is **FLEURS** (`google/fleurs`, `en_us` audio paired with `cmn_hans_cn`
+text by `id`), and the reward is sacreBLEU (Chinese tokenizer) / 100. The metric is
+`rollout/raw_reward` per step, i.e. the mean BLEU over that batch of samples. **The criterion is
+always a ten-step window mean, never a single step** — single-step noise is large; we have seen a
+drop from 0.539 to 0.397.
 
-| 实验 | 数据 | 步数 | 结果（首窗 → 末窗） |
+| Experiment | Data | Steps | Result (first window → last window) |
 |---|---|---|---|
-| zh→en 翻译 + BLEU（验证奖励设计） | 自造长难句 256 条 | 10 | 0.463 → 0.523 |
-| **en→zh S2TT（离线单轮）** | FLEURS 128 条 | **100** | **0.287 → 0.487** |
-| 同传（960ms 定长块，多轮） | FLEURS 97 条整段 | 20 | 0.155 → 0.265 |
-| en→zh S2TT（当前代码路径） | FLEURS 128 条 | 40 | 0.294 → 0.391 |
+| zh→en translation + BLEU (validating the reward design) | 256 hand-made long sentences | 10 | 0.463 → 0.523 |
+| **en→zh S2TT (offline)** | FLEURS, 128 items | **100** | **0.287 → 0.487** |
+| Simultaneous (960 ms fixed chunks, multi-turn) | FLEURS, 97 full clips | 20 | 0.155 → 0.265 |
+| en→zh S2TT (current code path) | FLEURS, 128 items | 40 | 0.294 → 0.391 |
 
-还有一次有价值的失败：数学 MCQ + 0/1 奖励，32/32 全对、组内零方差、advantage=0，学不动。
-它决定了后面所有实验为什么用连续奖励，理由见
-[`docs/design/reward-design.md`](docs/design/reward-design.md)。
+There was also one useful failure: math multiple-choice with a 0/1 reward gave 32/32 correct,
+zero in-group variance, advantage = 0, and nothing to learn from. That is why every experiment
+afterwards uses a continuous reward — the reasoning is in
+[`docs/design/reward-design.md`](docs/design/reward-design.md).
 
-## 主线：S2TT 100 步
+## The main line: S2TT, 100 steps
 
-十步窗口均值，单调上升：
+Ten-step window means, rising monotonically:
 
-| 区间 | BLEU | | 区间 | BLEU |
+| Range | BLEU | | Range | BLEU |
 |---|---|---|---|---|
 | 1–10 | 0.2868 | | 51–60 | 0.4137 |
 | 11–20 | 0.3442 | | 61–70 | 0.4400 |
@@ -57,91 +64,101 @@ BLEU 的均值。**判据一律用十步窗口均值，不看单步** —— 单
 | 31–40 | 0.3886 | | 81–90 | 0.4890 |
 | 41–50 | 0.4020 | | 91–100 | 0.4873 |
 
-区间 [0.234 @step3, 0.610 @step95]。旁证：response 长度从 28 token 降到 20（译文变紧凑）、
-log_probs 上升。逐步原始数据 `docs/results/s2tt-100step-curve.json`。
+Range [0.234 @step3, 0.610 @step95]. Supporting evidence: response length dropped from 28 tokens
+to 20 (tighter translations) and log_probs rose. Per-step raw data in
+`docs/results/s2tt-100step-curve.json`.
 
-## 边界：哪些没验过
+## Limits: what has not been verified
 
-- **当前代码路径只跑到 40 步。** 那条 100 步曲线是在旧实现上跑出来的；40 步之后能不能
-  继续爬到 0.487，在当前代码上没验过。前 40 步两者逐段吻合（差值都在 ±0.013 内）。
-- **续训没验证过。** 最近一次想从 `iter_0000004` 接着跑，实际从 0 开始了 —— 上次被提前
-  收掉，`latest_checkpointed_iteration.txt` 没写出来。LoRA 的续训路径至今没单独查过。
-- **同传代码已移过来，但一次没跑过。** `Relax/examples/simul_s2tt/`，四处必要改动已做；已知风险与
-  预期报错见 [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md)，上卡前先读。
-- **口径**：`omni_s2tt/curve.py` 按 `rollout_result` 的逐样本 reward 统计，上面的数字来自
-  训练日志的 `rollout/raw_reward`。两者理论上相等，但没交叉核对过。
+- **The current code path has only been run to 40 steps.** That 100-step curve was produced on
+  the older implementation; whether it keeps climbing to 0.487 past step 40 has not been verified
+  on the current code. The first 40 steps match segment by segment (all deltas within ±0.013).
+- **Resuming has never been verified.** The most recent attempt meant to continue from
+  `iter_0000004` but actually restarted from 0 — the previous run was killed early and
+  `latest_checkpointed_iteration.txt` was never written. The LoRA resume path has never been
+  investigated on its own.
+- **The simultaneous-interpretation code has been ported but never run.** It is in
+  `Relax/examples/simul_s2tt/` with the four necessary changes applied; known risks and the errors
+  to expect are in [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md) — read it
+  before spending GPU time.
+- **Convention**: `omni_s2tt/curve.py` computes from the per-sample rewards in `rollout_result`,
+  while the numbers above come from `rollout/raw_reward` in the training log. The two should be
+  equal, but they have never been cross-checked.
 
 ---
 
-# 当前进度
+# Current status
 
-> 截至 2026-09-05
+> As of 2026-09-05
 
-**已闭环**：S2TT 训练链路在当前代码上端到端跑通（2026-08-12，40 步）。sglang 的
-`should_apply_lora` 门控、Omni 的 `_lora_pattern`、Relax 的通配符展开与 PEFT 前缀、
-以及 adapter 传输，全部被这次训练隐式验证过。
+**Closed loop**: the S2TT training path runs end to end on the current code (2026-08-12, 40
+steps). sglang's `should_apply_lora` gate, Omni's `_lora_pattern`, Relax's wildcard expansion and
+PEFT prefix, and adapter transport were all implicitly validated by that run.
 
-**进行中**：五个上游 PR，全部 open，自 8 月中旬起无进展。
+**In flight**: five upstream PRs, all open, no movement since mid-August.
 
-| PR | 仓库 | 状态 |
+| PR | Repo | Status |
 |---|---|---|
-| [#34428](https://github.com/sgl-project/sglang/pull/34428) Honor `should_apply_lora` | sglang | Open，**CI 卡在缺 `run-ci` label，测试从未真正执行**；5 位 code owner 未响应 |
-| [#34595](https://github.com/sgl-project/sglang/pull/34595) CPU 张量 reduce 越界守卫 | sglang | Open，同样卡 `run-ci` label |
-| [#261](https://github.com/redai-infra/Relax/pull/261) 通配符 target modules 展开 | Relax | Open，CI 全绿，等 code owner 批准 |
-| [#262](https://github.com/redai-infra/Relax/pull/262) adapter 按 PEFT key 布局导出 | Relax | Open，CI 全绿，等 code owner 批准 |
-| [#265](https://github.com/redai-infra/Relax/pull/265) adapter 传输改内联字节 | Relax | Open，等 code owner 批准 |
+| [#34428](https://github.com/sgl-project/sglang/pull/34428) Honor `should_apply_lora` | sglang | Open. **CI is blocked on the missing `run-ci` label; the tests have never actually executed.** Five code owners have not responded |
+| [#34595](https://github.com/sgl-project/sglang/pull/34595) CPU-tensor reduce guard | sglang | Open, blocked on the same `run-ci` label |
+| [#261](https://github.com/redai-infra/Relax/pull/261) Wildcard target-module expansion | Relax | Open, CI green, awaiting code-owner approval |
+| [#262](https://github.com/redai-infra/Relax/pull/262) Export adapters in PEFT's key layout | Relax | Open, CI green, awaiting code-owner approval |
+| [#265](https://github.com/redai-infra/Relax/pull/265) Adapter transport switched to inlined bytes | Relax | Open, awaiting code-owner approval |
 
-PR 正文存档在 `docs/upstream-prs/`。两个 sglang PR 卡的不是技术问题，是需要 maintainer
-加个标签 —— 这是最容易推动的一件事。
+The PR bodies are archived in `docs/upstream-prs/`. What blocks the two sglang PRs is not a
+technical problem — a maintainer just needs to add a label, which makes it the easiest thing to
+push on.
 
-**下一步**（按优先级）：
+**Next steps** (in priority order):
 
-1. 推动 sglang 两个 PR 的 `run-ci` label
-2. 排查 LoRA 续训不生效
-3. 跑通同传（代码已就位，见 `docs/design/simul-port-notes.md` 的风险清单）
-4. 当前代码路径跑满 100 步，确认能复现 0.487
+1. Get the `run-ci` label onto the two sglang PRs
+2. Investigate why LoRA resume does not take effect
+3. Get simultaneous interpretation running (the code is in place; see the risk list in
+   `docs/design/simul-port-notes.md`)
+4. Run the current code path for a full 100 steps and confirm 0.487 reproduces
 
 ---
 
-# 如何运行
+# How to run it
 
-两条路径，**验证状态不同，先看清楚**：
+Two paths, with **different verification status — be clear which one you are on**:
 
-| | 状态 |
+| | Status |
 |---|---|
-| **A. Modal** | ✅ **已验证**。上面所有实验都是这条路跑出来的 |
-| **B. 自建服务器 / Docker** | ⚠️ **从源码推导，一次没实跑过**。逻辑与 A 一一对应，但没人走通过 |
+| **A. Modal** | ✅ **Verified.** Every experiment above was produced on this path |
+| **B. Your own server / Docker** | ⚠️ **Derived from the source, never actually run.** It corresponds one-to-one with A, but nobody has walked it through |
 
-B 那条路欢迎第一个跑通的人回来改这份文档 —— 有出入的地方直接提 PR，那比留着一份没验证的
-手册有用得多。
+For path B: whoever gets it working first, please come back and fix this document. Filing a PR
+with the discrepancies is far more useful than leaving an unverified manual in place.
 
-## A. 在 Modal 上跑（已验证）
+## A. Running on Modal (verified)
 
 ```bash
-modal run scripts/modal_train_s2tt.py::check                      # 先查数据与权重（CPU，几十秒）
-modal run scripts/modal_train_s2tt.py --num-rollout 40 --detach   # 起训练，spawn 出去与本地解耦
-modal run scripts/modal_train_s2tt.py::result --call-id <ID>      # 取结果
+modal run scripts/modal_train_s2tt.py::check                      # check data and weights first (CPU, tens of seconds)
+modal run scripts/modal_train_s2tt.py --num-rollout 40 --detach   # start training, spawned so it detaches from the local process
+modal run scripts/modal_train_s2tt.py::result --call-id <ID>      # fetch the result
 ```
 
-**`--detach` 不要省。** 用 `remote()` 会把训练的生命周期绑在本地那个 modal 进程上，本地一断
-app 就被收掉 —— 上次就是这么在第 5 步被杀的，只留下一个 `iter_0000004`。
+**Do not skip `--detach`.** Using `remote()` binds the training run's lifetime to the local modal
+process, so the app gets reaped the moment the local side drops — that is exactly how a run got
+killed at step 5, leaving nothing but an `iter_0000004`.
 
-`scripts/modal_train_s2tt.py` 里的镜像、PYTHONPATH、环境变量与下面 B 的每一节一一对应，
-可以对着看。
+The image, PYTHONPATH and environment variables in `scripts/modal_train_s2tt.py` correspond
+one-to-one with every section of B below, so you can read them side by side.
 
-## B. 在自建服务器 / Docker 上跑（未实跑）
+## B. Running on your own server / Docker (never actually run)
 
-### 一、拉代码
+### 1. Get the code
 
 ```bash
 git clone --recursive https://github.com/SakaiXue6666/Omni-LoRA-RL.git
 cd Omni-LoRA-RL
 
-# 已经 clone 但忘了 --recursive：
+# Already cloned but forgot --recursive:
 git submodule update --init --recursive
 ```
 
-核对两个 submodule 落在预期的提交上（对不上就是没 init 干净）：
+Check that both submodules landed on the expected commits (a mismatch means init was not clean):
 
 ```bash
 git submodule status
@@ -149,10 +166,11 @@ git submodule status
 #  02044692... sglang (v0.5.12.post1-5-g02044692cc)
 ```
 
-### 二、起容器
+### 2. Start the container
 
-用 Relax 官方镜像，按 digest 钉死——`:latest` 会漂移，旧的那套实现就是因为这个变得不可复现。
-镜像里已经有 Megatron-LM、Megatron-Bridge、flashinfer、transformer-engine，不用自己装。
+Use the official Relax image, pinned by digest — `:latest` drifts, and that is exactly what made
+the older implementation irreproducible. The image already contains Megatron-LM,
+Megatron-Bridge, flashinfer and transformer-engine; you do not need to install them.
 
 ```bash
 docker run --gpus all -it --rm \
@@ -166,9 +184,10 @@ docker run --gpus all -it --rm \
   bash
 ```
 
-`--shm-size` 不要省。默认的 64MB 会让 NCCL 与 Ray 的共享内存路径随机失败。
+Do not omit `--shm-size`. The default 64MB makes the shared-memory paths in NCCL and Ray fail at
+random.
 
-容器里补一个包（BLEU 奖励要用它的中文 tokenizer）：
+One package to add inside the container (the BLEU reward needs its Chinese tokenizer):
 
 ```bash
 pip install --no-cache-dir sacrebleu
@@ -176,20 +195,23 @@ pip install --no-cache-dir sacrebleu
 
 #### PYTHONPATH
 
-这是最容易翻车的一步，三条都必须有：
+This is the step most likely to go wrong. All three parts are required:
 
 ```bash
 cd /workspace/Omni-LoRA-RL
 export PYTHONPATH=$PWD:$PWD/sglang/python:$PYTHONPATH
 ```
 
-- `$PWD`：让 `--custom-rm-path omni_s2tt.bleu_rm.compute_bleu_reward` 能 import 到奖励模块
-- `$PWD/sglang/python`：**顶掉镜像预装的 sglang**，否则跑的是没有 Omni LoRA 支持的那份
-- 结尾的 `$PYTHONPATH`：镜像原本的 `/root/Megatron-LM:/pkg:/root` 必须保留，`megatron` 和
-  `megatron.bridge` 都在那儿。第一次跑漏了它，Ray job 起来后在 `from megatron.core import mpu`
-  直接 ModuleNotFoundError，十次重试全废在同一个地方
+- `$PWD`: so that `--custom-rm-path omni_s2tt.bleu_rm.compute_bleu_reward` can import the reward
+  module
+- `$PWD/sglang/python`: **shadows the sglang preinstalled in the image**, otherwise you run the
+  copy without Omni LoRA support
+- the trailing `$PYTHONPATH`: the image's original `/root/Megatron-LM:/pkg:/root` must be
+  preserved — `megatron` and `megatron.bridge` live there. The first run dropped it, and once the
+  Ray job started it died on `from megatron.core import mpu` with ModuleNotFoundError; all ten
+  retries burned on the same line
 
-烧卡之前先自检一遍，几秒钟的事：
+Before burning GPU time, self-check. It takes seconds:
 
 ```bash
 python3 -c "import megatron.core, relax, sglang, omni_s2tt.bleu_rm as b; \
@@ -197,54 +219,56 @@ print('megatron', megatron.core.__file__); print('relax', relax.__file__); \
 print('sglang ', sglang.__file__); print('reward ', b.__file__)"
 ```
 
-`sglang` 那行必须指向 `/workspace/Omni-LoRA-RL/sglang/python/...`。指到别处就是被镜像里
-那份盖住了，LoRA 会挂到 audio/vision 塔上去。
+The `sglang` line must point at `/workspace/Omni-LoRA-RL/sglang/python/...`. Anywhere else means
+the image's copy shadowed it, and LoRA will get attached to the audio/vision towers.
 
-### 三、准备权重
+### 3. Prepare the weights
 
 ```bash
 huggingface-cli download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /models/qwen3-omni
 ```
 
-两个必须存在的文件，缺了都不会立刻报错，而是以奇怪的方式失败：
+Two files must exist. Missing either does not fail immediately — it fails in a strange way:
 
 ```bash
-# 1. tokenizer.json：sgl-router 是 Rust 写的，注册 tokenizer 时只认 fast 格式
+# 1. tokenizer.json: sgl-router is written in Rust and only accepts the fast format when
+#    registering a tokenizer
 python3 -c "
 from transformers import AutoTokenizer
 AutoTokenizer.from_pretrained('/models/qwen3-omni', trust_remote_code=True, use_fast=True).save_pretrained('/models/qwen3-omni')"
 
-# 2. chat_template.json：Qwen3-Omni 的模板在 processor 里，裸 AutoTokenizer 在
-#    transformers 5.x 下读不到，会拿到空模板 —— 模型于是直接吐 <|im_end|>，rollout 全空
+# 2. chat_template.json: Qwen3-Omni keeps its template inside the processor, and a bare
+#    AutoTokenizer cannot read it under transformers 5.x — you get an empty template, so the
+#    model emits <|im_end|> straight away and every rollout comes back empty
 test -f /models/qwen3-omni/chat_template.json && echo OK
 ```
 
-### 四、准备数据
+### 4. Prepare the data
 
-一行一条 JSON，四个字段：
+One JSON object per line, four fields:
 
 ```json
 {
   "prompt": "<audio>\nPlease translate the English speech into Chinese. Only output the Chinese translation.",
   "audios": ["/data/s2tt/audio/fleurs_00000123_en.wav"],
-  "label": {"ground_truth": "参考译文"},
-  "metadata": {"src_lang": "en", "tgt_lang": "zh", "rm_type": "bleu", "src_text": "原文"}
+  "label": {"ground_truth": "reference translation"},
+  "metadata": {"src_lang": "en", "tgt_lang": "zh", "rm_type": "bleu", "src_text": "source text"}
 }
 ```
 
-`prompt` 里的 `<audio>` 是占位符，由 `--multimodal-keys '{"audio": "audios"}'` 把 `audios`
-里的路径填进去。`audios` 用绝对路径，单声道 16kHz wav。
+The `<audio>` in `prompt` is a placeholder; `--multimodal-keys '{"audio": "audios"}'` fills it
+from the paths in `audios`. Use absolute paths, mono 16 kHz wav.
 
-复现那条曲线的数据（FLEURS en→zh，validation 前 128 条）：
+The data behind that curve (FLEURS en→zh, first 128 items of validation):
 
 ```bash
 pip install "datasets>=2.19,<3" "numpy<2" soundfile librosa "huggingface_hub<0.26"
 python3 omni_s2tt/prep_fleurs_s2tt.py --out-dir /data/s2tt --limit 128
 ```
 
-128 条配 `rollout-batch 8` 是每 16 步一个 epoch，40 步约 2.5 个 epoch。
+128 items at `rollout-batch 8` is one epoch every 16 steps, so 40 steps is about 2.5 epochs.
 
-### 五、跑训练
+### 5. Run training
 
 ```bash
 cd /workspace/Omni-LoRA-RL
@@ -253,10 +277,10 @@ export HF_CKPT=/models/qwen3-omni
 export DATA=/data/s2tt/train_s2tt.jsonl
 export NUM_ROLLOUT=40
 export NUM_GPUS=4
-export SAVE_DIR=/data/s2tt/ckpt/s2tt_run1     # 留空则不存档
+export SAVE_DIR=/data/s2tt/ckpt/s2tt_run1     # leave empty to skip checkpointing
 export SAVE_INTERVAL=5
 
-# chat template 显式喂进去（见第三步）
+# feed the chat template in explicitly (see step 3)
 export CHAT_TEMPLATE_KWARGS=$(python3 -c "
 import json; t = json.load(open('$HF_CKPT/chat_template.json'))['chat_template']
 print(json.dumps({'chat_template': t}, ensure_ascii=False))")
@@ -264,16 +288,19 @@ print(json.dumps({'chat_template': t}, ensure_ascii=False))")
 bash omni_s2tt/run-qwen3-omni-lora-s2tt-4gpu.sh 2>&1 | tee train.log
 ```
 
-Ray 不用自己起。脚本会 source `Relax/scripts/entrypoint/local.sh`，那里会清理残留进程、
-起单机 Ray head、探测 NVLink 并设好 `RUNTIME_ENV_JSON`。**如果你已经有一个 Ray 集群**，
-设好 `RAY_ADDRESS` 即可，它检测到之后会转去 `ray-job.sh` 而不是另起一个 head。
+You do not need to start Ray yourself. The script sources `Relax/scripts/entrypoint/local.sh`,
+which cleans up leftover processes, brings up a single-node Ray head, probes NVLink and sets
+`RUNTIME_ENV_JSON`. **If you already have a Ray cluster**, just set `RAY_ADDRESS` — once detected,
+it hands off to `ray-job.sh` instead of starting another head.
 
-> **在共用服务器上注意**：`local.sh` 的清理段是 `pkill -9 python` + `pkill -9 ray`，
-> 不区分是谁的进程。在容器里跑没问题（PID namespace 隔离），直接在裸机上跑会连同事的
-> 任务一起杀掉。裸机跑的话自己起 Ray 并跳过那一段，`scripts/modal_train_s2tt.py` 走的就是这条路：
+> **On a shared server, be careful**: the cleanup section of `local.sh` is `pkill -9 python` plus
+> `pkill -9 ray`, and it does not care whose processes they are. Inside a container this is fine
+> (PID namespace isolation); running it directly on the host will take your colleagues' jobs down
+> with it. On bare metal, start Ray yourself and skip that section — this is the path
+> `scripts/modal_train_s2tt.py` takes:
 >
 > ```bash
-> export RELAX_ENTRYPOINT_MODE=local        # 让脚本别再 source local.sh
+> export RELAX_ENTRYPOINT_MODE=local        # tell the script not to source local.sh
 > export RAY_ADDRESS=http://127.0.0.1:8265
 > export RUNTIME_ENV_JSON="{\"env_vars\": {\"PYTHONPATH\": \"$PYTHONPATH\", \
 >   \"PYTHONUNBUFFERED\": \"1\", \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\", \
@@ -282,167 +309,181 @@ Ray 不用自己起。脚本会 source `Relax/scripts/entrypoint/local.sh`，那
 >   --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 > ```
 >
-> 这条路上 `RUNTIME_ENV_JSON` 必须自己给：Ray job 是另一个进程，PYTHONPATH 不传过去
-> 就又回到那个 `ModuleNotFoundError: megatron`。
+> On this path you must supply `RUNTIME_ENV_JSON` yourself: the Ray job is a separate process, and
+> without passing PYTHONPATH through you are back to `ModuleNotFoundError: megatron`.
 
-后台跑就套 `nohup ... &` 或 tmux。管道那里注意 `set -o pipefail`（脚本里已经有了）：
-不套的话退出码取的是 `tee` 的，训练崩了也报成功。
+To run in the background, wrap it in `nohup ... &` or tmux. Mind `set -o pipefail` on that pipe
+(the script already has it): without it the exit code is `tee`'s, so a crashed training run
+reports success.
 
-### 六、记录与看结果
+### 6. Records and results
 
-跑在服务器上不像 Modal 有面板兜着，所以先说清楚每样东西落在哪。**只要设了 `SAVE_DIR`，
-下面前三样都是自动的**，不用加开关。
+Running on a server means there is no Modal dashboard to fall back on, so first, where everything
+lands. **As long as `SAVE_DIR` is set, the first three are automatic** — no extra flags needed.
 
-#### 逐样本的 reward（最该收的一份）
+#### Per-sample rewards (the one most worth collecting)
 
-`$SAVE_DIR/rollout_result/train/<step>.jsonl`，每步一个文件，每行一条样本：
+`$SAVE_DIR/rollout_result/train/<step>.jsonl`, one file per step, one sample per line:
 
 ```
 rollout_id / sample_index / group_index / prompt / response / reward / label
 prompt_length / response_length / total_length / status
 ```
 
-BLEU 曲线只是这份数据的均值，而排查问题要的是原始 response——译文空了、带 `<|im_end|>`、
-还是组内八条完全一样（那样 GRPO 没有梯度），都得翻这里。没设 `SAVE_DIR` 的话显式给
-`--rollout-result-dir <目录>` 也行。
+The BLEU curve is just the mean of this data; what you need for debugging is the raw responses —
+an empty translation, one carrying `<|im_end|>`, or all eight in a group being identical (which
+leaves GRPO with no gradient) all have to be found here. If `SAVE_DIR` is unset, passing
+`--rollout-result-dir <dir>` explicitly works too.
 
-统计曲线：
+Computing the curve:
 
 ```bash
 python3 omni_s2tt/curve.py $SAVE_DIR/rollout_result/train --csv curve.csv
 ```
 
-它按步打印均值与直方条，并算首尾窗口均值。参照值见上面「做了什么实验」那一节。
+It prints per-step means with a histogram bar and computes the first/last window means. Reference
+values are in the "What was tried" section above.
 
 #### TensorBoard
 
-默认就开着（`--use-tensorboard` 默认为真）。落盘目录有优先级：`TENSORBOARD_DIR` 环境变量
-> `$SAVE_DIR/tensorboard_log` > `tensorboard_log/<项目>/<实验>`（相对路径，会跟着 Ray job
-的工作目录跑，不好找）。建议在跑之前显式钉死绝对路径：
+On by default (`--use-tensorboard` defaults to true). The output directory follows a priority
+order: the `TENSORBOARD_DIR` environment variable > `$SAVE_DIR/tensorboard_log` >
+`tensorboard_log/<project>/<experiment>` (a relative path, which follows the Ray job's working
+directory and is hard to find). Pin an absolute path explicitly before you start:
 
 ```bash
-export TENSORBOARD_DIR=/data/s2tt/tb/run1        # 要在 ray start 之前 export
+export TENSORBOARD_DIR=/data/s2tt/tb/run1        # must be exported before ray start
 tensorboard --logdir /data/s2tt/tb --host 0.0.0.0 --port 6006
 ```
 
-曲线在 `rollout/raw_reward`（这一步的 BLEU 均值）、`rollout/rewards`、`response_len/*`
-以及 `perf/*` 下面。
+The curves are under `rollout/raw_reward` (that step's mean BLEU), `rollout/rewards`,
+`response_len/*` and `perf/*`.
 
-#### 文本日志
+#### Text logs
 
-两处，作用不同：
+Two places, with different purposes:
 
-- `log/qwen3-omni-lora-s2tt-<时间戳>.log` —— 脚本自己 tee 的，是 Ray driver 的输出，
-  训练主线程与每步的 metrics 行都在这儿
-- `/tmp/ray/session_latest/logs/` —— Ray worker 的日志。**训练崩了要看的是这里**，
-  driver 那边往往只剩一句 actor died，真正的 traceback 在 worker 的 `python-core-worker-*.log`
-  和 `worker-*.err` 里
+- `log/qwen3-omni-lora-s2tt-<timestamp>.log` — what the script itself tees, i.e. the Ray driver's
+  output. The training main thread and the per-step metrics lines are here
+- `/tmp/ray/session_latest/logs/` — the Ray workers' logs. **This is where to look when training
+  crashes**: the driver side usually has nothing but "actor died", while the real traceback is in
+  the workers' `python-core-worker-*.log` and `worker-*.err`
 
-服务器上记得把这两处也落到能长期保存的盘：`/tmp` 一重启就没了。
+On a server, remember to copy both somewhere with long-term storage: `/tmp` is gone after a
+reboot.
 
-#### wandb（可选）
+#### wandb (optional)
 
-实验室机器常没外网，用离线模式，回头再 `wandb sync`：
+Lab machines often have no outbound network, so use offline mode and `wandb sync` later:
 
 ```bash
-export WANDB_API_KEY=...          # 在线才需要
-# 在训练脚本的 WANDB_ARGS 里加：--use-wandb --wandb-mode offline --wandb-dir /data/s2tt/wandb
+export WANDB_API_KEY=...          # only needed when online
+# add to WANDB_ARGS in the training script: --use-wandb --wandb-mode offline --wandb-dir /data/s2tt/wandb
 ```
 
-#### checkpoint
+#### Checkpoints
 
-`$SAVE_DIR/iter_XXXXXXX`，含 optimizer 状态，`--load` 指向同一目录即可续跑。默认
-`--max-actor-ckpt-to-keep 1`，只留最新一个，想多留就调 `MAX_CKPT_KEEP`。
-注意续训路径至今没验证过，见上面「边界」。
+`$SAVE_DIR/iter_XXXXXXX`, including optimizer state; point `--load` at the same directory to
+resume. The default `--max-actor-ckpt-to-keep 1` keeps only the newest one; raise `MAX_CKPT_KEEP`
+to keep more. Note that the resume path has never been verified — see "Limits" above.
 
-## 想调什么，去哪调
+## What to tune, and where
 
-超参全部走环境变量，不用改脚本：
+Every hyperparameter goes through an environment variable; you do not need to edit the script:
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Notes |
 |---|---|---|
-| `LORA_RANK` / `LORA_ALPHA` | 16 / 32 | 记录在案的曲线都是这个配置；改了就没法跟它们比 |
-| `LR` | 1e-4 | constant 衰减 |
-| `ROLLOUT_TEMPERATURE` | 1.1 | 略升温，让组内译文有方差，GRPO 才有梯度。**改小之前先读 `docs/design/reward-design.md`** |
-| `ROLLOUT_BATCH` / `N_SAMPLES` | 8 / 8 | 每步 64 条序列 |
+| `LORA_RANK` / `LORA_ALPHA` | 16 / 32 | Every recorded curve used this configuration; change it and you can no longer compare against them |
+| `LR` | 1e-4 | Constant decay |
+| `ROLLOUT_TEMPERATURE` | 1.1 | Slightly raised so translations within a group vary, which is what gives GRPO a gradient. **Read `docs/design/reward-design.md` before lowering it** |
+| `ROLLOUT_BATCH` / `N_SAMPLES` | 8 / 8 | 64 sequences per step |
 | `GLOBAL_BATCH` | 64 | |
-| `SGLANG_MEM_FRACTION` | 0.7 | 推理引擎占的显存比例 |
-| `PROJECT_NAME` | Relax/v2/omni-lora-s2tt | tensorboard 项目名 |
+| `SGLANG_MEM_FRACTION` | 0.7 | Fraction of GPU memory the inference engine takes |
+| `PROJECT_NAME` | Relax/v2/omni-lora-s2tt | TensorBoard project name |
 
-换数据集只要换 `DATA`，字段对齐第四节即可；换奖励则改 `--custom-rm-path` 指向你自己的
-函数（签名见 `omni_s2tt/bleu_rm.py`）。两者都不需要动 Relax 的代码。
+Changing dataset means just changing `DATA`, with fields matching section 4. Changing the reward
+means pointing `--custom-rm-path` at your own function (signature in `omni_s2tt/bleu_rm.py`).
+Neither requires touching Relax's code.
 
-## 改 Relax / sglang 的代码
+## Changing Relax / sglang code
 
-`Relax/` 和 `sglang/` 是 submodule，指向两个 fork。**改它们和改本仓库的文件不一样，要三步。**
-漏掉第三步是最常见的事故：别人拉下来还是旧代码，而且不报错。
+`Relax/` and `sglang/` are submodules pointing at two forks. **Changing them is not like changing
+a file in this repo — it takes three steps.** Skipping the third is the most common accident:
+other people pull and still get the old code, with no error.
 
 ```bash
-# 1. 在 submodule 里改、提交
-cd Relax                      # 或 sglang
-# ...改代码...
+# 1. Edit and commit inside the submodule
+cd Relax                      # or sglang
+# ...make your changes...
 git add -A && git commit -m "fix(lora): ..."
 
-# 2. 推到你的 fork
-git push mine lora-omni-v2    # sglang 同理，分支名也是 lora-omni-v2
+# 2. Push to your fork
+git push mine lora-omni-v2    # same for sglang; the branch name is also lora-omni-v2
 
-# 3. 回主仓库，把指针更新到新提交（这一步最容易忘）
+# 3. Back in this repo, move the pointer to the new commit (the step people forget)
 cd ..
-git add Relax                 # 或 sglang
-git commit -m "chore: bump Relax to <短 sha>"
+git add Relax                 # or sglang
+git commit -m "chore: bump Relax to <short sha>"
 git push
 ```
 
-第三步做了没有，`git status` 会告诉你：
+Whether you did step 3 is easy to check:
 
 ```bash
 git submodule status
-# +265723e... Relax   ← 开头是 + 表示指针和实际 checkout 不一致，说明第 3 步没做
-#  0204469... sglang  ← 开头是空格才对
+# +265723e... Relax   ← a leading + means the pointer and the actual checkout disagree, i.e. step 3 was skipped
+#  0204469... sglang  ← a leading space is what you want
 ```
 
-拉别人的更新：
+Pulling other people's updates:
 
 ```bash
 git pull && git submodule update --init --recursive
 ```
 
-**submodule 里不要 rebase 或 force-push 已经被主仓库指过的分支** —— 主仓库的指针会指向不
-存在的提交，别人 `clone --recursive` 直接失败，而且报错信息很难懂。
+**Never rebase or force-push a submodule branch this repo already points at** — the pointer then
+refers to a commit that no longer exists, and other people's `clone --recursive` fails outright
+with a cryptic message.
 
-改动如果是上游本身的 bug（不是我们的适配），顺手给上游提个 PR，合并之后 fork 就能少背一处。
-已提的几个见上面「当前进度」，正文写法可以参考 `docs/upstream-prs/`。
+If a change is a bug in upstream itself (rather than in our adaptation), file a PR upstream while
+you are at it; once merged, the fork carries one fewer thing. The ones already filed are listed
+under "Current status" above, and `docs/upstream-prs/` shows how the bodies were written.
 
-## 踩过的坑
+## Pitfalls
 
-按出现频率排，都是真在这条链路上遇到过的：
+Ordered by how often they come up. All of them actually happened on this pipeline:
 
-1. **`ModuleNotFoundError: No module named 'megatron'`** —— `PYTHONPATH` 覆盖掉了镜像原有的，
-   见 B 的第二节。Ray job 里报错，不是主进程。
-2. **rollout 全是空输出 / 满屏 `<|im_end|>`** —— chat template 没喂进去。
-3. **`RuntimeError: unable to open shared memory object </torch_...>`，而且只死一个 TP rank** ——
-   adapter 传输走了共享内存引用。`Relax` submodule 必须在 `lora-omni-v2`（含 `19aea461`）上，
-   那个提交把 adapter 改成内联字节。原因见 `docs/migration-v2.md` 的探针九。
-4. **sgl-router 起不来，抱怨 tokenizer** —— 缺 `tokenizer.json`，见 B 的第三节。
-5. **日志里出现 `[bleu_rm] 响应里出现特殊 token`** —— sglang 返回的文本带 `<|im_end|>`
-   之类，拼进 response 后会把 BLEU 压到真实值的约四成。奖励模块**只报不改分**，因为记录在案
-   的所有曲线都是在同样不去污染的条件下跑的，改了就没法比。偶发几条可以不管，成片出现
-   说明 rollout 那边不对 —— 去查 rollout，别去调奖励。
-6. **NCCL 挂在初始化** —— `--shm-size` 太小，或多网卡时要指定 `NCCL_SOCKET_IFNAME`。
+1. **`ModuleNotFoundError: No module named 'megatron'`** — `PYTHONPATH` overwrote the image's own,
+   see B step 2. The error appears inside the Ray job, not the main process.
+2. **Rollouts come back empty / full of `<|im_end|>`** — the chat template was not fed in.
+3. **`RuntimeError: unable to open shared memory object </torch_...>`, and only one TP rank dies**
+   — adapter transport went through a shared-memory reference. The `Relax` submodule must be on
+   `lora-omni-v2` (including `19aea461`), the commit that switched the adapter to inlined bytes.
+   The reasoning is in probe 9 of `docs/migration-v2.md`.
+4. **sgl-router will not start and complains about the tokenizer** — `tokenizer.json` is missing,
+   see B step 3.
+5. **`[bleu_rm] special token found in response` in the log** — the text sglang returns carries
+   things like `<|im_end|>`, and concatenating them into the response pushes BLEU down to roughly
+   40% of its true value. The reward module **only reports, it does not change the score**,
+   because every recorded curve was produced under the same non-stripping conditions and changing
+   it would make them incomparable. A few stray occurrences are fine; in bulk it means something
+   is wrong on the rollout side — go look at the rollout, do not tune the reward.
+6. **NCCL hangs at initialization** — `--shm-size` too small, or `NCCL_SOCKET_IFNAME` needs to be
+   specified on a multi-NIC machine.
 
 ---
 
-# 深入
+# Going deeper
 
-| 文档 | 内容 |
+| Document | Contents |
 |---|---|
-| [`docs/results/experiments.md`](docs/results/experiments.md) | 四次实验的完整记录：配置、逐步曲线、结论、失败的那次为什么失败 |
-| [`docs/design/reward-design.md`](docs/design/reward-design.md) | 为什么奖励是 BLEU、温度为什么是 1.1、组内方差怎么造 |
-| [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md) | 同传移植：改了哪四处、六条已知风险与各自的报错长什么样 |
-| [`docs/migration-v2.md`](docs/migration-v2.md) | 当前实现是怎么来的：九个探针的结论、五个上游 PR 的动机与证据 |
-| [`scripts/probes/`](scripts/probes/) | 上面每条结论对应的可复现脚本，附索引 |
-| `docs/design/my_plan.md` | 早期的规划与参数快照 |
-| `docs/results/*.json` | 四条曲线的逐步原始数据，带 `_meta` 说明口径 |
+| [`docs/results/experiments.md`](docs/results/experiments.md) | Full record of all four experiments: configuration, per-step curves, conclusions, and why the failed one failed |
+| [`docs/design/reward-design.md`](docs/design/reward-design.md) | Why the reward is BLEU, why the temperature is 1.1, how in-group variance is created |
+| [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md) | Porting simultaneous interpretation: the four changes, six known risks and what each one looks like when it fails |
+| [`docs/migration-v2.md`](docs/migration-v2.md) | How the current implementation came about: conclusions from nine probes, and the motivation and evidence behind five upstream PRs |
+| [`scripts/probes/`](scripts/probes/) | The reproducible script behind every one of those conclusions, with an index |
+| `docs/design/my_plan.md` | Early planning and parameter snapshots |
+| `docs/results/*.json` | Per-step raw data for all four curves, with `_meta` describing the conventions |
 
-早期实现冻结在本仓库的 `v1` 分支（tag `v1-frozen`），只读，那边有当时的镜像 digest 与
-三份归档 patch。
+The earlier implementation is frozen on this repository's `v1` branch (tag `v1-frozen`),
+read-only, together with the image digest of the time and three archived patches.

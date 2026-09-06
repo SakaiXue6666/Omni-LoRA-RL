@@ -1,8 +1,8 @@
-# PR 1 —— sgl-project/sglang
+# PR 1 — sgl-project/sglang
 
-分支：`SakaiXue6666:fix/lora-honor-should-apply-lora`（基于 main @ `f148eb6e6e`）
+Branch: `SakaiXue6666:fix/lora-honor-should-apply-lora` (based on main @ `f148eb6e6e`)
 
-开 PR 链接（浏览器已登录即可）：
+Link to open the PR (just needs a logged-in browser):
 https://github.com/sgl-project/sglang/compare/main...SakaiXue6666:sglang:fix/lora-honor-should-apply-lora?expand=1
 
 ---
@@ -15,7 +15,7 @@ Honor should_apply_lora when wrapping LoRA target modules
 
 ---
 
-## Body（直接粘贴）
+## Body (paste as-is)
 
 ## Motivation
 
@@ -92,17 +92,18 @@ slots for modules the adapter never fills.
 
 ---
 
-## 我们这边做过的验证
+## What we verified on our side
 
-- `scripts/ci/check_registered_tests.py` 通过
-- `isort` 7.0.0 / `black` 26.1.0（与上游 pre-commit 同版本）跑过，无改动
-- 在 T4 容器里对这个分支跑 `pytest test/registered/unit/lora/test_should_apply_lora_gate.py`：
-  - 带补丁：3 个用例通过
-  - 手动删掉门的三行：立即失败（`modal_verify_pr1.py` 会把这两步都跑一遍）
+- `scripts/ci/check_registered_tests.py` passes
+- `isort` 7.0.0 / `black` 26.1.0 (same versions as the upstream pre-commit) run clean, no changes
+- Ran `pytest test/registered/unit/lora/test_should_apply_lora_gate.py` on this branch in a T4 container:
+  - with the patch: 3 tests pass
+  - with the three gate lines manually removed: fails immediately (`modal_verify_pr1.py` runs both halves)
 
-## 没放进这个 PR 的东西
+## What is deliberately not in this PR
 
-- `patch_torch` 的 CPU tensor 保护 —— 另开一个 PR，关注点不同
-- `tp_worker` 补 `monkey_patch_torch_reductions` —— 上游 main 已经用统一的
-  `_deserialize_own_rank` 修掉了，只有 v0.5.12.post1 还需要
-- Qwen3-Omni 的 `_lora_pattern` 与音频对齐 —— 我们自己的 delta，等训练链路端到端跑通再说
+- The CPU-tensor guard in `patch_torch` — separate PR, different concern
+- Adding `monkey_patch_torch_reductions` to `tp_worker` — upstream main already fixed this
+  with the unified `_deserialize_own_rank`; only v0.5.12.post1 still needs it
+- Qwen3-Omni's `_lora_pattern` and audio alignment — our own delta; will revisit once the
+  training path is proven end to end

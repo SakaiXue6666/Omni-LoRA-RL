@@ -1,52 +1,67 @@
-# 为什么奖励是句级 BLEU
+# Why the reward is sentence-level BLEU
 
-看代码会遇到几个没有注释的常数 —— `ROLLOUT_TEMPERATURE=1.1`、`N_SAMPLES=8`、
-奖励为什么不是准确率而是 BLEU。理由都在这里，是实验打出来的，不是拍的。
+Reading the code you will run into a few constants with no comment attached —
+`ROLLOUT_TEMPERATURE=1.1`, `N_SAMPLES=8`, and the choice of BLEU over accuracy. The reasons are
+all here. They came out of experiments, not out of thin air.
 
-## GRPO 要的不是"高分"，是"组内有方差"
+## What GRPO needs is not a high score, it is variance within the group
 
-GRPO 的 advantage 来自同一个 prompt 采样出的一组回答之间的**相对**差异。组内所有样本
-拿一样的分，advantage 就是 0，梯度也是 0 —— 哪怕那个分是满分。
+GRPO's advantage comes from the *relative* differences among the responses sampled for the same
+prompt. If every sample in a group gets the same score, the advantage is 0 and so is the
+gradient — even when that score is a perfect one.
 
-这不是理论担心。用 hard 数学选择题跑过一次：闭环正常、reward 函数正确，但
-**`raw_reward = 1.0`，32/32 全对**。Qwen3-Omni-30B 的 thinker 带 CoT 把 2–3 位乘法做到满分，
-零方差，学不动。
+This is not a theoretical worry. We ran it once with hard multiple-choice math: the loop was
+fine, the reward function was correct, and yet **`raw_reward = 1.0`, 32/32 all correct**.
+Qwen3-Omni-30B's thinker with CoT nails 2–3 digit multiplication every time. Zero variance,
+nothing to learn from.
 
-试过压难度让它偶尔答错：thinking 开 = 100% 正确，thinking 关或把 `max_response_len`
-砍到 96 token = 0%（`<answer>` 直接被截断的伪全错），**中间没有过渡带**。所以「把任务调难一点」
-这条路在这个模型上走不通。
+We tried making it harder so it would occasionally get one wrong: thinking on = 100% correct;
+thinking off, or `max_response_len` cut to 96 tokens = 0% (a fake all-wrong, because `<answer>`
+gets truncated). **There is no middle ground.** So "just make the task harder" does not work on
+this model.
 
-**结论：0/1 二值奖励对这个规模的模型不可用。**
+**Conclusion: a 0/1 binary reward is unusable at this model scale.**
 
-## 所以换成连续奖励
+## Hence a continuous reward
 
-句级 BLEU ∈ [0, 1]，天然连续，而且模型几乎拿不到满分 —— 永远有 headroom，组内永远有方差。
-换成 BLEU 之后第一次 10 步实验就见到了上升（0.463 → 0.523）。
+Sentence-level BLEU is in [0, 1], naturally continuous, and the model almost never scores a
+perfect 1 — there is always headroom, so there is always variance within the group. The first
+10-step experiment after the switch already showed it rising (0.463 → 0.523).
 
-## 造组内方差的三个杠杆
+## Three levers for creating in-group variance
 
-选了连续奖励还不够，方差是需要主动制造的。三个杠杆都在用：
+Picking a continuous reward is not enough. Variance has to be manufactured deliberately. All
+three levers are in use:
 
-1. **任务本身要有多种合理答案。** 翻译天然满足：同一句话有多种正确译法，单参考 BLEU 落在
-   0.3~0.6 这个有区分度的区间。早期验证特意用了长难句（从句、口语），就是为了拉开分布。
-2. **温度。** 采样温度决定同一个 prompt 的 8 条回答有多分散。温度太低 → 8 条几乎一样 →
-   又回到零方差。当前 S2TT 用 **1.1**；早期纯文本翻译验证用过 1.3。
-3. **数据量摊平 batch 噪声。** 组内方差是要的，batch 之间的噪声不是。数据集太小，
-   每步抽到的题目难度波动会盖过学习信号。
+1. **The task itself must admit several valid answers.** Translation does this naturally: the
+   same sentence has multiple correct renderings, and single-reference BLEU lands in the 0.3–0.6
+   range where there is something to discriminate. The early validation deliberately used long,
+   difficult sentences (subordinate clauses, colloquial speech) to spread the distribution out.
+2. **Temperature.** The sampling temperature decides how spread out the 8 responses to one prompt
+   are. Too low → all 8 nearly identical → back to zero variance. S2TT currently uses **1.1**;
+   the early text-only translation validation used 1.3.
+3. **Enough data to average out batch noise.** In-group variance is wanted; batch-to-batch noise
+   is not. With too small a dataset, the difficulty swing between the prompts drawn each step
+   drowns out the learning signal.
 
-`ROLLOUT_TEMPERATURE=1.1` 和 `N_SAMPLES=8` 就是杠杆 2 和"一组多少条"的取值。
-**改小温度或改小 n-samples 之前，先想清楚组内还有没有方差。**
+`ROLLOUT_TEMPERATURE=1.1` and `N_SAMPLES=8` are lever 2 and "how many per group".
+**Before lowering either the temperature or n-samples, think about whether the group still has
+any variance left.**
 
-## 一个反复出现的坑：奖励被特殊 token 污染
+## A recurring pitfall: the reward gets contaminated by special tokens
 
-sglang 返回的文本有时带 `<|im_end|>` 之类的特殊 token，拼进 response 再算 BLEU，
-分数会被压到真实值的约四成。同传第一次跑出来 BLEU 平躺在 0.06、advantage≈0，就是这个原因，
-不是模型不会做。
+The text sglang returns sometimes carries special tokens such as `<|im_end|>`. Concatenating
+those into the response before computing BLEU pushes the score down to roughly 40% of its true
+value. The first simultaneous-interpretation run had BLEU flat at 0.06 with advantage ≈ 0 for
+exactly this reason — not because the model could not do the task.
 
-`omni_s2tt/bleu_rm.py` 会检测并打印 `[bleu_rm] 响应里出现特殊 token`，但**只报不改分**。
-偶发几条可以不管；成片出现说明 rollout 那边不对，去查，别去调奖励。
+`omni_s2tt/bleu_rm.py` detects this and prints `[bleu_rm] special token found in response`, but
+it **only reports, it does not change the score**. A few stray occurrences are fine; if they show
+up in bulk it means something is wrong on the rollout side. Go look there — do not tune the
+reward.
 
-## 相关
+## Related
 
-- 每次实验的完整数据：`docs/results/experiments.md`
-- 奖励实现：`omni_s2tt/bleu_rm.py`（sacreBLEU 中文 tokenizer，除以 100 归一到 [0,1]）
+- Full data for every experiment: `docs/results/experiments.md`
+- The reward implementation: `omni_s2tt/bleu_rm.py` (sacreBLEU with the Chinese tokenizer,
+  divided by 100 to normalize into [0, 1])
