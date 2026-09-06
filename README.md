@@ -4,7 +4,7 @@ Qwen3-Omni Thinker + LoRA 的强化学习训练工程。当前跑通的任务是
 中文文本），奖励用句级 BLEU，算法用 GRPO，推理侧走 sglang 的 LoRA adapter 热加载。
 
 已验证的结果：4×A100-80GB 上 40 步，BLEU 从前 10 步均值 0.294 升到后 10 步 0.392。
-详细的迁移记录、探针结论与逐段对照见 `README_v2.md`。
+详细的迁移记录、探针结论与逐段对照见 `docs/migration-v2.md`。
 
 本仓库是**入口/hub**，真正的代码以 submodule 指向两个 fork。
 
@@ -16,7 +16,7 @@ Qwen3-Omni Thinker + LoRA 的强化学习训练工程。当前跑通的任务是
 | `sglang/` | fork 自 `sgl-project/sglang` `v0.5.12.post1` | `lora-omni-v2` | 推理侧（Omni 的 LoRA serving） |
 | `omni_s2tt/` | 本仓库自带 | - | S2TT 的训练脚本、BLEU 奖励、数据准备、曲线统计 |
 
-之所以还要 fork，是因为有五处改动还没进上游（PR 已提，见 `README_v2.md` 的「上游 PR」）。
+之所以还要 fork，是因为有五处改动还没进上游（PR 已提，见 `docs/migration-v2.md` 的「上游 PR」）。
 一旦合并，fork 就能退化成"上游 + Omni 专属那两处"。
 
 ## 硬件
@@ -167,7 +167,7 @@ Ray 不用自己起。脚本会 source `Relax/scripts/entrypoint/local.sh`，那
 
 > **在共用服务器上注意**：`local.sh` 的清理段是 `pkill -9 python` + `pkill -9 ray`，
 > 不区分是谁的进程。在容器里跑没问题（PID namespace 隔离），直接在裸机上跑会连同事的
-> 任务一起杀掉。裸机跑的话自己起 Ray 并跳过那一段，`modal_train_s2tt.py` 走的就是这条路：
+> 任务一起杀掉。裸机跑的话自己起 Ray 并跳过那一段，`scripts/modal_train_s2tt.py` 走的就是这条路：
 >
 > ```bash
 > export RELAX_ENTRYPOINT_MODE=local        # 让脚本别再 source local.sh
@@ -283,7 +283,7 @@ export WANDB_API_KEY=...          # 在线才需要
 2. **rollout 全是空输出 / 满屏 `<|im_end|>`** —— chat template 没喂进去。
 3. **`RuntimeError: unable to open shared memory object </torch_...>`，而且只死一个 TP rank** ——
    adapter 传输走了共享内存引用。`Relax` submodule 必须在 `lora-omni-v2`（含 `19aea461`）上，
-   那个提交把 adapter 改成内联字节。原因见 `README_v2.md` 的探针九。
+   那个提交把 adapter 改成内联字节。原因见 `docs/migration-v2.md` 的探针九。
 4. **sgl-router 起不来，抱怨 tokenizer** —— 缺 `tokenizer.json`，见第三节。
 5. **日志里出现 `[bleu_rm] 响应里出现特殊 token`** —— sglang 返回的文本带 `<|im_end|>`
    之类，拼进 response 后会把 BLEU 压到真实值的约四成（v1 在同传里量过）。奖励模块只报
@@ -296,17 +296,17 @@ export WANDB_API_KEY=...          # 在线才需要
 这套东西最初就是在 Modal 上验的，那条路径仍然保留：
 
 ```bash
-modal run modal_train_s2tt.py::check                      # 先查数据与权重（CPU，几十秒）
-modal run modal_train_s2tt.py --num-rollout 40 --detach   # 起训练，spawn 出去与本地解耦
-modal run modal_train_s2tt.py::result --call-id <ID>      # 取结果
+modal run scripts/modal_train_s2tt.py::check                      # 先查数据与权重（CPU，几十秒）
+modal run scripts/modal_train_s2tt.py --num-rollout 40 --detach   # 起训练，spawn 出去与本地解耦
+modal run scripts/modal_train_s2tt.py::result --call-id <ID>      # 取结果
 ```
 
-`modal_train_s2tt.py` 里的镜像、PYTHONPATH、环境变量与上面几节是一一对应的，可以对着看。
+`scripts/modal_train_s2tt.py` 里的镜像、PYTHONPATH、环境变量与上面几节是一一对应的，可以对着看。
 
 ## 相关文档
 
-- `README_v2.md` —— v2 的迁移全过程：九个探针的结论、五个上游 PR、40 步与 v1 的逐段对照
-- `IMPORTANT/my_plan.md` —— 设计文档与实验记录
+- `docs/migration-v2.md` —— v2 的迁移全过程：九个探针的结论、五个上游 PR、40 步与 v1 的逐段对照
+- `docs/design/my_plan.md` —— 设计文档与实验记录
 - v1 在本仓库的 `v1` 分支（tag `v1-frozen`），那边有 `README_v1.md`（镜像 digest 与
   复现步骤）和 `patches/`（v1 相对上游的三份归档 patch）。v1 只读，是这条链路上唯一
   一份在真机上完整跑通过的参考实现，v2 出问题时先去那里对照

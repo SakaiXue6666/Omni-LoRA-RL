@@ -18,7 +18,7 @@ v1 不是被替换，而是被冻结成 **parity oracle**：v2 每一步的行�
 | 镜像 | `slimerl/slime@sha256:bd219aba…`（= `nightly-dev-20260428a`） | `ghcr.io/redai-infra/relaxrl@sha256:8dc39af3…` |
 | LoRA 权重通路 | 自己实现的 direct 导出 | Relax 官方 adapter 模式 |
 
-v1 的全部细节见 `..\omni-lora-rl\README_v1.md`，代码 delta 另有三份存档 patch 在 `..\omni-lora-rl\patches\`。
+v1 的全部细节见 `v1` 分支的 `README_v1.md`，代码 delta 另有三份存档 patch 在 `v1` 分支的 `patches/`。
 
 本目录仍保留指向 v1 本地仓库的 `v1local` remote，随时可以 `git fetch v1local` 取回 v1 的任何提交。
 
@@ -26,7 +26,7 @@ v1 的全部细节见 `..\omni-lora-rl\README_v1.md`，代码 delta 另有三份
 
 GitHub 仓库原本就是这么分的：`main` = Relax + sglang，`sglang_omni` = Relax + sglang + sglang-omni。v2 的范围正好等于 `main` 的结构，所以直接从 `main` 起，而不是从 `sglang_omni` 上剥掉一个 submodule。
 
-从 `sglang_omni` 额外带过来两份训练侧记录作参考：`IMPORTANT/OMNI_RELAX_HANDOFF_2026-07-18.md` 和 `IMPORTANT/OMNI_STREAMING_GPU_2026-07-19.md`。语音脚本、v1 冻结产物都留在 v1，不带。
+训练侧的两份历史记录留在 `sglang_omni` 分支：`IMPORTANT/OMNI_RELAX_HANDOFF_2026-07-18.md` 和 `IMPORTANT/OMNI_STREAMING_GPU_2026-07-19.md`。语音脚本、v1 冻结产物都留在 v1，不带。
 
 ## submodule 基线
 
@@ -64,7 +64,7 @@ v1 的 delta 一共 7 个文件，和 Relax 那 44 个文件只有 `python/sglan
 
 这正是 2026-07 那次迁移卡住的地方——当时 Megatron-Bridge 0.5.0 和 megatron-core 装不到一起。新版 Relax 的 Dockerfile 用 `3rdparty/Megatron-LM` submodule + rsync 的方式解决了，所以这条路现在通了。
 
-相关脚本：`mig_00_env.py`（判据 1-4）、`mig_01_omni_bridge.py`（注册后复验）、`modal_env_gate_v2.py`、`modal_gate_omni.py`。
+相关脚本：`scripts/probes/mig_00_env.py`（判据 1-4）、`scripts/probes/mig_01_omni_bridge.py`（注册后复验）、`scripts/probes/modal_env_gate_v2.py`、`scripts/probes/modal_gate_omni.py`。
 
 探针用的是「预构建镜像 + 指定源码」：镜像照用官方的，Relax 源码走 `PYTHONPATH` 注入，省掉每次改动都要重建镜像。
 
@@ -82,7 +82,7 @@ sglang 侧不一样：上游至今没有 Omni 的 LoRA 支持，`qwen3_omni_moe.
 
 ## 探针一结论：LoRA 的作用范围（已验证，2026-08-11）
 
-脚本 `mig_02_lora_scope.py` + `modal_probe_lora_scope.py`，在 v2 镜像 + Relax `9a5674af` 上跑通（T4，约 2 分钟；塔用 meta device 构建，不加载权重）。
+脚本 `scripts/probes/mig_02_lora_scope.py` + `scripts/probes/modal_probe_lora_scope.py`，在 v2 镜像 + Relax `9a5674af` 上跑通（T4，约 2 分钟；塔用 meta device 构建，不加载权重）。
 
 Relax 的 Megatron 模型 `Qwen3OmniMoeModel` 在 `pre_process` 的 rank 上确实建了两个塔，而且用的是 **transformers 的 HF 实现**（`Qwen3OmniMoeAudioEncoder` / `Qwen3OmniMoeVisionEncoder`），只有 `language_model` 是 Megatron 的 GPT。`PEFT.__call__` 走的是通用的 `_walk_model`，会下探到 HF 子模块，所以塔在遍历范围内——挂不挂上完全取决于名字撞不撞。
 
@@ -103,7 +103,7 @@ Relax 的 Megatron 模型 `Qwen3OmniMoeModel` 在 `pre_process` 的 rank 上确�
 
 ## 探针二结论：导出命名与 SGLang 的 parity（已验证，2026-08-11）
 
-脚本 `mig_03_export_names.py` + `modal_probe_export_names.py`（T4，约 2 分钟；同样不建 Megatron 模型——命名由真实的 `mapping_registry` 推导，SGLang 侧喂按真实 config 算好形状的零张量）。
+脚本 `scripts/probes/mig_03_export_names.py` + `scripts/probes/modal_probe_export_names.py`（T4，约 2 分钟；同样不建 Megatron 模型——命名由真实的 `mapping_registry` 推导，SGLang 侧喂按真实 config 算好形状的零张量）。
 
 顺带确认了预构建镜像并不落后于 Relax `main` 的钉法：`sglang 0.5.12.post1`、`megatron.bridge 0.5.0`、`megatron.core 0.18.0`、`transformers 5.6.0`、`torch 2.11.0+cu129`。
 
@@ -129,7 +129,7 @@ SGLang 侧往返验证（30B-A3B thinker：hidden=2048、32 头、4 KV 组、hea
 
 ## 探针三结论：导出的 adapter 目录标准 PEFT 读不回来（已验证，2026-08-11）
 
-脚本 `mig_04_peft_prefix.py` + `modal_probe_peft_prefix.py`（纯 CPU，约 2 分钟）。
+脚本 `scripts/probes/mig_04_peft_prefix.py` + `scripts/probes/modal_probe_peft_prefix.py`（纯 CPU，约 2 分钟）。
 
 起因是探针二发现 Relax 落盘的 key 不带 `base_model.model.` 前缀——`write_hf_peft_adapter` 是把 `export_adapter_weights` 的 `param_name` 原样 `save_file` 的，没走上游的 `convert_adapter_weights_to_peft_state`（那个函数才负责加前缀）。
 
@@ -189,7 +189,7 @@ thinker.model.layers.{0,1}.self_attn.{qkv_proj,o_proj}   <-- 放行
 
 顺带确认门本身放行的 8 个模块（`embed_tokens`、`lm_head`、每层的 `mlp.experts` 和两个投影）里，只有投影会真正落到 target 集合内，其余是 pattern 里的预留项，不会误伤。
 
-脚本：`mig_05_sglang_lora_scope.py` + `modal_probe_sglang_scope.py`。注意 runner 会 clone fork 的 `lora-omni-v2` 分支并把 `python/` 顶到 `PYTHONPATH` 最前面，否则验的是镜像里预装的那份 sglang，看不到新加的门。
+脚本：`scripts/probes/mig_05_sglang_lora_scope.py` + `scripts/probes/modal_probe_sglang_scope.py`。注意 runner 会 clone fork 的 `lora-omni-v2` 分支并把 `python/` 顶到 `PYTHONPATH` 最前面，否则验的是镜像里预装的那份 sglang，看不到新加的门。
 
 ## 单元测试（已完成，2026-08-11）
 
@@ -213,7 +213,7 @@ v1 那份 `test_should_apply_lora_gate.py` 写在 `test/srt/lora/` 下，用的�
 | `fix(lora): inline adapter tensors into the engine payload` | redai-infra/Relax | `fix/lora-adapter-transport-shm` | 分支已推 `1ceb779b`，正文已写 |
 | Fix IndexError when reducing CPU tensors after `monkey_patch_torch_reductions` | sgl-project/sglang | `fix/reduce-tensor-cpu-guard` | 分支已推 `11093f14`，正文已写 |
 
-正文分别在 `pr/sglang-01-body.md`、`pr/relax-01-wildcard-body.md`、`pr/relax-02-peft-prefix-body.md`、`pr/relax-03-transport-body.md`。
+正文分别在 `docs/upstream-prs/sglang-01-body.md`、`docs/upstream-prs/relax-01-wildcard-body.md`、`docs/upstream-prs/relax-02-peft-prefix-body.md`、`docs/upstream-prs/relax-03-transport-body.md`。
 
 Relax 那两个的动机各自都有硬证据：
 
@@ -234,8 +234,8 @@ Relax 那两个的动机各自都有硬证据：
   traceback 一模一样，帖子里流传的临时补丁就是这个长度守卫。也就是说下游用户现在要么手改
   site-packages，要么改走 merge 模式绕开推 adapter。
 
-CI 上踩过一个坑：Relax 的 `.pre-commit-config.yaml` 里有个本地 hook `docformatter --wrap-descriptions 79`，ruff 不管这条。#262 第一版就是因为测试文件里一段 docstring 按 ~90 列折行，被 docformatter 改写后判定「files were modified」而挂掉（Lint 和 ruff 全过，所以光跑 ruff 看不出来）。日志要登录才能下，用 `modal_precommit_relax_prs.py` 在容器里把仓库自带的 pre-commit 原样跑一遍就复现了。以后给 Relax 提 PR，docstring 描述段一律折到 79 列以内，或者直接跑那个脚本。
-两个分支都做了双向验证（`modal_verify_relax_prs.py`）：打了补丁 47/48 个用例全过；把 `megatron_peft_utils.py` 换回上游 `main` 再跑，新加的用例全挂。`ruff format --check` 与 `ruff check` 干净（`modal_lint_relax_prs.py`，本地 pip 连不上源所以放容器里跑）。
+CI 上踩过一个坑：Relax 的 `.pre-commit-config.yaml` 里有个本地 hook `docformatter --wrap-descriptions 79`，ruff 不管这条。#262 第一版就是因为测试文件里一段 docstring 按 ~90 列折行，被 docformatter 改写后判定「files were modified」而挂掉（Lint 和 ruff 全过，所以光跑 ruff 看不出来）。日志要登录才能下，用 `scripts/probes/modal_precommit_relax_prs.py` 在容器里把仓库自带的 pre-commit 原样跑一遍就复现了。以后给 Relax 提 PR，docstring 描述段一律折到 79 列以内，或者直接跑那个脚本。
+两个分支都做了双向验证（`scripts/probes/modal_verify_relax_prs.py`）：打了补丁 47/48 个用例全过；把 `megatron_peft_utils.py` 换回上游 `main` 再跑，新加的用例全挂。`ruff format --check` 与 `ruff check` 干净（`scripts/probes/modal_lint_relax_prs.py`，本地 pip 连不上源所以放容器里跑）。
 
 ## 探针六：CPU 张量的 reduce 越界（2026-08-11，纯 CPU）
 
@@ -252,7 +252,7 @@ rebuild 函数: rebuild_tensor      参数元组长度: 3
 
 因果链值得写清楚，否则容易误以为这是上游的既有 bug：v1 在 0.5.9 上推 CPU 张量没事，是因为当时 LoRA 那条路压根没调 `monkey_patch_torch_reductions`；是我们给 `tp_worker` 补上 reducer 安装之后，越界才暴露出来。所以这两处是同一个改动的两半，要一起提。verl 踩过同一个坑（bug #4065）。
 
-脚本：`mig_07_cpu_reduce.py`，入口 `modal run modal_probe_serve_lora.py --stage reduce`（CPU，约 90 秒）。
+脚本：`scripts/probes/mig_07_cpu_reduce.py`，入口 `modal run modal_probe_serve_lora.py --stage reduce`（CPU，约 90 秒）。
 
 ## 探针五：真机上把 adapter 热推给 sglang（2026-08-11，1×A100-80GB）
 
@@ -270,7 +270,7 @@ rebuild 函数: rebuild_tensor      参数元组长度: 3
 
 adapter 全程是 CPU 张量（384 个），走的正是探针六那条序列化路径。
 
-脚本：`mig_06_serve_lora.py`，三个 stage：`--stage inspect`（CPU，查模型卷与源码）、`--stage reduce`（CPU，探针六）、`--stage probe`（A100，本节）。设计直接沿用 v1 `modal_run.py` 的实验 G/J：引擎参数 `disable_cuda_graph=True, mem_fraction_static=0.85, tp_size=1`、chat 模板、adapter 构造方式、logprob 比对，都是 v1 已经验过的，这次没有重新试错。
+脚本：`scripts/probes/mig_06_serve_lora.py`，三个 stage：`--stage inspect`（CPU，查模型卷与源码）、`--stage reduce`（CPU，探针六）、`--stage probe`（A100，本节）。设计直接沿用 v1 分支的 `modal_run.py` 的实验 G/J：引擎参数 `disable_cuda_graph=True, mem_fraction_static=0.85, tp_size=1`、chat 模板、adapter 构造方式、logprob 比对，都是 v1 已经验过的，这次没有重新试错。
 
 ## 探针七：训练侧冒烟（2026-08-12，1×A10G，约 3 分钟）
 
@@ -302,7 +302,7 @@ thinker.model.layers.{0,1}.self_attn.o_proj.lora_A.weight  (32, 4096)
 
 `convert_megatron_to_hf_target_modules(['linear_qkv', 'linear_proj'])` 落到 `adapter_config.json` 里是 `['q_proj', 'k_proj', 'v_proj', 'o_proj']`，与导出的叶子模块完全覆盖。
 
-脚本：`mig_08_train_side.py` + `modal_probe_train_side.py`。用的是 Relax 自己的 `build_lora_peft` 和 bridge，不是重写一遍，所以验的是真实代码路径。
+脚本：`scripts/probes/mig_08_train_side.py` + `scripts/probes/modal_probe_train_side.py`。用的是 Relax 自己的 `build_lora_peft` 和 bridge，不是重写一遍，所以验的是真实代码路径。
 
 ## 与 v1 的对照（2026-08-12，做端到端训练之前的核对）
 
@@ -310,7 +310,7 @@ thinker.model.layers.{0,1}.self_attn.o_proj.lora_A.weight  (32, 4096)
 
 **1. LoRA 超参不一致，端到端时要改回 v1 的。** v1 冒烟脚本用的是 `--lora-rank 16 --lora-alpha 32`（sglang 侧 `--sglang-max-lora-rank 16`），探针五和七我用的是 32/64。功能上都成立，但 v1 那条 100 步 S2TT 的 BLEU 曲线是在 16/32 上跑出来的，v2 想和它对比就得对齐超参，否则说不清差异来自迁移还是来自 rank。
 
-**2. `--lora-target-modules` 的默认值是 v1 的一处 delta，我们没有移植，而且不该移植。** v1 把默认改成了 `*language_model*linear_qkv` / `*language_model*linear_proj`，理由是裸的 `linear_qkv` 会挂到 `audio_model`。但 v1 那个结论出自 `verify_lora_attach.py` 里手搭的 Omni-like 树，不是真模型。探针七在 Relax 真建出来的 `Qwen3OmniMoeModel` 上用裸名字，8 个 adapter 参数全在语言模型里，塔干净 —— 因为 v2 的 audio/vision 是 HF 模块，叫 `q_proj/k_proj/v_proj`，压根不叫 `linear_qkv`。
+**2. `--lora-target-modules` 的默认值是 v1 的一处 delta，我们没有移植，而且不该移植。** v1 把默认改成了 `*language_model*linear_qkv` / `*language_model*linear_proj`，理由是裸的 `linear_qkv` 会挂到 `audio_model`。但 v1 那个结论出自 v1 分支的 `verify_lora_attach.py` 里手搭的 Omni-like 树，不是真模型。探针七在 Relax 真建出来的 `Qwen3OmniMoeModel` 上用裸名字，8 个 adapter 参数全在语言模型里，塔干净 —— 因为 v2 的 audio/vision 是 HF 模块，叫 `q_proj/k_proj/v_proj`，压根不叫 `linear_qkv`。
 
    而且这里有个反向依赖：**通配符恰好是我们给 Relax 提 [#261](https://github.com/redai-infra/Relax/pull/261) 要修的那个 bug**（glob 会原样落进 `adapter_config.json`，导出侧一个模块都点不到）。所以真要用 v1 的加固写法，就得先带上 #261；用裸名字则不需要。结论是保持裸名字，不把 #261 变成端到端训练的前置条件。
 
@@ -318,7 +318,7 @@ thinker.model.layers.{0,1}.self_attn.o_proj.lora_A.weight  (32, 4096)
 
 **4. v1 根本没有 `export_adapter_weights`。** 它 pin 的 redai bridge（`f13bec09`）早于这个 API，导出走的是 `convert_qwen3omni_to_hf` 的 direct 路线，里面还得手写 `_reorder_qkv_lora_b()` 做 GQA 维度重排。探针七证明 v2 的 bridge 原生就把 fused `linear_qkv` 拆成 `q/k/v_proj` —— 这一整条 direct 路径连同重排函数，在 v2 里整个删掉。这是这次迁移最大的一块减法。
 
-**5. 下一个风险点是 TP>1 的 adapter gather，探针七只验了 TP=1。** v1 在这儿流过血（坑 16：TP=4 手写 all_gather 撞 CUDA illegal access），并且专门留了 `verify_lora_tp.py`（TP=2）和 `verify_tp_gather.py`（TP=4）两个探针。v2 这块交给 bridge 做，大概率没事，但"大概率"不算验过 —— 上 4×A100 之前值得先花两张卡验一次导出 parity。
+**5. 下一个风险点是 TP>1 的 adapter gather，探针七只验了 TP=1。** v1 在这儿流过血（坑 16：TP=4 手写 all_gather 撞 CUDA illegal access），并且专门留了 v1 分支的 `verify_lora_tp.py`（TP=2）和 `verify_tp_gather.py`（TP=4）两个探针。v2 这块交给 bridge 做，大概率没事，但"大概率"不算验过 —— 上 4×A100 之前值得先花两张卡验一次导出 parity。
 
 端到端时要照抄的 v1 配置：`TP=4 / EP=4 / PP=1`，**关掉 sequence-parallel 和 recompute**（v1 记录：recompute + SP + LoRA 会让 `lora_B` 的 backward 出 NaN），`A100-80GB:4`、timeout 240 分钟、`retries=10`（Modal 抢占后从卷上的 ckpt 续跑）。
 
@@ -343,7 +343,7 @@ linear_proj.adapter.linear_out (1024, 32)   partition_dim=0
 
 一个观察：TP>1 时 `Qwen3OmniModelProvider.finalize()` 会强制打开 `sequence_parallel`。这次没跑 backward 所以无所谓，但 v1 记录过 recompute + SP + LoRA 会让 `lora_B` 的 backward 出 NaN，端到端时要注意这个交互。
 
-脚本：`mig_09_tp_export.py` + `modal_probe_tp_export.py`（torchrun 起 2 进程）。
+脚本：`scripts/probes/mig_09_tp_export.py` + `scripts/probes/modal_probe_tp_export.py`（torchrun 起 2 进程）。
 
 ## 待办
 
@@ -386,7 +386,7 @@ linear_proj.adapter.linear_out (1024, 32)   partition_dim=0
   `<|...|>` 的条数（v1 在同传里发现过这种污染会把 BLEU 压到真实值的约四成），但不
   改分数，因为 v1 的 S2TT 基线当时也没打这个补丁。
 - `omni_s2tt/run-qwen3-omni-lora-s2tt-4gpu.sh` —— v1 冒烟脚本的 v2 版。
-- `modal_train_s2tt.py` —— runner，含 CPU 版 `check`、断点续跑、BLEU 曲线判定。
+- `scripts/modal_train_s2tt.py` —— runner，含 CPU 版 `check`、断点续跑、BLEU 曲线判定。
 
 ### 相对 v1 少掉的三样东西（都是上游变好了）
 
@@ -433,7 +433,7 @@ in read-write mode: No such file or directory
 `sglang.Engine` 的热加载，根本没经过跨进程共享内存这条路，所以「adapter 能热推」这个
 结论在真实的 Ray → HTTP 链路下并不自动成立。
 
-用一个几乎免费的 CPU 探针（`modal_probe_transport.py`：一个 Ray actor 序列化，四个
+用一个几乎免费的 CPU 探针（`scripts/probes/modal_probe_transport.py`：一个 Ray actor 序列化，四个
 consumer actor 反序列化）把三种传输方式摆在一起：
 
 | 传输方式 | 结果 |
@@ -471,7 +471,7 @@ consumer actor 反序列化）把三种传输方式摆在一起：
 | 涨幅（末段−首段） | +0.102 | +0.098 | — |
 
 四段全部落在噪声内，涨幅几乎一致。判据在开跑前就写死了（后 10 步均值落在 0.36–0.42、
-且前后差值同量级），不是看到结果再补的。逐步数值在 `_curve.json`。
+且前后差值同量级），不是看到结果再补的。逐步数值在 `docs/results/s2tt-40step-curve.json`。
 
 **两条曲线可比的前提**要说清楚：v1 的 100 步 S2TT 基线是 `lora-omni-baseline @ 8bcbb42`，
 而 reward 去污染那个提交 `3a6eb2f` 是**之后**为同传才做的——也就是说 v1 的 S2TT 曲线和

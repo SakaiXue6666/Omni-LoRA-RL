@@ -10,7 +10,7 @@
 
 ## 参数快照（可回滚基线，改 2a/2b 前固化）
 > 回滚点：Relax 分支 `lora-omni-baseline` @ `8bcbb42`（smoke 脚本含续训修复）；
-> Modal 入口 `modal_relax_smoke.py::learn_audio`（任务 `s2tt`）。以下为两者叠加后的有效参数。
+> Modal 入口 `v1 分支 modal_relax_smoke.py::learn_audio`（任务 `s2tt`）。以下为两者叠加后的有效参数。
 >
 > - 模型/部署：Qwen3-Omni-30B-A3B thinker，bf16；colocate，单机 4×A100-80GB；offload 开（colocate 默认）。
 > - 并行：TP=4 / EP=4 / ETP=1 / PP=1 / CP=1；micro-batch=1。
@@ -68,7 +68,7 @@
 
 ## 参数快照（相对上面 s2tt 基线的差异；其余同基线）
 > Relax 分支 `lora-omni-baseline`：`3a6eb2f`(reward-fix) + `bb7642f`(no-offload)；
-> Modal 入口 `modal_relax_smoke.py::learn_simul --tag v2`（save/load=/s2tt/ckpt/s2tt_probe_simul_v2，全新从头训）。
+> Modal 入口 `v1 分支 modal_relax_smoke.py::learn_simul --tag v2`（save/load=/s2tt/ckpt/s2tt_probe_simul_v2，全新从头训）。
 >
 > - 同传专属：`--custom-generate-function-path examples.simul_s2tt.rollout.generate`
 >   + `--custom-config-path examples/simul_s2tt/config.yaml`（`max_turns=64`, `simul_chunk_ms=960`）。

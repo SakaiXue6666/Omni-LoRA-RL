@@ -20,6 +20,6 @@ checkpoints/
 cursor_sglang_lora.md
 rl_lora_omni-gpt.md
 
-# 一次性的本地补丁/诊断脚本
-_patch_*.py
-_probe_env.py
+# 一次性的本地补丁/诊断脚本、临时输出（下划线开头一律不入库）
+_*.py
+_*.json
