@@ -1,11 +1,12 @@
-# 同传移植笔记：改了什么、哪里可能炸
+# 同传移植笔记
 
 同传（simultaneous S2TT）的代码从 `v1` 分支的 `Relax/examples/simul_s2tt/` 移到了本仓库的
 `omni_s2tt/simul/`。
 
-**这条路径在当前代码上一次都没跑过。** 下面把「改了哪些、为什么改、预计在哪炸、炸了长什么样」
-写清楚，让第一个上手的人不用从零猜。参照指标：v1 跑 20 步是 **0.155 → 0.265**
-（见 `docs/results/experiments.md` 实验 3）。
+**这份代码本身是跑通过的** —— 2026-07-10 在旧实现上跑完 20 步，BLEU 0.155 → 0.265
+（`docs/results/experiments.md` 实验 3）。逻辑不需要怀疑。
+
+没跑过的是**移植本身**：迁移时丢了一个补丁，以及本次改的四处。下面分开写，别把两者混为一谈。
 
 ## 移了什么
 
@@ -46,11 +47,25 @@ v1 放在 `Relax/examples/simul_s2tt/`。现在放本仓库，因为 Relax fork 
 
 ---
 
-# 已知风险，按可能性排
+# 真正的两个风险
 
-## 1. 多段音频的 rope device bug —— 最可能炸的一处
+## 1. 迁移时丢了 rope device 补丁 —— 几乎一定会炸
 
-**状态：代码层面逐环节核实成立，未实机复现。**
+**这不是代码缺陷，是迁移遗漏。** 证据链很硬：
+
+- 补丁 `patch_qwen3_omni_rope_index_device()` 是 commit `a700c7f`（2026-07-10）加的，
+  该 commit 标题就是「新增 Qwen3-Omni 同传(多轮定长音频块)自定义 rollout」——
+  **补丁和同传是同一个 commit 出生的，它就是被同传逼出来的**
+- 所以 v1 那 20 步能跑通，恰恰是因为补丁在。成功跑通是 bug 存在的证据，不是不存在的证据
+- 当前 Relax 里没有这个补丁，而等价代码在新位置上仍是老样子
+
+**为什么 v1 的补丁照搬无效**：它 patch 的是
+`megatron.bridge.models.qwen_omni.modelling_qwen3_omni.model.get_rope_index`；而
+`relax/models/qwen_omni/qwen3_omni_provider.py:23` import 的是 Relax **自己 vendor 的**
+`Qwen3OmniMoeModel`，走自己的 `modeling_qwen3_omni/utils.py`。两个不同模块。更糟的是 v1 那段
+包在 `try/except ImportError: pass` 里，**打不上也不会报错**，会静默失效。
+
+代码层面逐环节核实如下，未实机复现：
 
 链条：
 
@@ -79,15 +94,10 @@ but found at least two devices, cuda:0 and cpu!
 `model.py:368` 的调用处把 `audio_seqlens=audio_feature_lengths.cpu()`，或在 `utils.py` 进
 audio 分支前 `.cpu()`。
 
-⚠️ **v1 的补丁不能直接用。** `relax/backends/megatron/__init__.py:65` 的
-`patch_qwen3_omni_rope_index_device()` patch 的是
-`megatron.bridge.models.qwen_omni.modelling_qwen3_omni.model.get_rope_index`，而当前 Relax
-自己 vendor 了一份在 `relax/models/qwen_omni/modeling_qwen3_omni/utils.py` —— 门牌号变了，
-照搬过来等于没打。
+这一处也可以直接推给上游当第六个 PR —— 性质和已提的五个一样：上游自己的代码在
+video 分支做了 `.cpu()`，audio 分支漏了。
 
-如果确认成立，这是可以推给上游的第六个 PR，性质和已提的五个一样。
-
-## 2. permit 声明丢了
+## 2. 本次改动 ②③ 没配套（permit）
 
 改动 ②③ 是成对的。只改一半会直接抛：
 
@@ -99,14 +109,24 @@ to use per-request permits; without it ... acquiring a permit would deadlock.
 
 好消息是它**大声报错而不是默默死锁**。看到这条就去检查文件末尾那行还在不在。
 
-## 3. 双 token 流对齐 —— 最精巧、也最没验过的部分
+---
+
+# 以下不是风险，是行为说明
+
+原先我把这四条也列成「风险」，那是过度解读 —— v1 跑通过，说明它们都按预期工作。
+留在这里是因为它们不直观，第一次接手容易误判。
+
+## 3. 双 token 流对齐（v1 已验证正确）
 
 `rollout.py` 维护两条流：`sample.rollout_tokens` 发 sglang（每段音频一个未展开 marker），
 `sample.tokens` 给 Megatron（processor 已展开，与音频特征对齐），`_merge_mm_train()`
 把各块的 `input_features` pad 到同一长度再沿 dim=0 拼。
 
-这套逻辑没有针对当前版本的 processor 验证过。炸的话通常不是异常，而是**训练发散或 loss 异常**，
-因为 loss_mask 和 token 对不上。要查的不变式（v1 的 CPU 自测就是断这些的）：
+这套逻辑在 v1 上验证过是对的，本次移植一行没动。唯一的不确定是镜像换了之后
+transformers/processor 的行为是否有差异 —— 我没有任何具体证据说它变了，只是没跑过。
+
+真出问题通常不是异常，而是**训练发散或 loss 异常**，因为 loss_mask 和 token 对不上。
+要查的不变式（v1 的 CPU 自测就是断这些的）：
 
 - `len(loss_mask) == response_length`
 - `len(rollout_log_probs) == response_length`
@@ -117,7 +137,7 @@ to use per-request permits; without it ... acquiring a permit would deadlock.
 
 `sample.metadata` 里有 `simul_num_chunks` 和 `simul_stop_reason` 可以对。
 
-## 4. `--no-offload-train/rollout` 的 help 与代码不一致
+## 4. `--no-offload-train/rollout` 现在有效，但 help 与代码不一致
 
 启动脚本用了这两个 flag（v1 的常驻配置，比带 offload 快约 27~35%）。它们目前**有效** ——
 `arguments.py:3170` 是 `if args.offload_train is None: = True`，只在没显式指定时才强制。
@@ -126,7 +146,7 @@ to use per-request permits; without it ... acquiring a permit would deadlock.
 上游哪天把代码改得和 help 一致，同传会**静默退回 offload 模式** —— 不报错，只是变慢、显存
 行为变了。发现每步耗时突然从 ~3 分钟涨到 ~4.4 分钟，先查这里。
 
-## 5. 奖励去污染的口径与单轮**不同**
+## 5. 奖励去污染的口径与单轮**不同**（设计如此）
 
 | | `<\|...\|>` 特殊 token |
 |---|---|
@@ -141,7 +161,7 @@ to use per-request permits; without it ... acquiring a permit would deadlock.
 
 **后果：同传曲线和单轮曲线的绝对值不可直接比较。** 各自跟自己的历史比。
 
-## 6. 数据要求：每条样本恰好一段整段音频
+## 6. 数据要求：每条样本恰好一段整段音频（v1 同一个 assert）
 
 `AudioChunkEnv.__init__` 有硬断言：
 
