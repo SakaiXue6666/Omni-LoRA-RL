@@ -145,7 +145,7 @@ git submodule update --init --recursive
 
 ```bash
 git submodule status
-# +19aea461... Relax  (heads/lora-omni-v2)
+# +9e94202... Relax  (heads/lora-omni-v2)
 #  02044692... sglang (v0.5.12.post1-5-g02044692cc)
 ```
 

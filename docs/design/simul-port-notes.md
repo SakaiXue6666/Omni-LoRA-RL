@@ -49,7 +49,11 @@ v1 放在 `Relax/examples/simul_s2tt/`。现在放本仓库，因为 Relax fork 
 
 # 真正的两个风险
 
-## 1. 迁移时丢了 rope device 补丁 —— 几乎一定会炸
+## 1. rope device 补丁（迁移时丢了，**现已修复**）
+
+> **已修**：Relax fork `lora-omni-v2` 的 `9e94202` 直接在
+> `relax/models/qwen_omni/modeling_qwen3_omni/utils.py` 里把 `audio_seqlens` 归到 CPU，
+> 与 video 分支的做法一致。下面保留原委，方便日后往上游提 PR。
 
 **这不是代码缺陷，是迁移遗漏。** 证据链很硬：
 
