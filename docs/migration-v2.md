@@ -75,7 +75,7 @@ v1 的 delta 一共 7 个文件，和 Relax 那 44 个文件只有 `python/sglan
 | 自己写 direct 权重导出 | `relax/backends/megatron/weight_update/lora_adapter_sync.py` |
 | 自己实现 LoRA 注入 | `relax/utils/megatron_peft_utils.py` 的 `apply_lora_to_model` |
 | 自己做 adapter 转换 | Megatron-Bridge 的 `export_adapter_weights` |
-| —— | 参考脚本 `scripts/training/text/run-qwen3-4B-lora-adapter-x8gpu-async.sh` |
+| —— | 参考脚本 `Relax/scripts/training/text/run-qwen3-4B-lora-adapter-x8gpu-async.sh` |
 | —— | 参考测试 `tests/backends/megatron/weight_update/test_lora_weight_sync.py` |
 
 sglang 侧不一样：上游至今没有 Omni 的 LoRA 支持，`qwen3_omni_moe.py` 里既没有 `should_apply_lora` 也没有 audio/vision tower 的 LoRA 排除逻辑。这部分是**永久 delta**，不是技术债，需要一直带着（也正是将来给 sgl-project 开 PR 的内容）。
@@ -217,7 +217,7 @@ v1 那份 `test_should_apply_lora_gate.py` 写在 `test/srt/lora/` 下，用的�
 
 Relax 那两个的动机各自都有硬证据：
 
-- **通配符**：Relax 自己的 `scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-lora-mtp-8xgpu.sh` 就在用 `*decoder.layers.*.linear_qkv`，注释写明是为了让 MTP 层保持冻结。注入侧（Bridge）认这个模式，导出侧不认——glob 会原样落进 `adapter_config.json` 和 SGLang 启动参数，而两边都只按后缀匹配，等于导出的 config 一个模块都没点到。
+- **通配符**：Relax 自己的 `Relax/scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-lora-mtp-8xgpu.sh` 就在用 `*decoder.layers.*.linear_qkv`，注释写明是为了让 MTP 层保持冻结。注入侧（Bridge）认这个模式，导出侧不认——glob 会原样落进 `adapter_config.json` 和 SGLang 启动参数，而两边都只按后缀匹配，等于导出的 config 一个模块都没点到。
 - **PEFT 前缀**：`_save_lora_to_checkpoint` 的 docstring 和中英文档都承诺 `lora_adapter/` 可以用 `peft.PeftModel.from_pretrained` 加载，但落盘的 key 不带 `base_model.model.`。探针三实测：不报错，只警告一句 missing keys，然后 `lora_B` 全零。续训和 SGLang 都不受影响，受影响的恰好就是这个产物承诺的唯一用途。
 
 - **adapter 传输**：真机 4×A100 上第一次推 adapter 就死在 TP0，而 TP1–3 成功。根因是
