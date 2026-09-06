@@ -1,7 +1,7 @@
 # 同传移植笔记
 
-同传（simultaneous S2TT）的代码从 `v1` 分支的 `Relax/examples/simul_s2tt/` 移到了本仓库的
-`omni_s2tt/simul/`。
+同传（simultaneous S2TT）的代码位置与 v1 一致：`Relax/examples/simul_s2tt/`（submodule 里）。
+启动脚本 `omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh` 留在本仓库，跟单轮那个放一起。
 
 **这份代码本身是跑通过的** —— 2026-07-10 在旧实现上跑完 20 步，BLEU 0.155 → 0.265
 （`docs/results/experiments.md` 实验 3）。逻辑不需要怀疑。
@@ -12,24 +12,21 @@
 
 | 文件 | 来源 | 说明 |
 |---|---|---|
-| `omni_s2tt/simul/rollout.py` | v1 同名文件 | 主体，多轮 generate（788 行） |
-| `omni_s2tt/simul/audio_chunk_env.py` | 同上 | 960ms 定长切块 env，未改逻辑 |
-| `omni_s2tt/simul/config.yaml` | 同上 | `max_turns: 64` / `simul_chunk_ms: 960` |
-| `omni_s2tt/simul/_selftest_env.py` | 同上 | 纯 numpy 切块自测 |
-| `omni_s2tt/simul/__init__.py` | 同上 | 文档字符串 |
+| `Relax/examples/simul_s2tt/rollout.py` | v1 同名文件 | 主体，多轮 generate（788 行） |
+| `Relax/examples/simul_s2tt/audio_chunk_env.py` | 同上 | 960ms 定长切块 env，未改逻辑 |
+| `Relax/examples/simul_s2tt/config.yaml` | 同上 | `max_turns: 64` / `simul_chunk_ms: 960` |
+| `Relax/examples/simul_s2tt/_selftest_env.py` | 同上 | 纯 numpy 切块自测 |
+| `Relax/examples/simul_s2tt/__init__.py` | 同上 | 文档字符串 |
 | `omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh` | 新写 | 单轮脚本的薄包装 |
 
 **没移** `omni_rollout.py`（396 行）—— 那是 sglang-omni Thinker 变体，当前代码已经不含
 sglang-omni submodule。要用的话去 `v1` 分支拿。
 
-## 为什么放 hub 仓而不是 Relax fork
+## 为什么放 Relax fork 里
 
-v1 放在 `Relax/examples/simul_s2tt/`。现在放本仓库，因为 Relax fork 目前只剩 1 处
-`[YULIN-MOD]`，塞进 1000 行会让跟上游 rebase 变难，也和 README 说的「换任务不需要动 Relax 的
-代码」冲突。`examples.deepeyes.base_env` 的 import 仍然可用 —— Relax 根目录也在 PYTHONPATH 上。
-
-想退回 v1 布局：把 `omni_s2tt/simul/` 挪进 `Relax/examples/simul_s2tt/`，把三处
-`omni_s2tt.simul.` 改回 `examples.simul_s2tt.`，再改启动脚本的两个路径。
+与 v1 一致，也和它借用的 `examples/deepeyes/base_env.py` 放在一起。代价是往 fork 里加了
+~1000 行，日后同步上游更容易冲突；但 Relax 的改动本来就要走 submodule 三步流程，
+放哪都一样，见 README 的「改 Relax / sglang 的代码」。
 
 ## 改了哪四处
 

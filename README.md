@@ -66,7 +66,7 @@ log_probs 上升。逐步原始数据 `docs/results/s2tt-100step-curve.json`。
   继续爬到 0.487，在当前代码上没验过。前 40 步两者逐段吻合（差值都在 ±0.013 内）。
 - **续训没验证过。** 最近一次想从 `iter_0000004` 接着跑，实际从 0 开始了 —— 上次被提前
   收掉，`latest_checkpointed_iteration.txt` 没写出来。LoRA 的续训路径至今没单独查过。
-- **同传代码已移过来，但一次没跑过。** `omni_s2tt/simul/`，四处必要改动已做；已知风险与
+- **同传代码已移过来，但一次没跑过。** `Relax/examples/simul_s2tt/`，四处必要改动已做；已知风险与
   预期报错见 [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md)，上卡前先读。
 - **口径**：`omni_s2tt/curve.py` 按 `rollout_result` 的逐样本 reward 统计，上面的数字来自
   训练日志的 `rollout/raw_reward`。两者理论上相等，但没交叉核对过。
@@ -371,6 +371,47 @@ export WANDB_API_KEY=...          # 在线才需要
 
 换数据集只要换 `DATA`，字段对齐第四节即可；换奖励则改 `--custom-rm-path` 指向你自己的
 函数（签名见 `omni_s2tt/bleu_rm.py`）。两者都不需要动 Relax 的代码。
+
+## 改 Relax / sglang 的代码
+
+`Relax/` 和 `sglang/` 是 submodule，指向两个 fork。**改它们和改本仓库的文件不一样，要三步。**
+漏掉第三步是最常见的事故：别人拉下来还是旧代码，而且不报错。
+
+```bash
+# 1. 在 submodule 里改、提交
+cd Relax                      # 或 sglang
+# ...改代码...
+git add -A && git commit -m "fix(lora): ..."
+
+# 2. 推到你的 fork
+git push mine lora-omni-v2    # sglang 同理，分支名也是 lora-omni-v2
+
+# 3. 回主仓库，把指针更新到新提交（这一步最容易忘）
+cd ..
+git add Relax                 # 或 sglang
+git commit -m "chore: bump Relax to <短 sha>"
+git push
+```
+
+第三步做了没有，`git status` 会告诉你：
+
+```bash
+git submodule status
+# +265723e... Relax   ← 开头是 + 表示指针和实际 checkout 不一致，说明第 3 步没做
+#  0204469... sglang  ← 开头是空格才对
+```
+
+拉别人的更新：
+
+```bash
+git pull && git submodule update --init --recursive
+```
+
+**submodule 里不要 rebase 或 force-push 已经被主仓库指过的分支** —— 主仓库的指针会指向不
+存在的提交，别人 `clone --recursive` 直接失败，而且报错信息很难懂。
+
+改动如果是上游本身的 bug（不是我们的适配），顺手给上游提个 PR，合并之后 fork 就能少背一处。
+已提的几个见上面「当前进度」，正文写法可以参考 `docs/upstream-prs/`。
 
 ## 踩过的坑
 

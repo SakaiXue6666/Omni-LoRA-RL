@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 同传（simultaneous S2TT）训练：整段音频按定长块多轮 rollout。
 #
-# 它是 run-qwen3-omni-lora-s2tt-4gpu.sh 的薄包装 —— 超参、LoRA、并行、奖励全部复用那份，
+# 代码在 Relax/examples/simul_s2tt/（submodule 里）。本脚本只是 run-qwen3-omni-lora-s2tt-4gpu.sh
+# 的薄包装 —— 超参、LoRA、并行、奖励全部复用那份，
 # 只加两件事：
 #   1. --custom-generate-function-path 换成同传的多轮 generate
 #   2. --custom-config-path 指向 max_turns / simul_chunk_ms
@@ -25,8 +26,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # 同传专属参数。CUSTOM_CONFIG_PATH 可覆盖（改 chunk 时长 / 轮数上限）。
 export EXTRA_ARGS="${EXTRA_ARGS:-} \
-   --custom-generate-function-path omni_s2tt.simul.rollout.generate \
-   --custom-config-path ${CUSTOM_CONFIG_PATH:-${REPO_ROOT}/omni_s2tt/simul/config.yaml}"
+   --custom-generate-function-path examples.simul_s2tt.rollout.generate \
+   --custom-config-path ${CUSTOM_CONFIG_PATH:-${REPO_ROOT}/Relax/examples/simul_s2tt/config.yaml}"
 
 # 日志和 tensorboard 项目名分开，别和单轮那条曲线混在一起。
 export LOG_NAME="${LOG_NAME:-qwen3-omni-lora-simul}"
