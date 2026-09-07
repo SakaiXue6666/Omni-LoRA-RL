@@ -77,10 +77,11 @@ to 20 (tighter translations) and log_probs rose. Per-step raw data in
   `iter_0000004` but actually restarted from 0 — the previous run was killed early and
   `latest_checkpointed_iteration.txt` was never written. The LoRA resume path has never been
   investigated on its own.
-- **Simultaneous interpretation is not in this tree.** It ran on the older implementation
-  (20 steps, 0.155 → 0.265) and the code lives on the `v1` branch under
-  `Relax/examples/simul_s2tt/`. Porting it has not been done; what it would involve is written up
-  in [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md).
+- **Simultaneous interpretation is not wired into this tree.** It ran on the older
+  implementation (20 steps, 0.155 → 0.265). The v1 sources, its launch script and the one
+  main-code change it needs are parked byte-for-byte in
+  [`porting/simul_s2tt/`](porting/simul_s2tt/), unreferenced by anything that runs; what porting
+  them involves is in [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md).
 - **Convention**: `omni_s2tt/curve.py` computes from the per-sample rewards in `rollout_result`,
   while the numbers above come from `rollout/raw_reward` in the training log. The two should be
   equal, but they have never been cross-checked.
@@ -113,8 +114,8 @@ push on.
 
 1. Get the `run-ci` label onto the two sglang PRs
 2. Investigate why LoRA resume does not take effect
-3. Port simultaneous interpretation from the `v1` branch (see `docs/design/simul-port-notes.md`
-   for what that involves)
+3. Port simultaneous interpretation — sources are in `porting/simul_s2tt/`, notes in
+   `docs/design/simul-port-notes.md`
 4. Run the current code path for a full 100 steps and confirm 0.487 reproduces
 
 ---
@@ -521,7 +522,8 @@ Ordered by how often they come up. All of them actually happened on this pipelin
 |---|---|
 | [`docs/results/experiments.md`](docs/results/experiments.md) | Full record of all four experiments: configuration, per-step curves, conclusions, and why the failed one failed |
 | [`docs/design/reward-design.md`](docs/design/reward-design.md) | Why the reward is BLEU, why the temperature is 1.1, how in-group variance is created |
-| [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md) | Porting simultaneous interpretation: the four changes, six known risks and what each one looks like when it fails |
+| [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md) | What porting simultaneous interpretation would involve: the API changes needed, and the one trap that fails silently |
+| [`porting/simul_s2tt/`](porting/simul_s2tt/) | The v1 simultaneous-interpretation sources, launch script and main-code diff, parked byte-for-byte and wired into nothing |
 | [`docs/migration-v2.md`](docs/migration-v2.md) | How the current implementation came about: conclusions from nine probes, and the motivation and evidence behind five upstream PRs |
 | [`scripts/probes/`](scripts/probes/) | The reproducible script behind every one of those conclusions, with an index |
 | `docs/design/my_plan.md` | Early planning and parameter snapshots |
