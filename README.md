@@ -445,8 +445,9 @@ shrinks. The ones that will stay indefinitely are the Omni-specific pieces: upst
 no LoRA support for Qwen3-Omni at all.
 
 **When you change something in either fork, bracket it the same way.** An unmarked change is
-invisible to that grep, which quietly makes the index wrong — this happened once already with the
-`audio_seqlens` fix and had to be corrected after the fact.
+invisible to that grep, which quietly makes the index wrong. It is easy to forget when the change
+is small: the `audio_seqlens` fix above is two lines and shipped without markers at first, which
+had to be corrected afterwards.
 
 ## Changing Relax / sglang code
 
