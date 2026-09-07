@@ -54,7 +54,8 @@ lock is held. A custom generate function must declare `manages_inference_permit 
 to use per-request permits; without it ... acquiring a permit would deadlock.
 ```
 
-> An implementation of all four exists at `12fed1b` on the Relax fork's `lora-omni-v2` branch,
+> An implementation of all four exists at `12fed1b` on the Relax fork's `simul-port-attempt`
+> branch,
 > from the reverted attempt. It has never been run. Treat it as a starting point to review, not
 > as working code.
 
@@ -109,7 +110,7 @@ It cannot simply be copied forward, for two reasons:
 **Unresolved.** A two-line fix (`audio_seqlens = audio_seqlens.cpu()` at the top of the vendored
 `get_rope_index`) was written and then reverted, because it sits in the forward path of the
 already-verified single-turn run and had never been executed on a GPU. It is at `9e94202` on the
-fork's `lora-omni-v2` branch if you want to look at it.
+fork's `simul-port-attempt` branch if you want to look at it.
 
 Whoever does the port has to decide how to handle this. The options, roughly:
 
