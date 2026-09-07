@@ -63,9 +63,7 @@ def main() -> None:
     print(f"\n  前 {k} 步均值 = {first:.3f}")
     print(f"  后 {k} 步均值 = {last:.3f}")
     print(f"  区间 [{min(means):.3f}, {max(means):.3f}]，共 {len(means)} 步")
-    print("  参照（docs/results/experiments.md）：40 步跑法 前10步≈0.29 → 后10步≈0.39；")
-    print("        跑满 100 步可到 ≈0.49。注意本工具按 rollout_result 的逐样本 reward 统计，")
-    print("        而记录里的曲线来自训练日志的 rollout/raw_reward，两者口径未交叉核对。")
+    print("  v1 参照：前 10 步约 0.29，31-40 步约 0.41")
     print(f"  判定：{'上升' if last > first else '没升'}")
 
     if args.csv:

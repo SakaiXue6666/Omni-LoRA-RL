@@ -1,116 +1,52 @@
-# Notes on porting simultaneous interpretation
+# Porting simultaneous interpretation: what it would involve
 
-The simultaneous S2TT code sits where it did in v1: `Relax/examples/simul_s2tt/` (inside the
-submodule). The launch script `omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh` stays in this repo,
-next to the single-turn one.
+**Status: not ported.** Simultaneous S2TT is not in this tree. It exists on the `v1` branch and
+has never been run on the current implementation.
 
-**The code itself has been run successfully** — 20 steps on the older implementation on
-2026-07-10, BLEU 0.155 → 0.265 (`docs/results/experiments.md`, experiment 3). The logic is not in
-question.
+This document is the survey done before attempting the port. It was attempted once and reverted,
+so the findings below are analysis, not experience with a working port.
 
-What has *not* been run is **the port itself**: one patch was lost in the migration, plus the four
-edits made here. The two are written up separately below — do not conflate them.
+## Where the code is
 
-## What was moved
+Everything is on the `v1` branch:
 
-| File | Origin | Notes |
+| Path | Lines | What it is |
 |---|---|---|
-| `Relax/examples/simul_s2tt/rollout.py` | v1 file of the same name | The body: multi-turn generate (788 lines) |
-| `Relax/examples/simul_s2tt/audio_chunk_env.py` | same | 960 ms fixed-chunk env, logic unchanged |
-| `Relax/examples/simul_s2tt/config.yaml` | same | `max_turns: 64` / `simul_chunk_ms: 960` |
-| `Relax/examples/simul_s2tt/_selftest_env.py` | same | Pure-numpy chunking self-test |
-| `Relax/examples/simul_s2tt/__init__.py` | same | Docstring |
-| `omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh` | newly written | Thin wrapper around the single-turn script |
+| `Relax/examples/simul_s2tt/rollout.py` | 788 | The body: multi-turn generate, one audio chunk per turn |
+| `Relax/examples/simul_s2tt/audio_chunk_env.py` | 103 | 960 ms fixed-chunk env; `step()` ignores the model output and just feeds the next chunk |
+| `Relax/examples/simul_s2tt/config.yaml` | 5 | `max_turns: 64` / `simul_chunk_ms: 960` |
+| `Relax/examples/simul_s2tt/_selftest_env.py` | 113 | Pure-numpy chunking self-test, no GPU |
+| `Relax/examples/simul_s2tt/__init__.py` | 14 | Docstring |
+| `Relax/scripts/training/multimodal/run-qwen3-30B-A3B-omni-lora-simul.sh` | 168 | **The launch script that produced the recorded result** |
+| `Relax/examples/simul_s2tt/omni_rollout.py` | 396 | The sglang-omni Thinker variant — out of scope, the current tree has no sglang-omni submodule |
 
-**Not moved:** `omni_rollout.py` (396 lines) — that is the sglang-omni Thinker variant, and the
-current code no longer carries the sglang-omni submodule. Grab it from the `v1` branch if needed.
+It works: 20 steps on 2026-07-10, BLEU 0.155 → 0.265
+(`docs/results/experiments.md`, experiment 3). The logic is not in question.
 
-## Why it lives inside the Relax fork
+**Port the launch script as-is.** It is the artifact that actually produced that number. A
+previous attempt replaced it with a thin wrapper around the single-turn script, which required
+editing the single-turn script — an already-verified artifact — and was reverted. Copy it, do not
+redesign it.
 
-Same as v1, and next to the `examples/deepeyes/base_env.py` it borrows from. The cost is ~1000
-lines of extra divergence in the fork, which makes syncing with upstream more conflict-prone; but
-any change to Relax has to go through the three-step submodule flow anyway, so the location makes
-no difference there. See "Changing Relax / sglang code" in the README.
+## What the current implementation would require changing
 
-## The four changes
+Four things, all in `rollout.py`, all forced by API changes in Relax since v1:
 
 | # | Location | Change | Why |
 |---|---|---|---|
-| ① | `rollout.py` imports + lines 638/749 | `_ENCODE_EXECUTOR` → `get_encode_executor()` | Current Relax replaced that private global with a lazily constructed accessor |
-| ② | `_run_inference_step` | `post(url, payload)` → `state.post_generate(url, payload)`; the signature takes an extra `state` | See "permit" below |
-| ③ | End of file | Added `generate.manages_inference_permit = True` | Pairs with ②; neither works alone |
-| ④ | `generate()` | Split into a `generate()` shell plus `_generate_impl()`, with the shell catching `GenerationAborted` | The upstream contract requires it not to escape |
+| ① | imports + the two `run_in_executor` call sites | `_ENCODE_EXECUTOR` → `get_encode_executor()` | That private global was replaced by a lazily constructed accessor |
+| ② | `_run_inference_step` | `post(url, payload)` → `state.post_generate(url, payload)`, taking `state` as a new argument | See "permit" below |
+| ③ | end of file | `generate.manages_inference_permit = True` | Pairs with ②; neither works alone |
+| ④ | `generate()` | catch `GenerationAborted` | The upstream contract requires it not to escape |
 
-**About the permit:** current Relax added `relax/engine/rollout/request_permit.py` (v1 had no such
-thing). A multi-turn rollout that does not declare `manages_inference_permit` holds one slot of
-the session-level semaphore for the entire run — across all ~10 turns plus the chunking and
-encoding time in between. It does not deadlock and does not serialize; it costs throughput. The
-upstream comment puts it exactly: *"Custom multi-turn rollouts should use
-inference_permit()/post_generate() instead."*
+**The permit**: current Relax added `relax/engine/rollout/request_permit.py`, which v1 has no
+concept of. A multi-turn rollout that does not declare `manages_inference_permit` holds one slot
+of the session-level semaphore for its entire run — all ~10 turns plus the chunking and encoding
+time in between. It does not deadlock and does not serialize; it costs throughput. Upstream's own
+comment: *"Custom multi-turn rollouts should use inference_permit()/post_generate() instead."*
+`Relax/examples/deepeyes/rollout.py` is the reference implementation.
 
----
-
-# The two real risks
-
-## 1. The rope device patch (lost in the migration, **now fixed**)
-
-> **Fixed**: commit `9e94202` on the Relax fork's `lora-omni-v2` moves `audio_seqlens` onto the
-> CPU directly inside `relax/models/qwen_omni/modeling_qwen3_omni/utils.py`, matching what the
-> video branch already does. The background below is kept so it can be sent upstream later.
-
-**This is not a code defect, it is a migration omission.** The evidence is solid:
-
-- The patch `patch_qwen3_omni_rope_index_device()` was added in commit `a700c7f` (2026-07-10),
-  whose title is literally "add the Qwen3-Omni simultaneous (multi-turn fixed audio chunk) custom
-  rollout" — **the patch and the simultaneous rollout were born in the same commit; the patch
-  exists because simultaneous interpretation forced it into being**
-- So those 20 steps in v1 succeeded precisely *because* the patch was there. Having run
-  successfully is evidence that the bug exists, not evidence that it does not
-- Current Relax does not carry the patch, and the equivalent code at its new location is
-  unchanged
-
-**Why v1's patch cannot simply be copied over:** it patches
-`megatron.bridge.models.qwen_omni.modelling_qwen3_omni.model.get_rope_index`, whereas
-`relax/models/qwen_omni/qwen3_omni_provider.py:23` imports Relax's **own vendored**
-`Qwen3OmniMoeModel`, which goes through its own `modeling_qwen3_omni/utils.py`. Two different
-modules. Worse, v1's code is wrapped in `try/except ImportError: pass`, so **it fails silently
-when it fails to apply**.
-
-Verified link by link at the code level, never reproduced on real hardware:
-
-```
-model.py:206   audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)   # CUDA
-model.py:368   get_rope_index(..., audio_seqlens=audio_feature_lengths)           # no .cpu()
-utils.py:9     _get_feat_extract_output_lengths()  pure arithmetic, device unchanged  # still CUDA
-utils.py:188   audio_len = _get_feat_extract_output_lengths(audio_seqlens[i])     # CUDA scalar
-utils.py:192   st += text_len + bos_len + audio_len + eos_len                     # poisons the CPU counter
-```
-
-In the same function the **video branches call `.cpu()` explicitly** (`utils.py:235`, `271`); the
-audio branch does not — the same shape of bug v1 hit back then.
-
-**It only fires once a sequence holds two or more audio segments.** Single-turn S2TT has exactly
-one per item and never reaches it (which is why the 40-step run went through cleanly);
-simultaneous interpretation has ~10 chunks per item and hits it every time.
-
-Expected error:
-
-```
-RuntimeError: Expected all tensors to be on the same device,
-but found at least two devices, cuda:0 and cpu!
-```
-
-`get_rope_index` will be in the traceback. **The fix** (copy what the video branch does — it
-changes the compute device only, not the values): at the call site `model.py:368` pass
-`audio_seqlens=audio_feature_lengths.cpu()`, or call `.cpu()` in `utils.py` before entering the
-audio branch.
-
-This one could also go straight upstream as a sixth PR — same character as the five already
-filed: upstream's own code guards the video branch with `.cpu()` and forgot the audio branch.
-
-## 2. Changes ②③ getting out of sync (permit)
-
-Changes ② and ③ are a pair. Doing only half of it raises immediately:
+Doing only half of ②③ fails loudly, which is the good case:
 
 ```
 RuntimeError: inference_permit()/post_generate() was called while the session-level
@@ -118,117 +54,149 @@ lock is held. A custom generate function must declare `manages_inference_permit 
 to use per-request permits; without it ... acquiring a permit would deadlock.
 ```
 
-The good news is it **fails loudly rather than deadlocking silently**. If you see this, check
-whether that line at the end of the file is still there.
+> An implementation of all four exists at `12fed1b` on the Relax fork's `lora-omni-v2` branch,
+> from the reverted attempt. It has never been run. Treat it as a starting point to review, not
+> as working code.
 
 ---
 
-# The following are not risks, they are behavior notes
+# The one real trap: the rope device patch
 
-These four were originally listed as "risks" as well, which was an overreading — v1 ran fine, so
-they all work as intended. They are kept here because they are unintuitive and easy to misjudge
-on first contact.
+**Read this before running anything.** It is the only known blocker, and it fails in a way that
+looks like it is not there.
 
-## 3. The dual token stream alignment (verified correct in v1)
+## What the bug is
+
+`get_rope_index` builds position ids on CPU with `torch.arange(...)`, and the running counters
+`st` / `st_idx` accumulate each segment's length into that CPU chain. `audio_seqlens` arrives as a
+CUDA tensor — callers derive it from `feature_attention_mask.sum(1)` — so `audio_len` stays on
+CUDA and contaminates the counter. On the *next* segment, `st_idx` (CPU) meets `text_len` (now
+CUDA) and:
+
+```
+RuntimeError: Expected all tensors to be on the same device,
+but found at least two devices, cuda:0 and cpu!
+```
+
+The first audio segment is always safe: `st` is still a plain int at that point. **It only fires
+once a sequence holds two or more audio segments** — which is why single-turn S2TT never sees it,
+and simultaneous interpretation (~10 chunks per sample) hits it immediately.
+
+Inside the same function the video branches already guard exactly this way with
+`second_per_grids[video_index].cpu()`; the audio branches do not.
+
+## Why v1 does not hit it, and why copying v1's fix will not work
+
+v1 carries a patch for this — `patch_qwen3_omni_rope_index_device()` in
+`Relax/relax/backends/megatron/__init__.py`. It was added in commit `a700c7f`, which is *the same
+commit that introduced the simultaneous rollout*: the patch exists because simultaneous
+interpretation forced it into being. The recorded 20-step run succeeded because that patch was in
+place.
+
+It cannot simply be copied forward, for two reasons:
+
+1. **It patches the wrong module now.** v1 patches
+   `megatron.bridge.models.qwen_omni.modelling_qwen3_omni.model.get_rope_index`. Current Relax
+   vendors its own copy — `relax/models/qwen_omni/qwen3_omni_provider.py` imports
+   `Qwen3OmniMoeModel` from `relax/models/qwen_omni/modeling_qwen3_omni/`, which uses its own
+   `utils.get_rope_index`. Different module; the patch never runs.
+2. **It fails silently.** The call is wrapped in `try/except ImportError: pass`, so if the target
+   module is missing you get no error at all — the patch simply does not apply, and everything
+   looks fine until the first training step crashes.
+
+## Status of the fix
+
+**Unresolved.** A two-line fix (`audio_seqlens = audio_seqlens.cpu()` at the top of the vendored
+`get_rope_index`) was written and then reverted, because it sits in the forward path of the
+already-verified single-turn run and had never been executed on a GPU. It is at `9e94202` on the
+fork's `lora-omni-v2` branch if you want to look at it.
+
+Whoever does the port has to decide how to handle this. The options, roughly:
+
+- Apply the fix to the vendored copy and re-verify the single-turn 40-step run still matches
+- Keep it out of the shared tree and apply it as a patch only when running simultaneous
+- File it upstream — the asymmetry with the video branches makes it a defensible upstream bug
+  report, though there is no reproduction on hand and upstream's own workloads look single-audio
+
+Verified at the code level on upstream main `f361a16` (2026-09-04): unchanged, no test coverage,
+and no existing issue or PR covers it.
+
+---
+
+# Behavior notes
+
+Not risks — these all worked in v1. They are here because they are unintuitive.
+
+## The dual token stream
 
 `rollout.py` maintains two streams: `sample.rollout_tokens` goes to sglang (one unexpanded marker
 per audio segment), `sample.tokens` goes to Megatron (expanded by the processor, aligned with the
 audio features), and `_merge_mm_train()` pads each chunk's `input_features` to a common length and
 concatenates along dim=0.
 
-This logic was verified correct in v1 and not a single line of it changed in the port. The only
-uncertainty is whether transformers/processor behavior differs now that the image changed — I have
-no specific evidence that it did, it simply has not been run.
-
-When this does go wrong it usually is not an exception but **divergent training or an odd loss**,
-because `loss_mask` and the tokens no longer line up. The invariants to check (v1's CPU self-test
-asserted exactly these):
+When this goes wrong it is usually not an exception but divergent training, because `loss_mask`
+and the tokens no longer line up. The invariants v1's CPU self-test asserts:
 
 - `len(loss_mask) == response_length`
 - `len(rollout_log_probs) == response_length`
 - `len(tokens) == prompt_len + response_length`
-- `sum(loss_mask) == total generated tokens` (excluding the injected observation tokens)
+- `sum(loss_mask) == total generated tokens` (excluding injected observation tokens)
 - number of sglang calls `== num_chunks`
-- `input_features` present, with its first dimension == number of audio segments
+- `input_features` present, first dimension == number of audio segments
 
-`sample.metadata` carries `simul_num_chunks` and `simul_stop_reason` to check against.
+`sample.metadata` carries `simul_num_chunks` and `simul_stop_reason`.
 
-## 4. `--no-offload-train/rollout` works today, but the help text disagrees with the code
-
-The launch script uses both flags (v1's resident configuration, ~27–35% faster than running with
-offloading). They currently **do work** — `arguments.py:3170` reads
-`if args.offload_train is None: = True`, so it is only forced when you did not set it explicitly.
-
-But the help text in the same place says *"This will always be true when --colocate is set."* The
-two disagree. The day upstream changes the code to match the help, simultaneous interpretation
-will **silently fall back to offload mode** — no error, just slower with different memory
-behavior. If per-step time suddenly jumps from ~3 minutes to ~4.4 minutes, look here first.
-
-## 5. Special-token stripping differs from single-turn (by design)
+## Special-token stripping differs from single-turn
 
 | | `<\|...\|>` special tokens |
 |---|---|
-| Simultaneous (this module) | **Stripped** before concatenating the response (`_clean_gen_text`, `rollout.py:156`) |
+| Simultaneous | **Stripped** before concatenating the response (`_clean_gen_text`, commit `3a6eb2f`) |
 | Single-turn S2TT | **Not stripped**; warns only, score unchanged |
 
-This is not a bug; each has its own history:
+Simultaneous has to strip: a marker lands between every pair of chunks, destroying every
+cross-chunk 2/3/4-gram. Measured, BLEU drops to ~40% of its true value (7.2 vs 17.9). Without it
+advantage ≈ 0 and RL cannot learn — that is exactly how v1's first 40-step attempt was wasted.
+Single-turn does not strip because every recorded curve was produced that way.
 
-- Simultaneous *has* to strip — a marker gets inserted between every pair of chunks, which
-  destroys every cross-chunk 2/3/4-gram. Measured, BLEU is pushed down to ~40% of its true value
-  (7.2 vs 17.9). Without the fix advantage ≈ 0 and RL simply cannot learn (that is exactly how
-  v1's first 40-step run was wasted).
-- Single-turn does not strip — every recorded curve was produced under contaminated conditions,
-  and changing it would make them incomparable.
+**So the two curves are not directly comparable in absolute value.** Compare each against its own
+history.
 
-**Consequence: absolute values from the simultaneous curve and the single-turn curve are not
-directly comparable.** Compare each against its own history.
+## `--no-offload-train/rollout`
 
-## 6. Data requirement: exactly one full audio clip per sample (same assert as v1)
+v1's simultaneous configuration keeps the base model frozen and resident on both sides, which is
+~27–35% faster than running with offloading, at the cost of tighter memory
+(`sglang-mem-fraction-static` lowered to 0.55).
 
-`AudioChunkEnv.__init__` has a hard assertion:
+Both flags currently work — `arguments.py` reads `if args.offload_train is None: = True`, so the
+value is only forced when you did not set it explicitly. But the help text in the same place says
+*"This will always be true when --colocate is set."* If upstream ever makes the code match the
+help, simultaneous silently falls back to offload mode: no error, just slower. If per-step time
+jumps from ~3 minutes to ~4.4 minutes, look here.
 
-```python
-assert len(audios) == 1, "AudioChunkEnv expects exactly 1 complete audio clip initially..."
-```
+## Data requirement
 
-Chunking is done by the env itself, so what you feed in must be the **complete** clip. The 128
-items used for single-turn satisfy this. v1 used 97 full clips averaging 9.6 seconds (3.8–23.4 s),
-one chunk per 960 ms → roughly 10 chunks per clip.
+`AudioChunkEnv.__init__` asserts exactly one complete audio clip per sample — chunking is the
+env's job, so what you feed in must be the whole clip. The 128 items used for single-turn satisfy
+this. v1 used 97 full clips averaging 9.6 s (3.8–23.4 s), one chunk per 960 ms → about 10 chunks
+per clip.
 
----
+# Tests available on the v1 branch
 
-## Tests that were not brought over
+Both live in `modal_relax_smoke.py` on `v1`:
 
-v1 had two self-tests, both still living in `modal_relax_smoke.py` on the `v1` branch; neither was
-ported:
-
-- `selftest_simul` (line 2185) → `selftest_simul_encode` — **CPU, about 1 minute**. Builds a
-  3-second synthetic clip through the real `process_raw_sample` path (4 chunks, with a
-  deliberately short final chunk to reproduce variable-length feature concatenation), mocks out
+- `selftest_simul` (line 2185) → `selftest_simul_encode` — **CPU, about 1 minute.** Builds a
+  3-second synthetic clip through the real `process_raw_sample` path (4 chunks, last one
+  deliberately short to reproduce variable-length feature concatenation), mocks out
   `GenerateState`/`post`, runs the full multi-turn `generate()`, and asserts the invariants listed
-  in section 3 above. **This is the only thing that can tell you whether changes ①②③ are correct
-  before you spend GPU time.**
-- `selftest_rope` (line 2313) — T4, 1–2 minutes, reproduces the device bug from section 1 against
-  the pure function.
+  above. **This is the cheapest way to tell whether changes ①②③④ are correct before spending GPU
+  time.**
+- `selftest_rope` (line 2313) — T4, 1–2 minutes, reproduces the device bug above against the pure
+  function.
 
-To use them: `git show v1:modal_relax_smoke.py`, then lift `_offline_build_simul_out` and
-`selftest_simul_encode` out and adapt them.
+`git show v1:modal_relax_smoke.py`, then lift out `_offline_build_simul_out` and
+`selftest_simul_encode`.
 
-The `_selftest_env.py` that *was* brought over is of limited use: it exercises only the pure-numpy
-chunking logic with a fake sample built from `SimpleNamespace`, has zero relax dependencies, and
-`examples/deepeyes/base_env.py` is byte-for-byte identical across the two versions — so it is
-guaranteed to pass and verifies nothing related to this port. It is kept because it is still
-useful when changing the chunking logic.
-
-## How to run it
-
-```bash
-HF_CKPT=/models/qwen3-omni DATA=/s2tt/train_s2tt.jsonl NUM_ROLLOUT=20 \
-SAVE_DIR=/data/s2tt/ckpt/simul_run1 \
-bash omni_s2tt/run-qwen3-omni-lora-simul-4gpu.sh
-```
-
-It is a thin wrapper around the single-turn script: all hyperparameters are reused, and it only
-adds `--custom-generate-function-path` / `--custom-config-path` plus the resident configuration.
-The log file and the tensorboard project name are already separated from the single-turn ones, so
-they will not get mixed together.
+Note that `_selftest_env.py` is much weaker than it looks: it exercises only the pure-numpy
+chunking logic with a fake sample, has no relax dependencies, and `examples/deepeyes/base_env.py`
+is byte-for-byte identical between the two versions — so it passes regardless and verifies nothing
+about a port.

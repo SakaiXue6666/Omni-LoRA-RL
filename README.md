@@ -77,10 +77,10 @@ to 20 (tighter translations) and log_probs rose. Per-step raw data in
   `iter_0000004` but actually restarted from 0 — the previous run was killed early and
   `latest_checkpointed_iteration.txt` was never written. The LoRA resume path has never been
   investigated on its own.
-- **The simultaneous-interpretation code has been ported but never run.** It is in
-  `Relax/examples/simul_s2tt/` with the four necessary changes applied; known risks and the errors
-  to expect are in [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md) — read it
-  before spending GPU time.
+- **Simultaneous interpretation is not in this tree.** It ran on the older implementation
+  (20 steps, 0.155 → 0.265) and the code lives on the `v1` branch under
+  `Relax/examples/simul_s2tt/`. Porting it has not been done; what it would involve is written up
+  in [`docs/design/simul-port-notes.md`](docs/design/simul-port-notes.md).
 - **Convention**: `omni_s2tt/curve.py` computes from the per-sample rewards in `rollout_result`,
   while the numbers above come from `rollout/raw_reward` in the training log. The two should be
   equal, but they have never been cross-checked.
@@ -113,8 +113,8 @@ push on.
 
 1. Get the `run-ci` label onto the two sglang PRs
 2. Investigate why LoRA resume does not take effect
-3. Get simultaneous interpretation running (the code is in place; see the risk list in
-   `docs/design/simul-port-notes.md`)
+3. Port simultaneous interpretation from the `v1` branch (see `docs/design/simul-port-notes.md`
+   for what that involves)
 4. Run the current code path for a full 100 steps and confirm 0.487 reproduces
 
 ---
@@ -162,7 +162,7 @@ Check that both submodules landed on the expected commits (a mismatch means init
 
 ```bash
 git submodule status
-# +9e94202... Relax  (heads/lora-omni-v2)
+# 19aea461... Relax  (heads/lora-omni-v2)
 #  02044692... sglang (v0.5.12.post1-5-g02044692cc)
 ```
 
@@ -427,13 +427,11 @@ grep -rn "\[YULIN-MOD\] START" Relax sglang
 we actually change, and why", this is the answer — not the git history, which also contains the
 44-file vendor patch Relax applies to sglang and everything upstream did on its own.
 
-There are currently 12 marked blocks in 11 files:
+There are currently 6 marked blocks in 5 files:
 
 | Area | What is changed |
 |---|---|
-| `Relax/examples/simul_s2tt/` (5 files) | The whole simultaneous-interpretation rollout: fixed-chunk env, multi-turn generate, config, self-test |
 | `Relax/.../weight_update/update_weight_from_tensor.py` | Inline the adapter bytes instead of passing a shared-memory reference (filed as Relax #265) |
-| `Relax/.../modeling_qwen3_omni/utils.py` | Keep `audio_seqlens` on CPU so sequences with 2+ audio segments do not hit a device mismatch |
 | `sglang/.../lora/lora_manager.py` | Honor the per-model `should_apply_lora` gate (filed as sglang #34428) |
 | `sglang/.../managers/tp_worker.py` | Install the torch reducers before deserializing |
 | `sglang/.../models/qwen3_omni_moe.py` (2 blocks) | Declare LoRA support on the thinker text body; pad mel frames before batching |
@@ -475,7 +473,7 @@ Whether you did step 3 is easy to check:
 
 ```bash
 git submodule status
-# +265723e... Relax   ← a leading + means the pointer and the actual checkout disagree, i.e. step 3 was skipped
+# +19aea461... Relax  ← a leading + means the pointer and the actual checkout disagree, i.e. step 3 was skipped
 #  0204469... sglang  ← a leading space is what you want
 ```
 
