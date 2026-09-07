@@ -405,6 +405,49 @@ Changing dataset means just changing `DATA`, with fields matching section 4. Cha
 means pointing `--custom-rm-path` at your own function (signature in `omni_s2tt/bleu_rm.py`).
 Neither requires touching Relax's code.
 
+## Finding what we changed: the `[YULIN-MOD]` markers
+
+`Relax/` and `sglang/` are forks of large upstream projects. Our own changes are a tiny fraction
+of those trees, and every one of them is bracketed by a pair of markers:
+
+```python
+# ===== [YULIN-MOD] START: keep audio_seqlens on CPU so multi-audio sequences work =====
+...our code...
+# ===== [YULIN-MOD] END =====
+```
+
+The `START` line always says *what the change is for*, in one line. Some older blocks carry a 🚨
+before the `=====`; that is decoration only, so match on the bracketed name:
+
+```bash
+grep -rn "\[YULIN-MOD\] START" Relax sglang
+```
+
+**That grep is the complete index of our delta against upstream.** If you want to know "what did
+we actually change, and why", this is the answer — not the git history, which also contains the
+44-file vendor patch Relax applies to sglang and everything upstream did on its own.
+
+There are currently 12 marked blocks in 11 files:
+
+| Area | What is changed |
+|---|---|
+| `Relax/examples/simul_s2tt/` (5 files) | The whole simultaneous-interpretation rollout: fixed-chunk env, multi-turn generate, config, self-test |
+| `Relax/.../weight_update/update_weight_from_tensor.py` | Inline the adapter bytes instead of passing a shared-memory reference (filed as Relax #265) |
+| `Relax/.../modeling_qwen3_omni/utils.py` | Keep `audio_seqlens` on CPU so sequences with 2+ audio segments do not hit a device mismatch |
+| `sglang/.../lora/lora_manager.py` | Honor the per-model `should_apply_lora` gate (filed as sglang #34428) |
+| `sglang/.../managers/tp_worker.py` | Install the torch reducers before deserializing |
+| `sglang/.../models/qwen3_omni_moe.py` (2 blocks) | Declare LoRA support on the thinker text body; pad mel frames before batching |
+| `sglang/.../utils/patch_torch.py` | Leave CPU tensors alone in the reducer patch (filed as sglang #34595) |
+
+Several of these are upstream bugs rather than our adaptation, which is why they are also open
+PRs — see "Current status". As those merge, the corresponding blocks get deleted and the fork
+shrinks. The ones that will stay indefinitely are the Omni-specific pieces: upstream sglang has
+no LoRA support for Qwen3-Omni at all.
+
+**When you change something in either fork, bracket it the same way.** An unmarked change is
+invisible to that grep, which quietly makes the index wrong — this happened once already with the
+`audio_seqlens` fix and had to be corrected after the fact.
+
 ## Changing Relax / sglang code
 
 `Relax/` and `sglang/` are submodules pointing at two forks. **Changing them is not like changing
